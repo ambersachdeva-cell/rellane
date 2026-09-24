@@ -8,18 +8,22 @@
  */
 
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import * as os from "node:os";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSandbox, resolveInSandbox, SandboxError } from "./sandbox.js";
+
+vi.mock("node:os", async importOriginal => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, homedir: vi.fn(actual.homedir) };
+});
 
 let dir: string;
 let inside: string;
 let outside: string;
 
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "cadrane-symlink-"));
+  dir = await mkdtemp(join(os.tmpdir(), "cadrane-symlink-"));
   inside = join(dir, "granted");
   outside = join(dir, "elsewhere");
   await mkdir(inside, { recursive: true });
@@ -28,7 +32,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -73,8 +77,8 @@ describe("a granted root that is itself a link to somewhere sensitive", () => {
     //
     // Use a temporary home so this test does not depend on the runner's
     // credential directories or touch the developer's real home.
-    vi.stubEnv("HOME", dir);
-    const secrets = join(homedir(), ".claude");
+    vi.spyOn(os, "homedir").mockReturnValue(dir);
+    const secrets = join(dir, ".claude");
     await mkdir(secrets);
     const decoy = join(dir, "harmless");
     await symlink(secrets, decoy);

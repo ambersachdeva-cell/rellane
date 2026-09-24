@@ -98,7 +98,13 @@ function isSensitive(candidate: string): boolean {
   const normalised = resolve(candidate);
   // macOS may spell the temporary home as /var/... while realpath returns
   // /private/var/.... Check both spellings against the credential denylist.
-  const realHome = realpathSync(home, { encoding: "utf8" });
+  let realHome = home;
+  try {
+    realHome = realpathSync(home, { encoding: "utf8" });
+  } catch {
+    // A home directory can be absent in a transient test or account setup.
+    // Keep the spelled path on the denylist even when it cannot be resolved.
+  }
   return NEVER.some((entry) => {
     return [home, realHome].some((base) => {
       const banned = resolve(base, entry);
