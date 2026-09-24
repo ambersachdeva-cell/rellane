@@ -1,0 +1,53 @@
+/**
+ * Recording an enquiry by hand.
+ *
+ * Quiet on purpose. Today's job is to say what needs answering; this is a thing
+ * done a few times a day and must not compete with the list every morning. It
+ * sits below the list, closed, until somebody asks for it.
+ */
+
+.add-enquiry__open {
+  margin-top: var(--space-5);
+}
+
+.add-enquiry {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 560px;
+  margin-top: var(--space-5);
+  padding: var(--space-4);
+  /* Inset, like every other surface here that holds a customer's words rather
+     than the shop's own working area. */
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+
+.add-enquiry textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 88px;
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.5;
+}
+
+.add-enquiry__actions {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+}
+
+.add-enquiry__problem {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--step--1);
+}
+
+/* Said quietly and only while the example is still untouched. It is a caveat,
+   not a warning: nothing has gone wrong and nothing is at risk. */
+.add-enquiry__example {
+  margin: calc(var(--space-2) * -1) 0 var(--space-3);
+  font-size: var(--step--1);
+  color: var(--text-secondary);
+}

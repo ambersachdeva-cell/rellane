@@ -1,0 +1,102 @@
+/* A ruled list of sentences, not a table of cards.
+   DESIGN.md: records are ruled rather than carded, figures are mono because
+   they are compared down a column, and only the ending takes colour. */
+
+.deals {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+
+.deals__row {
+  display: grid;
+  /* who · what they said · standing · money · when */
+  grid-template-columns: minmax(120px, 1fr) minmax(0, 2.4fr) auto auto auto;
+  gap: var(--space-3);
+  align-items: baseline;
+  width: 100%;
+  padding: var(--space-3) var(--space-2);
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* A row that has a reason under it keeps its rule for the pair, not for itself.
+   With a border on both, the owner's sentence about why a job went was fenced
+   off from the job it was about by a line through the middle. */
+.deals__row:has(+ .deals__because) { border-bottom: 0; }
+
+.deals__row:hover { background: var(--surface-1); }
+/* The pair highlights together, because they are one row to a reader. */
+.deals__row:hover + .deals__because { background: var(--surface-1); }
+.deals__row:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+.deals__who { font-weight: 600; }
+
+/* Nobody named. The customer's own words take the space instead of a sentence
+   pretending to be a name: a column reading "Not in the book yet" twice looks
+   like two customers with the same odd name, and the excerpt is what a person
+   recognises the row by anyway. */
+.deals__row--unnamed .deals__said { grid-column: 1 / 3; }
+
+.deals__said {
+  color: var(--text-secondary);
+  /* One line. The excerpt is already cut to length; this keeps a pasted
+     message from pushing the figures out of their column. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deals__state {
+  font-size: var(--step--1);
+  /* Fixed, because every row is its own grid and `auto` columns therefore size
+     to their own content — so "Waiting for an answer" pushed its row's figures
+     left and the money column zig-zagged down the list. A column of amounts
+     that does not line up is one nobody can compare, which is the only reason
+     to put amounts in a column. Wide enough for the longest standing. */
+  min-width: 152px;
+}
+.deals__state--open { color: var(--text-secondary); }
+.deals__state--won { color: var(--success); font-weight: 600; }
+.deals__state--lost { color: var(--danger); }
+.deals__state--quiet { color: var(--text-muted); }
+.deals__state--junk { color: var(--text-muted); }
+
+.deals__money {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  min-width: 96px;
+}
+
+.deals__when {
+  font-size: var(--step--1);
+  color: var(--text-muted);
+  white-space: nowrap;
+  /* Same reason. "IndiaMART · 4 Sep" and "Phone · 1 Sep" are different widths
+     and were dragging the column beside them about. */
+  min-width: 128px;
+  text-align: right;
+}
+
+.deals__because {
+  margin: 0;
+  padding: 0 var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--step--1);
+  color: var(--text-secondary);
+}
+
+@media (max-width: 900px) {
+  /* The figures stop sharing a column with the words rather than shrinking
+     until neither is readable. */
+  .deals__row { grid-template-columns: 1fr auto; }
+  .deals__said { grid-column: 1 / -1; white-space: normal; }
+  .deals__when { grid-column: 1 / -1; }
+}

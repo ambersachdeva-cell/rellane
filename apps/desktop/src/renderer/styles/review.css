@@ -1,0 +1,52 @@
+/* The harness's own chrome, in a file rather than inline, because the renderer
+   runs under a style-src 'self' policy and an inline style attribute is exactly
+   what that forbids. Nothing here styles a product component. */
+
+.review {
+  padding: 32px;
+  background: var(--bg);
+  min-height: 100vh;
+}
+
+.review__screen { margin-bottom: 64px; }
+
+.review__label {
+  margin: 0 0 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.review__note {
+  margin: 0 0 16px;
+  max-width: 640px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.review__frame {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* The work column as the shell gives it: the components inside expect to be
+   laid out by it, and a deal room without a height cannot pin its dock. */
+.review__work {
+  display: flex;
+  flex-direction: column;
+  min-height: 620px;
+  padding: 28px;
+}
+
+/* The shell gives a place its height; this stands in for it. Without it the
+   deal room's panes stop at their content and its dock floats mid-frame, which
+   looks like a product defect and is a harness one. */
+.review__work > * {
+  flex: 1;
+  min-height: 0;
+}

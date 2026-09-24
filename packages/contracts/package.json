@@ -1,0 +1,49 @@
+{
+  "name": "@cadrane/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./daemon-control": {
+      "types": "./dist/daemon-control.d.ts",
+      "import": "./dist/daemon-control.js"
+    },
+    "./storage-capability": {
+      "types": "./dist/storage-capability.d.ts",
+      "import": "./dist/storage-capability.js"
+    },
+    "./native-capability-qa": {
+      "types": "./dist/native-capability-qa.d.ts",
+      "import": "./dist/native-capability-qa.js"
+    },
+    "./durable-journal": {
+      "types": "./dist/durable-journal.d.ts",
+      "import": "./dist/durable-journal.js"
+    },
+    "./capability-intent": {
+      "types": "./dist/capability-intent.d.ts",
+      "import": "./dist/capability-intent.js"
+    },
+    "./capability-journal": {
+      "types": "./dist/capability-journal.d.ts",
+      "import": "./dist/capability-journal.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "26.1.2",
+    "typescript": "7.0.2"
+  }
+}

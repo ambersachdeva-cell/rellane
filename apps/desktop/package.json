@@ -1,0 +1,159 @@
+{
+  "name": "@cadrane/desktop",
+  "version": "0.2.3",
+  "description": "Rellane local-first AI work studio",
+  "author": "Rellane",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main/index.cjs",
+  "scripts": {
+    "build": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer\"",
+    "build:processes": "tsup",
+    "build:renderer": "vite build",
+    "dev": "npm --prefix ../daemon run build && npm run build:processes && concurrently -k -s first \"vite --host 127.0.0.1\" \"wait-on http-get://127.0.0.1:5173 && SWITCHBOARD_DEV_URL=http://127.0.0.1:5173 electron .\"",
+    "package:dir": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --mac dir --arm64 --publish never\"",
+    "package:mac": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --mac dmg zip --arm64 --x64\"",
+    "package:windows": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --win nsis portable --x64 --arm64\"",
+    "package:linux": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --linux AppImage deb --x64 --arm64\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "package:dir:unsigned": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64 --publish never -c.forceCodeSigning=false\"",
+    "package:dmg": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --mac dmg --arm64 --publish never\"",
+    "dist:mac": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --mac dmg zip --arm64 --x64 --publish never -c.mac.identity=null\"",
+    "dist:windows": "../../scripts/build-lock.sh bash -c \"npm run build:processes && npm run build:renderer && electron-builder --win nsis portable --x64 --arm64 --publish never\""
+  },
+  "dependencies": {
+    "@cadrane/contracts": "workspace:*",
+    "@cadrane/daemon": "workspace:*",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@fontsource/ibm-plex-sans-devanagari": "^5.3.0",
+    "@fontsource/ibm-plex-serif": "^5.3.0",
+    "docx": "9.7.1",
+    "fuse.js": "7.0.0",
+    "jszip": "3.10.1",
+    "katex": "0.16.11",
+    "markdown-it": "14.1.0",
+    "mermaid": "11.4.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "shiki": "1.24.0",
+    "xml-js": "1.6.11",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@types/katex": "0.16.7",
+    "@types/markdown-it": "14.1.2",
+    "@types/node": "26.1.2",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "6.0.4",
+    "concurrently": "10.0.4",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
+    "tsup": "8.5.1",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "wait-on": "9.1.0"
+  },
+  "build": {
+    "appId": "com.cadrane.local-work-studio",
+    "productName": "Cadrane",
+    "asar": true,
+    "forceCodeSigning": false,
+    "afterPack": "./scripts/macos-plist-hardening.mjs",
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false,
+      "resetAdHocDarwinSignature": true
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "!dist/**/*.map",
+      "package.json",
+      "!**/node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../../NOTICES.md",
+        "to": "NOTICES.md"
+      },
+      {
+        "from": "vendor/llama-b10182",
+        "to": "llama-b10182"
+      },
+      {
+        "from": "../../native/read-document",
+        "to": "read-document",
+        "filter": [
+          "read-document"
+        ]
+      },
+      {
+        "from": "../../vendor/hermes-agent/skills/research/grounded-citations/scripts",
+        "to": "hermes-citations/scripts",
+        "filter": [
+          "sources.py",
+          "_hermes_home.py"
+        ]
+      },
+      {
+        "from": "scripts/hermes-citations-bridge.py",
+        "to": "hermes-citations/hermes-citations-bridge.py"
+      }
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "binaries": [
+        "Contents/Resources/llama-b10182/llama-server"
+      ],
+      "notarize": false,
+      "identity": "Apple Development: amber.26.2003@gmail.com (4YLJH6747Y)",
+      "extendInfo": {
+        "LSApplicationCategoryType": "public.app-category.productivity",
+        "NSDesktopFolderUsageDescription": "Rellane can tidy your Desktop, and only ever the folders you grant.",
+        "NSDownloadsFolderUsageDescription": "Rellane can tidy your Downloads, and only ever the folders you grant.",
+        "NSDocumentsFolderUsageDescription": "Rellane can read documents in folders you grant, so it can file them."
+      }
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "linux": {
+      "category": "Utility",
+      "target": [
+        "AppImage",
+        "deb"
+      ]
+    },
+    "dmg": {
+      "writeUpdateInfo": false
+    },
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://updates.cadrane.app/${os}"
+      }
+    ]
+  }
+}

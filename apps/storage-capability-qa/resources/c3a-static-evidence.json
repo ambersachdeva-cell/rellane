@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "domain": "switchboard/storage-capability/package-static-inspection/v1",
+  "inspectionKind": "packaged-static-inspection",
+  "durableSpacesEnabled": false,
+  "package": {
+    "asarSha256": "2da1ef33208ec0dc5302028cc44b4efc9c38ce127a65cde8e96bd5ec9bb7189b",
+    "asarBytes": 2333326
+  },
+  "entries": {
+    "mainProbe": {
+      "sha256": "9ef290dae4a0cd127829e313470f86bb6e4a3a4c005d5fc53c0b4e56b7b7a529",
+      "bytes": 1611,
+      "path": "dist/main/storage-capability-probe.cjs",
+      "safeStorageReference": "present"
+    },
+    "utilityProbe": {
+      "sha256": "84db531d4162742c8c5180a056b8aca3845738295ef702818b6bcac1b0459297",
+      "bytes": 1689,
+      "path": "dist/daemon/storage-capability-probe.cjs",
+      "nodeSqliteReference": "present"
+    },
+    "durableSpacesGate": {
+      "sha256": "94b8d330f0c208736910384f9809a0b96f3c2a5b5def4e2145bd7cef4229a152",
+      "bytes": 1595,
+      "path": "dist/main/durable-spaces-gate.cjs",
+      "durableSpacesEnabled": false
+    }
+  },
+  "unobserved": {
+    "safeStorageAvailability": "unobserved",
+    "safeStorageRoundtrip": "unobserved",
+    "nodeSqliteModuleLoad": "unobserved",
+    "databaseOpen": "unobserved",
+    "fts5": "unobserved",
+    "schemaTransaction": "unobserved",
+    "restart": "unobserved",
+    "recovery": "unobserved"
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "@cadrane/storage-capability-qa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main/native-capability-qa-main.cjs",
+  "scripts": {
+    "build": "tsup",
+    "prepare:binding": "pnpm --filter @cadrane/contracts run build && node ./scripts/prepare-c3a-build-binding.mjs",
+    "generate:manifest": "node ./scripts/generate-candidate-build-manifest.mjs",
+    "package:dir": "pnpm run build && pnpm run prepare:binding && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64 --publish never -c.forceCodeSigning=false",
+    "inspect:package": "node ./scripts/inspect-native-capability-qa-package.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@cadrane/contracts": "workspace:*",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "@types/node": "26.1.2",
+    "electron": "43.2.0",
+    "electron-builder": "26.15.3",
+    "tsup": "8.5.1",
+    "typescript": "7.0.2"
+  },
+  "build": {
+    "appId": "com.switchboard.storage-capability-qa",
+    "productName": "Switchboard Storage Capability QA",
+    "asar": true,
+    "forceCodeSigning": true,
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false,
+      "resetAdHocDarwinSignature": true
+    },
+    "directories": { "output": "release-qa" },
+    "files": ["dist/**/*", "!dist/**/*.map", "!dist/resources/**/*", "!dist/native-capability-qa-candidate-build.json", "package.json", "!**/node_modules/**/*"],
+    "extraResources": [{ "from": "dist/resources/c3a-build-binding.json", "to": "c3a-build-binding.json" }],
+    "mac": { "category": "public.app-category.utilities", "target": ["dmg", "zip"] },
+    "win": { "target": ["nsis", "portable"] },
+    "linux": { "category": "Utility", "target": ["AppImage", "deb"] }
+  }
+}

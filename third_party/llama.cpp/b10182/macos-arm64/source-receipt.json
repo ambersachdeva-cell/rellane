@@ -1,0 +1,54 @@
+{
+  "receiptVersion": 1,
+  "status": "pinned-source-input-not-distributed",
+  "runtimeId": "llama.cpp",
+  "upstreamRepository": "ggml-org/llama.cpp",
+  "upstreamRepositoryUrl": "https://github.com/ggml-org/llama.cpp",
+  "tag": "b10182",
+  "sourceCommit": "afeebe103bd99cda8f5dfaefcabadf890db7fda7",
+  "releaseUrl": "https://github.com/ggml-org/llama.cpp/releases/tag/b10182",
+  "target": {
+    "platform": "darwin",
+    "architecture": "arm64",
+    "acceleration": [
+      "cpu",
+      "metal"
+    ]
+  },
+  "archive": {
+    "filename": "llama-b10182-bin-macos-arm64.tar.gz",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/b10182/llama-b10182-bin-macos-arm64.tar.gz",
+    "bytes": 10936141,
+    "expandedBytes": 27210240,
+    "sha256": "d17e65c8056573dada3b7dfaf675e95953a7b29e7f004489dd1bf434edb72394",
+    "observedAt": "2026-07-30"
+  },
+  "memberManifest": {
+    "path": "member-manifest.json",
+    "members": 62,
+    "canonicalSha256": "4578cba02f598014f78424cc255ccac9e90214cd07c27c7fd432a3fbee52dc8b"
+  },
+  "requiredPayload": {
+    "server": {
+      "path": "llama-b10182/llama-server",
+      "sha256": "a4998768a70ba2be02617ec9d8773accc2952516f4f5a8f38f621ece54cbf04b"
+    },
+    "license": {
+      "path": "llama-b10182/LICENSE",
+      "sha256": "94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d"
+    }
+  },
+  "versionProbe": {
+    "arguments": [
+      "--version"
+    ],
+    "expectedVersionLine": "version: 10182 (afeebe103)",
+    "expectedTargetSuffix": "for Darwin arm64"
+  },
+  "distributionGates": [
+    "Switchboard code-signs the complete payload",
+    "The outer macOS app and sidecar pass notarization",
+    "The signed staged runtime passes a loopback health smoke test",
+    "The previous known-good runtime remains available for rollback"
+  ]
+}

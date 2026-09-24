@@ -1,0 +1,108 @@
+/**
+ * The typefaces, declared by hand.
+ *
+ * Fontsource's own stylesheets were the obvious thing to import, and they were
+ * wrong for a desktop app in three ways. Each weight pulled six faces — Latin,
+ * Latin-ext, Cyrillic, Greek, Vietnamese — for an interface that ships in
+ * English and Hinglish. Each face was shipped twice, woff2 plus a woff fallback
+ * for browsers older than the 2015 cutoff, when we pin exactly one Chromium.
+ * And every face carried `font-display: swap`, which is advice for a font
+ * arriving over a network.
+ *
+ * None of that survives contact with the actual delivery model: these files sit
+ * inside the asar, on the same disk, already paid for. So the faces are
+ * declared here instead, one file each, and `font-display: block` is correct
+ * rather than pessimistic — a local read completes in a frame or two, and a
+ * flash of fallback text reflowing the workbench is worse than that wait.
+ *
+ * Weights are the ones the token scale actually names. Adding a weight means
+ * adding it here on purpose, which is the point: a font file that nobody
+ * references cannot be shipped by accident.
+ */
+
+/* ---- IBM Plex Sans — the interface voice ---- */
+
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 500;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-weight: 600;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+}
+
+/* ---- IBM Plex Serif — headings, and only headings ---- */
+
+@font-face {
+  font-family: "IBM Plex Serif";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-serif/files/ibm-plex-serif-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Serif";
+  font-style: normal;
+  font-weight: 600;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-serif/files/ibm-plex-serif-latin-600-normal.woff2") format("woff2");
+}
+
+/* ---- IBM Plex Mono — paths, counts, keys, anything measured ---- */
+
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-500-normal.woff2") format("woff2");
+}
+
+/**
+ * Devanagari.
+ *
+ * Not decoration and not a hypothetical: the people this is built for write
+ * "₹68 का quote भेज दो" in one sentence, and a missing Devanagari face renders
+ * that as tofu boxes. `unicode-range` is what keeps it cheap — the browser
+ * fetches this file only when a Devanagari codepoint is actually painted, so an
+ * English-only session never touches it despite it being declared here.
+ *
+ * The range is Devanagari (U+0900–097F) plus its extended block and the two
+ * Vedic ranges, which is what Fontsource itself scopes this subset to.
+ */
+@font-face {
+  font-family: "IBM Plex Sans Devanagari";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-sans-devanagari/files/ibm-plex-sans-devanagari-devanagari-400-normal.woff2") format("woff2");
+  unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF, U+11B00-11B09;
+}
+@font-face {
+  font-family: "IBM Plex Sans Devanagari";
+  font-style: normal;
+  font-weight: 600;
+  font-display: block;
+  src: url("@fontsource/ibm-plex-sans-devanagari/files/ibm-plex-sans-devanagari-devanagari-600-normal.woff2") format("woff2");
+  unicode-range: U+0900-097F, U+1CD0-1CF9, U+200C-200D, U+20A8, U+20B9, U+20F0, U+25CC, U+A830-A839, U+A8E0-A8FF, U+11B00-11B09;
+}

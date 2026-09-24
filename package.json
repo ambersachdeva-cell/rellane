@@ -1,0 +1,29 @@
+{
+  "name": "switchboard-local-intelligence",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24.14.0 <25",
+    "pnpm": "11.9.0"
+  },
+  "scripts": {
+    "build": "npm --prefix packages/contracts run build && npm --prefix packages/runtime run build && npm --prefix apps/daemon run build && npm --prefix apps/desktop run build",
+    "dev": "npm --prefix apps/desktop run dev",
+    "test": "vitest run --pool=threads --maxWorkers=2",
+    "typecheck": "npm --prefix packages/contracts run typecheck && npm --prefix packages/runtime run typecheck && npm --prefix apps/daemon run typecheck && npm --prefix apps/desktop run typecheck",
+    "verify": "npm --prefix packages/runtime run native:verify && npm run build && npm run typecheck && npm run test",
+    "fixtures": "curl -sSL -o /private/tmp/llama-b10182-bin-macos-arm64.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b10182/llama-b10182-bin-macos-arm64.tar.gz && shasum -a 256 /private/tmp/llama-b10182-bin-macos-arm64.tar.gz | grep -q d17e65c8056573dada3b7dfaf675e95953a7b29e7f004489dd1bf434edb72394 && echo 'fixture verified' || (echo 'FIXTURE HASH MISMATCH' && exit 1)"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/node": "26.1.2",
+    "jsdom": "^30.0.1",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
+  }
+}

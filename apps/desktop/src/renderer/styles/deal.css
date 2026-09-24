@@ -1,0 +1,431 @@
+/**
+ * The Deal room.
+ *
+ * Its own file rather than another thousand lines of app.css, which is the
+ * largest stylesheet here and the reason a screen's appearance is currently
+ * impossible to reason about in isolation. A component owning its own styles is
+ * the shape the rest should move to.
+ *
+ * Every value below resolves to a token. There are no literal colours, no
+ * literal type sizes, and no magic spacing: a hue change stays a hue change
+ * instead of becoming a refactor (DESIGN.md §2).
+ */
+
+.deal {
+  display: grid;
+  /* Bar, panes, dock. The panes take whatever is left, so the dock is pinned to
+     the bottom edge at any window height rather than following the table down. */
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-surface);
+}
+
+/* ---- The bar ------------------------------------------------------------- */
+
+.deal__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.deal__who {
+  font-weight: 600;
+  font-size: var(--step-0);
+}
+
+.deal__origin {
+  font: var(--step--1) / 1.4 var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* The money, in the corner, always. Mono and tabular so a glance down a day of
+   deals compares like with like rather than by string length. */
+.deal__anchor {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--step-1);
+  font-weight: 600;
+}
+
+/* ---- The two panes ------------------------------------------------------- */
+
+.deal__panes {
+  display: grid;
+  grid-template-columns: 38fr 62fr;
+  min-height: 0;
+}
+
+.deal__evidence,
+.deal__draft {
+  overflow-y: auto;
+  min-height: 0;
+  padding: var(--space-4);
+}
+
+/* Inset, because it is a record rather than a working surface. The visual
+   difference is the whole argument of this screen: what the customer wrote is
+   not a field. */
+.deal__evidence {
+  background: var(--bg-inset);
+  border-right: 1px solid var(--border);
+}
+
+.deal__label {
+  font: var(--step--1) / 1.4 var(--font-mono);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin: 0 0 var(--space-3);
+}
+
+/* Verbatim: wrapped, never reflowed, never trimmed. */
+.deal__raw {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+/* Serif, because a quotation is a document a person is being asked to approve,
+   not a dialog they are being asked to dismiss (DESIGN.md §3). */
+.deal__quote-title {
+  font-family: var(--font-serif);
+  font-size: var(--step-2);
+  font-weight: 600;
+  margin: 0 0 var(--space-3);
+}
+
+/* ---- Line items ---------------------------------------------------------- */
+
+.deal__lines {
+  width: 100%;
+  /* `separate` rather than `collapse`: a sticky thead detaches its borders under
+     border-collapse, so the header rule tears away from the header as the table
+     scrolls. Spacing is zeroed so the rows still read as one ruled block. */
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: var(--step--1);
+}
+
+.deal__lines th,
+.deal__lines td {
+  padding: var(--space-1) var(--space-2);
+  height: 32px;
+  text-align: left;
+  /* The quieter rule: ruled paper, not a cage. */
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.deal__lines thead th {
+  font-weight: 600;
+  color: var(--text-muted);
+  background: var(--bg-surface-2);
+  position: sticky;
+  top: 0;
+}
+
+.deal__lines tbody tr:hover {
+  background: var(--bg-hover);
+}
+
+/* Anything that can be compared to another number. */
+.deal__lines .num {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.deal__unit {
+  color: var(--text-muted);
+}
+
+.deal__lines tfoot th {
+  text-align: right;
+  font-weight: 500;
+  color: var(--text-secondary);
+  border-bottom: none;
+}
+
+.deal__lines tfoot td {
+  border-bottom: none;
+}
+
+.deal__grand th,
+.deal__grand td {
+  font-size: var(--step-0);
+  font-weight: 600;
+  color: var(--text-primary);
+  border-top: 1px solid var(--border);
+}
+
+/* ---- The dock ------------------------------------------------------------ */
+
+/* Never scrolls. An outcome that has to be hunted for is an outcome that does
+   not get recorded, and the close is the row this product is actually for. */
+.deal__dock {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  min-height: 56px;
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-md);
+}
+
+.deal__state {
+  font-size: var(--step--1);
+  color: var(--text-secondary);
+}
+
+.deal__outcomes {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.deal__outcomes .field {
+  min-width: 240px;
+}
+
+/* ---- Closed --------------------------------------------------------------- */
+
+/* Colour arrives only now. A closed deal should be readable from across the
+   room; an open one should not shout, because everything on this screen is
+   open most of the time. */
+.deal__verdict {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  font-size: var(--step-0);
+}
+
+.deal__reason {
+  color: var(--text-secondary);
+  font-size: var(--step--1);
+}
+
+.deal--won .deal__dock {
+  background: var(--success-wash);
+  border-top-color: var(--success);
+}
+
+.deal--won .deal__verdict strong {
+  color: var(--success);
+}
+
+.deal--lost .deal__dock {
+  background: var(--danger-wash);
+  border-top-color: var(--danger);
+}
+
+.deal--lost .deal__verdict strong {
+  color: var(--danger);
+}
+
+.deal--no_reply .deal__dock {
+  background: var(--warning-wash);
+  border-top-color: var(--warning);
+}
+
+.deal--no_reply .deal__verdict strong {
+  color: var(--warning);
+}
+
+/* A closed deal is a record. Nothing on it invites a cursor. */
+.deal--closed .deal__draft {
+  opacity: .92;
+}
+
+@media (max-width: 900px) {
+  /* Below this the two panes stop being side by side and become one column:
+     evidence first, because the answer is worth less than the question. */
+  .deal__panes {
+    grid-template-columns: 1fr;
+    /* Both rows bounded. `auto` on the evidence row let a long customer message
+       grow to its full height and push the quotation off the bottom of the
+       window, which is the one thing on this screen you can actually edit. */
+    grid-template-rows: minmax(0, 2fr) minmax(0, 3fr);
+  }
+
+  .deal__evidence {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .deal__outcomes {
+    margin-left: 0;
+    width: 100%;
+    flex-wrap: wrap;
+  }
+}
+
+/* The quotation's heading, with the one action that belongs beside it. */
+.deal__quote-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+/* The title pushes, the buttons stay together.
+   `justify-content: space-between` put "Read the enquiry" against the heading
+   and "Preview message" against the far edge, so two actions of the same kind
+   read as unrelated — one belonging to the title, one to the room. */
+.deal__quote-head .deal__quote-title { margin-right: auto; }
+
+.deal__quote-head .deal__quote-title {
+  margin-bottom: var(--space-3);
+}
+
+/* What the customer would read. Shown as the text itself, on the inset surface
+   every other piece of evidence in this room uses. */
+.deal__preview {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+
+.deal__preview-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.deal__preview-head h3 {
+  margin: 0 auto 0 0;
+  font-size: var(--step-0);
+  font-weight: 600;
+}
+
+.deal__preview-text {
+  margin: var(--space-3) 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-sans);
+  font-size: var(--step-0);
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+/* A statement of fact, not a warning: nothing has gone wrong and nothing is
+   lost. Quiet enough that the customer's words beneath it stay the loudest
+   thing in the room. */
+.deal__junk {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--step--1);
+  color: var(--text-secondary);
+}
+
+/* The handoff's answer, under the message it is about. Usually a refusal — the
+   customer is not on the outbound list yet — so it reads as an explanation
+   rather than an alarm. */
+.deal__handoff {
+  margin: var(--space-3) 0 0;
+  font-size: var(--step--1);
+  color: var(--text-secondary);
+}
+
+/* The way back out of a price typed wrong. Quiet: it sits in every row of a
+   draft, and a column of saturated buttons beside the figures would make the
+   figures the second thing a person looks at. */
+.deal__strike {
+  width: 1%;
+  padding-left: var(--space-3);
+  text-align: right;
+  white-space: nowrap;
+  font-size: var(--step--1);
+}
+
+/* The customer's name, which is also the way in to changing it. Looks like the
+   text it replaced until it is hovered: a header full of buttons tells a person
+   the room is a form, and this room is mostly a thing to read. */
+.deal__who--edit {
+  padding: 2px var(--space-2);
+  margin-left: calc(var(--space-2) * -1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.deal__who--edit:hover { border-color: var(--border); }
+.deal__who--edit:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }
+
+.deal__phone {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--step--1);
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.deal__customer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.deal__customer-problem {
+  margin: 0;
+  flex-basis: 100%;
+  font-size: var(--step--1);
+  color: var(--danger);
+}
+
+/* Putting a line on by hand. Laid out along one line because it is four short
+   answers, not a form to fill in — and it sits under the table it adds to, so
+   the thing being changed stays in view while it is typed. */
+.deal__add {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border);
+}
+
+/* The description is the long one; everything else is a few characters. */
+.deal__add .field:first-child { flex: 1 1 240px; }
+.deal__add input { width: 100%; }
+.deal__add .field:not(:first-child) { flex: 0 0 92px; }
+
+.deal__add-problem {
+  margin: 0;
+  flex-basis: 100%;
+  font-size: var(--step--1);
+  color: var(--danger);
+}
+
+/* What this shop charged before. Under the form that asks for a rate, quiet,
+   and never in the box: the figure is the owner's own handwriting read back,
+   and what makes it useful is the quantity and the date beside it. */
+.deal__past {
+  list-style: none;
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  flex-basis: 100%;
+  display: grid;
+  gap: var(--space-2);
+  font-size: var(--step--1);
+}
+
+.deal__past button { font-family: var(--font-mono); }
+.deal__past-why { color: var(--text-muted); }

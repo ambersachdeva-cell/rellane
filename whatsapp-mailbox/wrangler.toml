@@ -1,0 +1,8 @@
+name = "rellane-whatsapp-mailbox"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# Holds inbound messages until the Mac collects them. Nothing else is kept here.
+[[kv_namespaces]]
+binding = "MAILBOX"
+id = "REPLACE_AFTER_CREATING_THE_NAMESPACE"

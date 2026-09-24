@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Hardened Runtime entitlements.
+
+	  Deliberately minimal. Each one below is here because something Rellane
+	  actually does stops working without it; anything not listed is something
+	  we have chosen not to be able to do.
+	-->
+
+	<!-- Electron's renderer needs a writable-executable JIT page for V8.
+	     Without this the app launches and every window is blank. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+
+	<!-- The bundled llama-server and the docked CLI are separate signed
+	     binaries we spawn. Without this, Hardened Runtime refuses to let a
+	     signed process launch them. -->
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Model downloads, the Hugging Face catalogue, and Telegram. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+
+	<!-- Loopback only: the local inference server binds 127.0.0.1. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+
+	<!-- Folders the user grants through the picker, and the models we install. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+
+	<!--
+	  Deliberately NOT requested, so nobody has to wonder:
+	    - camera, microphone, location, contacts, calendars, photos
+	    - address-book and Apple Events automation
+	    - com.apple.security.cs.allow-dyld-environment-variables
+	  Rellane reads the frontmost app through lsappinfo precisely so it does
+	  not need Apple Events, which would put an Automation prompt in front of
+	  a user for a feature that should just work.
+	-->
+</dict>
+</plist>

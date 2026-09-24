@@ -1,0 +1,5 @@
+import { describe, expect, it } from "vitest";
+import { ApprovedCapabilityIntentSchema } from "./capability-intent.js";
+const id = (n:number) => `00000000-0000-4000-8000-${n.toString().padStart(12,"0")}`; const hash = "a".repeat(64);
+const value = () => ({ schemaVersion:1, permissionRequestId:id(1), permissionDecisionId:id(2), spaceId:id(3), runId:id(4), effectId:id(5), effectRevision:1, effectKind:"export-artifact", authoritySessionId:id(6), subjectBindingSha256:hash, targetBindingSha256:hash, parameterSha256:hash, requestSha256:hash, expiresAt:"2026-08-03T00:05:00.000Z", maxUses:1 });
+describe("private approved capability intent", () => { it("accepts only canonical strict v1 intent", () => { expect(ApprovedCapabilityIntentSchema.safeParse(value()).success).toBe(true); for (const bad of [{...value(), path:"x"},{...value(), expiresAt:"2026-08-03T05:00:00.000+05:00"},{...value(), effectRevision:0},{...value(), maxUses:2}]) expect(ApprovedCapabilityIntentSchema.safeParse(bad).success).toBe(false); }); });

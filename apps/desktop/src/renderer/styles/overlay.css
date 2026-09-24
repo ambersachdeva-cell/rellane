@@ -1,0 +1,278 @@
+/**
+ * ⌥Space overlay — night-forward Ledger & Marigold.
+ *
+ * Motion values are the researched ones, not invented: entry uses
+ * cubic-bezier(.16,1,.3,1) which is damped with no overshoot, presses compress
+ * to .98, and hover is asymmetric (fast in, slower out) so the list feels
+ * responsive without flickering as the cursor crosses it.
+ *
+ * Explicitly not here: pulsing gradient borders, per-token typing delay,
+ * theatrical status text, springs that bounce past their box. Those read as
+ * generated slop.
+ */
+
+@import "./tokens.css";
+
+@import "./fonts.css";
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* The window itself is transparent and vibrant; the panel is the only surface. */
+.overlay-body {
+  margin: 0;
+  background: transparent;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+
+/**
+ * Liquid glass.
+ *
+ * Four things make a surface read as glass rather than as a translucent
+ * rectangle: it blurs what is behind it, it *saturates* what it blurs (real
+ * glass concentrates colour), it carries a bright specular rim along the lit
+ * edge that fades toward the bottom, and it sits on a deep soft shadow so it
+ * is clearly floating rather than painted on.
+ *
+ * The rim is a masked gradient border rather than a solid one — that is the
+ * difference between glass and the pulsing gradient outline the research
+ * called out as slop. It does not animate and it does not cycle hue.
+ *
+ * Light-mode glass is genuinely a different recipe, not an inversion: a dark
+ * glass recipe over a bright desktop turns to mud, so it blurs less, saturates
+ * less, and takes a much brighter rim. Those four numbers are the only things
+ * that change, so they are the only things the theme blocks below set. The
+ * recipe itself is written once.
+ *
+ * They cannot use light-dark() the way tokens.css does — a blur radius is not
+ * a <color>, and that function interpolates colours only.
+ */
+:root {
+  --glass-blur: 32px;
+  --glass-sat: 180%;
+  --glass-rim: rgba(255, 255, 255, .28);
+  --glass-rim-mid: rgba(255, 255, 255, .06);
+  --glass-inner-top: rgba(255, 255, 255, .10);
+  --glass-inner-bottom: rgba(0, 0, 0, .22);
+}
+
+:root[data-theme="light"] {
+  --glass-blur: 24px;
+  --glass-sat: 150%;
+  --glass-rim: rgba(255, 255, 255, .85);
+  --glass-rim-mid: rgba(255, 255, 255, .25);
+  --glass-inner-top: rgba(255, 255, 255, .70);
+  --glass-inner-bottom: rgba(20, 16, 11, .06);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --glass-blur: 24px;
+    --glass-sat: 150%;
+    --glass-rim: rgba(255, 255, 255, .85);
+    --glass-rim-mid: rgba(255, 255, 255, .25);
+    --glass-inner-top: rgba(255, 255, 255, .70);
+    --glass-inner-bottom: rgba(20, 16, 11, .06);
+  }
+}
+
+.ov {
+  position: relative;
+  margin: var(--space-3);
+  border-radius: 16px;
+  background:
+    linear-gradient(
+      to bottom,
+      color-mix(in srgb, var(--bg-surface) 72%, transparent),
+      color-mix(in srgb, var(--bg-surface) 88%, transparent)
+    );
+  backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat));
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-sat));
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-inner-top),
+    inset 0 -1px 0 0 var(--glass-inner-bottom),
+    var(--shadow-lg);
+  overflow: hidden;
+  animation: ov-in 190ms cubic-bezier(.16, 1, .3, 1);
+}
+
+/* The specular rim: bright where light lands, gone by the bottom edge. */
+.ov::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    160deg,
+    var(--glass-rim),
+    var(--glass-rim-mid) 38%,
+    rgba(255, 255, 255, 0) 62%
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+@keyframes ov-in {
+  from { opacity: 0; transform: translateY(-6px) scale(.985); }
+}
+
+/* ---- input row ---- */
+
+.ov__bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 0 var(--space-4);
+  height: 58px;
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+.ov__bar > * { -webkit-app-region: no-drag; }
+
+.ov__glyph {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--text-muted);
+  flex: none;
+}
+
+.ov__input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -.01em;
+  user-select: text;
+}
+.ov__input::placeholder { color: var(--text-muted); font-weight: 400; }
+
+/* ---- results ---- */
+
+.ov__list {
+  list-style: none;
+  margin: 0;
+  padding: var(--space-2);
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.ov__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  cursor: default;
+  /* Asymmetric: snaps in, settles out. */
+  transition: background 80ms cubic-bezier(.16, 1, .3, 1);
+}
+.ov__item:active { transform: scale(.98); }
+.ov__item.is-selected { background: var(--bg-hover); }
+.ov__item:not(.is-selected) { transition-duration: 200ms; }
+
+/* A 2px stripe carries the action's kind — colour as information, not decoration. */
+.ov__kind {
+  flex: none;
+  width: 2px;
+  align-self: stretch;
+  border-radius: 1px;
+  background: var(--text-muted);
+}
+.ov__kind--compute  { background: var(--horizon); }
+.ov__kind--skill    { background: var(--brand); }
+.ov__kind--search   { background: var(--info); }
+.ov__kind--ask      { background: var(--text-muted); }
+
+.ov__text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+
+.ov__title {
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -.005em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ov__item.is-selected .ov__title { color: var(--text-primary); }
+
+.ov__detail {
+  font-size: 12.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ov__badge {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+}
+
+/* Computed answers are the one place a result gets weight — it IS the answer. */
+.ov__item .ov__kind--compute ~ .ov__text .ov__title {
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--horizon);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- footer ---- */
+
+.ov__foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.ov__foot kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px var(--space-1);
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  color: var(--text-secondary);
+}
+
+:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+/**
+ * The command input is focused the entire time the overlay is open, so a focus
+ * ring on it is permanent decoration rather than information. The caret already
+ * says where typing goes. Every other control keeps its ring.
+ */
+.ov__input:focus-visible { outline: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .001ms !important;
+  }
+}

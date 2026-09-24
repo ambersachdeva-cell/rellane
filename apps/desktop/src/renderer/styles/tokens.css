@@ -1,0 +1,248 @@
+/** Rellane: mineral surfaces, juniper chrome and warm colour for different kinds
+ * of work. The same semantic tokens serve light and dark mode; fonts stay local. */
+
+:root {
+  /**
+   * Dark is the default and light is a full first-class theme, so the pair is
+   * declared in that order everywhere: light-dark(LIGHT, DARK) reads backwards
+   * from how this product thinks, but the CSS function's argument order is
+   * fixed and fighting it with a wrapper would be worse.
+   */
+  color-scheme: light dark;
+
+  --sidebar-bg: #172B26;
+  --sidebar-text: #E9F2E2;
+  --sidebar-muted: #B1C5B6;
+  --sidebar-hover: #253D32;
+  --sidebar-active: #D9E8C5;
+  --coral: #F08C70;
+  --coral-wash: light-dark(#FCEAE3, #422D26);
+  --iris: #B8ADE8;
+  --iris-wash: light-dark(#EEEBFA, #302E42);
+  --citron: #DBE89B;
+  --citron-wash: light-dark(#EEF3D8, #303D25);
+  --workroom-title: clamp(34px, 3.9vw, 54px);
+
+  /* ---- 1. Primitives ------------------------------------------------ */
+
+  /* Sand — warm neutral. Backgrounds, text, borders. */
+  --sand-50:#FBF7F0; --sand-100:#F3ECE0; --sand-200:#E7DBC9; --sand-300:#D6C6AC;
+  --sand-400:#B9A587; --sand-500:#8F7B5E; --sand-600:#6B5A43; --sand-700:#4E4132;
+  --sand-800:#332A20; --sand-900:#211B14; --sand-950:#14100B;
+
+  /* Peacock — brand. Primary actions, active nav, links. */
+  --teal-50:#EAF6F4; --teal-100:#CCEAE6; --teal-200:#9FD8D0; --teal-300:#66BEB4;
+  --teal-400:#2E9E93; --teal-500:#0F7E74; --teal-600:#0A6B62; --teal-700:#0B554E;
+  --teal-800:#0D4640; --teal-900:#0E3A35; --teal-950:#06211E;
+
+  /* Tulsi — success, claimed, won. */
+  --green-50:#ECF6EC; --green-100:#D2ECD3; --green-200:#A6DAA8; --green-300:#72C177;
+  --green-400:#46A64D; --green-500:#2E8B37; --green-600:#22712B; --green-700:#1D5A25;
+  --green-800:#1A481F; --green-900:#153A1B; --green-950:#0A200E;
+
+  /* Sindoor — hot leads, danger, failed sends. */
+  --red-50:#FCECE8; --red-100:#F9D6CD; --red-200:#F2AE9E; --red-300:#E97F67;
+  --red-400:#DE5237; --red-500:#C63A22; --red-600:#A82F1B; --red-700:#872718;
+  --red-800:#6B2115; --red-900:#571D14; --red-950:#300E09;
+
+  /* Marigold — warning, derived budget, junk, business hours, the horizon. */
+  --amber-50:#FDF3E0; --amber-100:#FAE3B8; --amber-200:#F4C97A; --amber-300:#EDAE3E;
+  --amber-400:#E0961A; --amber-500:#C57E0C; --amber-600:#A2660A; --amber-700:#7E4F0C;
+  --amber-800:#63400F; --amber-900:#52350F; --amber-950:#2E1D06;
+
+  /* Ink-blue — info and manual budget. Deliberately bluer than brand teal so
+     "manual" never reads as "brand". */
+  --blue-50:#EAF1FA; --blue-100:#CFE0F4; --blue-200:#A3C4E9; --blue-300:#6D9FD8;
+  --blue-400:#417CC4; --blue-500:#285FA6; --blue-600:#1F4C88; --blue-700:#1D3E6D;
+  --blue-800:#1A3459; --blue-900:#162A48; --blue-950:#0C1729;
+
+  /* WhatsApp — the channel's own colour. Only ever on a tap-to-chat control,
+     never on app status, so it stays unmistakably "this opens WhatsApp". */
+  --whatsapp:#1FA855; --whatsapp-hover:#178D46; --whatsapp-fg:#FFFFFF;
+
+  /* ---- 2. Semantics — DEFAULT IS NIGHT ------------------------------
+     Amber's call: dark-first, warm ink-brown rather than blue-black.
+     Each token states light first, then dark. */
+
+  --bg-app: light-dark(#F3F5F1, #11201C);
+  /* What the document paints. Transparent on macOS so the window's vibrancy
+     is the ground; the opaque fallback is used where there is no material. */
+  --bg-window: var(--bg-app);
+  --bg-surface: light-dark(#FFFFFF, #192C25);
+  --bg-surface-2: light-dark(#EAF0E8, #21382E);
+  --bg-inset: light-dark(#EDF1EA, #13251F);
+  --bg-hover: light-dark(#E6ECE2, #294337);
+  --bg-scrim:     light-dark(rgba(20, 16, 11, .45), rgba(0, 0, 0, .6));
+
+  --text-primary: light-dark(#21382E, #EDF3E9);
+  --text-secondary: light-dark(#4F6458, #B8CBBF);
+  --text-muted: light-dark(#5D7063, #99B2A2);
+  --text-inverse: light-dark(#FFFFFF, #172B26);
+  --text-link: light-dark(#225E4A, #BFDAA8);
+
+  --border: light-dark(#D8E1D4, #344C3F);
+  --border-strong: light-dark(#ACBCAA, #526F5B);
+  --ring: light-dark(#225E4A, #DBE89B);
+
+  --brand: light-dark(#225E4A, #BED9AC);
+  --brand-hover: light-dark(#173E32, #D0E8BF);
+  --brand-active: light-dark(#172B26, #E2F2D5);
+  --brand-fg: light-dark(#FFFFFF, #172B26);
+  /* A filled primary needs a brighter step than the accent used for text and
+     rules. On the warm dark ground `--brand` reads as *disabled* at button size:
+     not vivid enough to say "this is the action", which is the whole job of the
+     one filled control on a screen. Text keeps `--brand`; fills take this. */
+  --brand-solid: light-dark(#225E4A, #DBE89B);
+  --brand-solid-hover: light-dark(#173E32, #EBF3BD);
+  --brand-wash: light-dark(#E4EEDD, #29422F);
+
+  --danger:       light-dark(var(--red-500),   var(--red-300));
+  --danger-wash:  light-dark(var(--red-50),    rgba(233, 127, 103, .12));
+  --success:      light-dark(var(--green-600), var(--green-400));
+  --success-wash: light-dark(var(--green-50),  rgba(70, 166, 77, .12));
+  --warning:      light-dark(var(--amber-500), var(--amber-300));
+  --warning-wash: light-dark(var(--amber-50),  rgba(237, 174, 62, .12));
+
+  /* A gridline for dense data, quieter than --border.
+     A quotation's line items need a rule between rows so figures in adjacent
+     columns stay readable, but --border at every row turns a five-line quote
+     into a cage. This is the same hue one step lighter, so the table reads as
+     ruled paper rather than as a grid of boxes.
+     No --success-solid / --danger-solid ramps were added alongside it: three
+     saturated buttons in a fixed dock is precisely what DESIGN.md §1.3 spends
+     its colour budget forbidding, and the existing washes already carry the
+     three outcomes. */
+  --border-subtle: light-dark(var(--sand-200), var(--sand-800));
+  --info:         light-dark(var(--blue-600),  var(--blue-300));
+  --info-wash:    light-dark(var(--blue-50),   rgba(109, 159, 216, .12));
+
+  /* The horizon: the line between what happened and what is coming. */
+  --horizon:      light-dark(var(--amber-500), var(--amber-300));
+  --horizon-wash: light-dark(rgba(197, 126, 12, .08), rgba(237, 174, 62, .10));
+
+  /**
+   * Shadow tints, then the shadows built from them.
+   *
+   * Two depths rather than one: the near tint is the contact edge that keeps a
+   * surface from floating, the far tint is the soft cast that gives it height.
+   * A single tint scaled by opacity cannot do both — it either smears the
+   * contact edge or makes the cast too tight.
+   *
+   * On a warm ground the tint is warm too. Pure black shadow over sand reads
+   * grey and dead, which is the tell of a palette that was picked but never
+   * looked at.
+   */
+  --shadow-near: light-dark(rgba(20, 16, 11, .06), rgba(0, 0, 0, .50));
+  --shadow-far:  light-dark(rgba(20, 16, 11, .22), rgba(0, 0, 0, .80));
+
+  --shadow-sm: 0 1px 2px var(--shadow-near);
+  --shadow-md: 0 1px 2px var(--shadow-near), 0 8px 24px -16px var(--shadow-far);
+  --shadow-lg: 0 2px 6px var(--shadow-near), 0 24px 60px -28px var(--shadow-far);
+
+  /* ---- 3. Type, space, motion --------------------------------------- */
+
+  /**
+   * Three families, three jobs, and the job is the reason each is here.
+   *
+   * Sans is the interface voice. Serif is for headings only — it is what makes
+   * a plan read as a document you are being asked to approve rather than a
+   * dialog you are being asked to dismiss. Mono is for anything measured:
+   * paths, counts, durations, keys, hashes. If a number can be compared to
+   * another number, it is set in mono with tabular figures.
+   *
+   * Devanagari sits inside the sans stack rather than beside it, so a Hinglish
+   * sentence stays in one font-family declaration and picks up the right glyphs
+   * per codepoint. See fonts.css for what is actually loaded.
+   */
+  --font-sans: "IBM Plex Sans", "IBM Plex Sans Devanagari", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "IBM Plex Serif", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* A six-step scale. Anything not on it is a mistake, not a nuance. */
+  --step--1: 12.5px;
+  --step-0: 14.5px;
+  --step-1: 16px;
+  --step-2: 19px;
+  --step-3: 24px;
+  --step-4: 31px;
+
+  --space-1: 4px;  --space-2: 8px;  --space-3: 12px; --space-4: 16px;
+  --space-5: 22px; --space-6: 30px; --space-7: 42px; --space-8: 60px;
+
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --radius-lg: 9px;
+
+  --ease: cubic-bezier(.2, .7, .3, 1);
+  /* DESIGN.md §6 names this curve for entrances and it had no token, so it was
+     hardcoded five times and absent everywhere else. A named curve with no token
+     is a curve that drifts. */
+  --ease-entrance: cubic-bezier(.16, 1, .3, 1);
+  --dur-fast: 110ms;
+  --dur: 190ms;
+  --dur-slow: 340ms;
+  /* Hover is asymmetric by design (DESIGN.md §6): arriving is immediate, leaving
+     is slow enough that a cursor sweeping a dense list does not strobe. Both were
+     specified in the document and neither existed as a token. */
+  --dur-hover-in: 80ms;
+  --dur-hover-out: 200ms;
+}
+
+/**
+ * The theme switch, entire.
+ *
+ * `color-scheme` is what every light-dark() above resolves against, so setting
+ * it is the whole override — there is no second palette to keep in step. The
+ * un-stamped default stays `light dark`, which follows the OS.
+ */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"]  { color-scheme: dark; }
+
+/* ====================================================================
+   Material — surfaces that sit on the window's vibrancy
+
+   The window provides the ground (`vibrancy: under-window`). Everything
+   above it is a *tint*, not a fill: translucent white or black laid over
+   whatever the desktop is doing, which is how macOS builds depth and why
+   an opaque hex here would flatten the whole thing back into a web page.
+
+   Three steps, and three is the limit. A page with five levels of glass
+   is mush; depth reads when the steps are few and far apart.
+   ==================================================================== */
+
+:root {
+  /* Sidebar and top bar: the chrome the content floats against. */
+  --surface-1: light-dark(#F7F9F4, #172B23);
+  /* Cards and rows: the things you act on. */
+  --surface-2: light-dark(#FFFFFF, #1D3229);
+  /* Raised: modals, and the one row under the pointer. */
+  --surface-3: light-dark(#FFFFFF, #294336);
+
+  /* Inputs read as recessed rather than raised — a well, not a card. */
+  --surface-well: light-dark(#EDF2E9, #10221B);
+
+  /* Hairlines. Borders are the exception now; space separates by default. */
+  --hairline: light-dark(#DCE4D7, #324B3B);
+  --hairline-strong: light-dark(#BCCCB8, #4D6955);
+
+  /* Blur is expensive per layer, so it is spent on three surfaces only. */
+  --blur-chrome: saturate(180%) blur(30px);
+
+  --radius-panel: 16px;
+  --radius-card: 14px;
+  --radius-control: 9px;
+}
+
+/**
+ * Reduced transparency is a real macOS setting, used by people who find
+ * translucency hard to read. Honour it: the same three steps, opaque.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  :root {
+    --surface-1: light-dark(#F7F9F4, #172B23);
+    --surface-2: light-dark(#FFFFFF, #1D3229);
+    --surface-3: light-dark(#FFFFFF, #294336);
+    --surface-well: light-dark(#EDF2E9, #10221B);
+    --blur-chrome: none;
+  }
+}

@@ -1,0 +1,61 @@
+import { EventEmitter } from "node:events";
+import { DatabaseSync } from "node:sqlite";
+import type { IpcMainInvokeEvent } from "electron";
+import { beforeEach, afterEach, expect, it, vi } from "vitest";
+import { IPC_CHANNELS as C } from "../../shared/ipc-channels.js";
+import { MIGRATIONS } from "../book/schema.js";
+import { openCase, appendTurn, turnsFor } from "../book/cases.js";
+import { saveCreativeBrief, readCreativeBrief } from "./creative.js";
+import { installWorkstationCreative } from "./creative-ipc.js";
+const f = vi.hoisted(() => ({ handlers: new Map<string, (event: IpcMainInvokeEvent, input: unknown) => unknown>(), open: vi.fn(), copy: vi.fn() }));
+vi.mock("electron", () => ({ ipcMain: {handle: (name: string, handler: (event: IpcMainInvokeEvent, input: unknown) => unknown) => f.handlers.set(name, handler)}, clipboard: {writeText: f.copy}, shell: {openExternal: f.open} }));
+let db: DatabaseSync, caseId: string, event: IpcMainInvokeEvent, sender: EventEmitter, trusted: boolean;
+const book = vi.fn(() => db); const idle = vi.fn();
+const invoke = (channel: string, input: unknown) => Promise.resolve().then(() => f.handlers.get(channel)!(event, input));
+beforeEach(() => {
+  vi.resetAllMocks(); f.handlers.clear(); trusted = true; db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys=ON"); for (const migration of MIGRATIONS) db.exec(migration.sql);
+  caseId = openCase(db, {title: "Paper directions", question: "Create an image"});
+  sender = Object.assign(new EventEmitter(), {isDestroyed: () => false});
+  event = {sender, senderFrame: {}} as unknown as IpcMainInvokeEvent;
+  f.open.mockResolvedValue(undefined);
+  installWorkstationCreative({book, assertIdle: idle, assertTrusted: () => {if (!trusted) throw new Error("Untrusted");}});
+});
+afterEach(() => db.close());
+it("rejects untrusted callers and caller-defined URLs or packets before any external action", async () => {
+  trusted = false;
+  for (const channel of [C.workstationCreativeList,C.workstationCreativeSave,C.workstationCreativeCopy,C.workstationCreativeOpen,C.workstationCreativeLink]) await expect(invoke(channel,{caseId})).rejects.toThrow("Untrusted");
+  expect(book).not.toHaveBeenCalled(); trusted = true;
+  const brief = saveCreativeBrief(db,{caseId,productId:"gemini",prompt:"Paper",sourceIds:[]});
+  await expect(invoke(C.workstationCreativeOpen,{caseId,id:brief.id,url:"https://example.com/private"})).rejects.toThrow();
+  await expect(invoke(C.workstationCreativeCopy,{caseId,id:brief.id,packet:"Unreviewed"})).rejects.toThrow();
+  expect(f.open).not.toHaveBeenCalled(); expect(f.copy).not.toHaveBeenCalled();
+});
+it("copies the exact frozen brief and opens only its fixed product with no prompt in the URL", async () => {
+  const id = appendTurn(db,caseId,{seat:"Source · v1",kind:"verbatim",body:"  forest green\n"});
+  const brief = saveCreativeBrief(db,{caseId,productId:"gemini",prompt:"Make a paper study",sourceIds:[id]});
+  appendTurn(db,caseId,{seat:"Source · v2",kind:"verbatim",body:"Unselected revision"});
+  await invoke(C.workstationCreativeCopy,{caseId,id:brief.id}); expect(f.copy).toHaveBeenCalledExactlyOnceWith(brief.packet);
+  expect(f.open).not.toHaveBeenCalled(); expect(readCreativeBrief(db,caseId,brief.id).openedAt).toBeNull();
+  await invoke(C.workstationCreativeOpen,{caseId,id:brief.id}); expect(f.open).toHaveBeenCalledExactlyOnceWith("https://gemini.google.com/app");
+  const after = readCreativeBrief(db,caseId,brief.id); expect(after.openedAt).not.toBeNull(); expect(after.imageId).toBeNull(); expect(after.packet).toBe(brief.packet);
+  const other = openCase(db,{title:"Other",question:"Private"});
+  await expect(invoke(C.workstationCreativeCopy,{caseId:other,id:brief.id})).rejects.toThrow("not found");
+  expect(f.copy).toHaveBeenCalledTimes(1);
+});
+it("leaves failed and reloaded launches unconfirmed and releases the opening lock", async () => {
+  const brief = saveCreativeBrief(db,{caseId,productId:"ai-studio",prompt:"Image",sourceIds:[]});
+  f.open.mockRejectedValueOnce(new Error("Browser failed"));
+  await expect(invoke(C.workstationCreativeOpen,{caseId,id:brief.id})).rejects.toThrow("Browser failed");
+  expect(readCreativeBrief(db,caseId,brief.id).openedAt).toBeNull();
+  f.open.mockImplementationOnce(async () => {sender.emit("did-start-navigation",{isMainFrame:true});});
+  await expect(invoke(C.workstationCreativeOpen,{caseId,id:brief.id})).rejects.toThrow("window changed");
+  expect(readCreativeBrief(db,caseId,brief.id).openedAt).toBeNull();
+  await invoke(C.workstationCreativeOpen,{caseId,id:brief.id}); expect(f.open).toHaveBeenLastCalledWith("https://aistudio.google.com/");
+  expect(turnsFor(db,caseId).filter(t=>t.seat==="workstation-creative")).toHaveLength(2);
+});
+it("refuses active work before opening an external product", async () => {
+  const brief = saveCreativeBrief(db,{caseId,productId:"chatgpt",prompt:"Image",sourceIds:[]});
+  idle.mockImplementationOnce(()=>{throw new Error("Task active");});
+  await expect(invoke(C.workstationCreativeOpen,{caseId,id:brief.id})).rejects.toThrow("Task active"); expect(f.open).not.toHaveBeenCalled();
+});

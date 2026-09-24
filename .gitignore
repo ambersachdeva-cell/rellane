@@ -1,0 +1,43 @@
+node_modules/
+.pnpm-store/
+dist/
+release/
+coverage/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.gguf
+*.safetensors
+models/
+data/
+.review/
+
+# Swarm working files: queues, per-task results and generated corpora. The
+# committed artefacts are the corpus fixture and the findings acted on, not the
+# thousands of intermediate JSON files that produced them.
+.swarm/
+
+# Stray review output. `.swarm/` is the current home for this; `.review*`
+# directories were an earlier scheme and 72 files of it reached a commit.
+.review*/
+
+# Generated native addon files contain local machine paths.
+packages/runtime/native/atomic-publish/build/
+
+# Personal subscription wrapper, not part of the public toolchain.
+scripts/gem.sh
+
+# Download the pinned llama.cpp macOS runtime for local packaging.
+apps/desktop/vendor/llama-b10182/*
+!apps/desktop/vendor/llama-b10182/LICENSE
+!apps/desktop/vendor/llama-b10182/README.md
+
+# The crew's shared room is COMMITTED — `.crew/BOARD.md`, `FINDINGS.md`,
+# `MEMORY.md`, `ROSTER.md` and `HOUSE-RULES.md` are the memory whose whole
+# purpose is surviving a restart, and they lived in `/tmp` until 2026-09-05,
+# which is the one directory macOS deletes. Only the raw per-seat transcripts
+# are ignored: they are large, they are superseded by FINDINGS.md, and nothing
+# reads them twice.
+.crew/runs/
