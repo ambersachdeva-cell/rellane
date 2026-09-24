@@ -11,7 +11,7 @@ import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createSandbox, resolveInSandbox, SandboxError } from "./sandbox.js";
 
 let dir: string;
@@ -28,6 +28,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -70,9 +71,11 @@ describe("a granted root that is itself a link to somewhere sensitive", () => {
     // name it was given, and then had its real target added to the roots — the
     // one thing the never-granted list exists to make impossible.
     //
-    // `.claude` rather than `.ssh`: the check resolves the link, so the target
-    // has to actually exist for the test to exercise the path at all.
+    // Use a temporary home so this test does not depend on the runner's
+    // credential directories or touch the developer's real home.
+    vi.stubEnv("HOME", dir);
     const secrets = join(homedir(), ".claude");
+    await mkdir(secrets);
     const decoy = join(dir, "harmless");
     await symlink(secrets, decoy);
 

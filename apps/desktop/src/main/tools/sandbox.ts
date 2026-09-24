@@ -12,6 +12,7 @@
  */
 
 import { realpath, lstat } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 
@@ -95,9 +96,14 @@ export async function createSandbox(grantedRoots: readonly string[]): Promise<Sa
 function isSensitive(candidate: string): boolean {
   const home = homedir();
   const normalised = resolve(candidate);
+  // macOS may spell the temporary home as /var/... while realpath returns
+  // /private/var/.... Check both spellings against the credential denylist.
+  const realHome = realpathSync(home, { encoding: "utf8" });
   return NEVER.some((entry) => {
-    const banned = resolve(home, entry);
-    return normalised === banned || isInside(banned, normalised);
+    return [home, realHome].some((base) => {
+      const banned = resolve(base, entry);
+      return normalised === banned || isInside(banned, normalised);
+    });
   });
 }
 
