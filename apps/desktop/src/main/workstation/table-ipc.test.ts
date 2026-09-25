@@ -220,4 +220,33 @@ describe("Workstation table IPC", () => {
 
     await expect(queryPromise).rejects.toThrow("This window changed");
   });
+
+  it("evaluates SQL queries, column stats, formulas, and record transforms through the tabular workbench", async () => {
+    sourceTextMap.set("case-1:turn-1", "item,price\nDesk,200\nChair,100\n");
+
+    const readResult = (await invoke(IPC_CHANNELS.workstationTableParse, {
+      caseId: "case-1",
+      sourceTurnId: "turn-1",
+      includeWorkbenchStats: true,
+      sql: "SELECT item, price FROM data WHERE price > 150",
+      formula: "=SUM(10, 20, 30)",
+      transformCode: "records.map(r => ({ item: r.item, doubled: Number(r.price) * 2 }))"
+    })) as {
+      workbenchStats?: readonly { name: string; count: number }[];
+      sqlResult?: { rowCount: number; rows: readonly (readonly unknown[])[] };
+      formulaResult?: { success: boolean; result: unknown };
+      transformResult?: { success: boolean; records?: readonly Record<string, unknown>[] };
+    };
+
+    expect(readResult.workbenchStats).toHaveLength(2);
+    expect(readResult.sqlResult?.rowCount).toBe(1);
+    expect(readResult.sqlResult?.rows[0]).toEqual(["Desk", 200]);
+    expect(readResult.formulaResult?.success).toBe(true);
+    expect(readResult.formulaResult?.result).toBe(60);
+    expect(readResult.transformResult?.success).toBe(true);
+    expect(readResult.transformResult?.records).toEqual([
+      { item: "Desk", doubled: 400 },
+      { item: "Chair", doubled: 200 }
+    ]);
+  });
 });

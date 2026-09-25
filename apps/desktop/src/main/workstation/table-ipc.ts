@@ -4,11 +4,31 @@ import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
 import { parseTable, type ParsedTable } from "./table-parse.js";
-import { runQuery, type Filter, type QueryResult, type QuerySpec } from "./table-query.js";
+import { runQuery, type Filter, type QueryResult as TableQueryResult, type QuerySpec } from "./table-query.js";
+import {
+  createTabularWorkbench,
+  type ColumnSchema,
+  type ColumnStats,
+  type QueryResult,
+  type TabularWorkbench
+} from "./duckdb-workbench.js";
+import {
+  evaluateFormula,
+  transformTabularData,
+  type SandboxResult
+} from "./wasm-sandbox.js";
+
+export const MAX_IPC_PAYLOAD_BYTES = 10 * 1024 * 1024;
+export const MAX_PATH_LENGTH = 4096;
 
 export const WorkstationTableParseInputSchema = z.object({
   caseId: z.string().min(1).max(500),
-  sourceTurnId: z.string().min(1).max(500)
+  sourceTurnId: z.string().min(1).max(500),
+  sql: z.string().min(1).optional(),
+  formula: z.string().min(1).optional(),
+  formulaVariables: z.record(z.string(), z.union([z.number(), z.string(), z.boolean()])).optional(),
+  transformCode: z.string().min(1).optional(),
+  includeWorkbenchStats: z.boolean().optional()
 });
 
 export const QueryFilterSchema = z.object({
@@ -62,6 +82,32 @@ export const WorkstationTableQueryInputSchema = z.union([
     limit: z.number().int().nonnegative().max(100_000).optional()
   })
 ]);
+
+export const WorkstationTableReadInputSchema = z.object({
+  caseId: z.string().min(1).max(500).optional(),
+  sourceTurnId: z.string().min(1).max(500).optional(),
+  path: z.string().min(1).max(MAX_PATH_LENGTH).optional(),
+  filePath: z.string().min(1).max(MAX_PATH_LENGTH).optional(),
+  sql: z.string().min(1).optional(),
+  formula: z.string().min(1).optional(),
+  formulaVariables: z.record(z.string(), z.union([z.number(), z.string(), z.boolean()])).optional(),
+  transformCode: z.string().min(1).optional(),
+  includeWorkbenchStats: z.boolean().optional()
+});
+
+export const TableReadInputSchema = WorkstationTableReadInputSchema;
+
+export const WorkstationTableExportInputSchema = z.object({
+  caseId: z.string().min(1).max(500).optional(),
+  sourceTurnId: z.string().min(1).max(500).optional(),
+  path: z.string().min(1).max(MAX_PATH_LENGTH).optional(),
+  filePath: z.string().min(1).max(MAX_PATH_LENGTH).optional(),
+  content: z.string().max(MAX_IPC_PAYLOAD_BYTES).optional(),
+  format: z.string().optional(),
+  data: z.unknown().optional()
+});
+
+export const TableExportInputSchema = WorkstationTableExportInputSchema;
 
 export interface TableQueryRequest {
   readonly caseId: string;
@@ -129,6 +175,92 @@ export function parseQueryRequest(input: unknown): TableQueryRequest {
   };
 }
 
+export interface LoadedTableColumn {
+  readonly name: string;
+  readonly type?: string | undefined;
+}
+
+export interface LoadedTable {
+  readonly columns: readonly LoadedTableColumn[];
+  readonly rows: readonly (readonly unknown[])[];
+}
+
+export interface TableWorkbenchAnalysis {
+  readonly workbenchStats?: readonly ColumnStats[];
+  readonly sqlResult?: QueryResult;
+  readonly formulaResult?: SandboxResult;
+  readonly transformResult?: {
+    readonly success: boolean;
+    readonly records?: readonly Record<string, unknown>[];
+    readonly error?: string;
+  };
+}
+
+export function analyzeLoadedTableWithWorkbench(
+  table: LoadedTable,
+  options?: {
+    sql?: string | undefined;
+    formula?: string | undefined;
+    formulaVariables?: Record<string, number | string | boolean> | undefined;
+    transformCode?: string | undefined;
+    includeWorkbenchStats?: boolean | undefined;
+  }
+): TableWorkbenchAnalysis {
+  const records: Record<string, unknown>[] = [];
+  const cols = table.columns;
+  const rows = table.rows;
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const record: Record<string, unknown> = {};
+    if (Array.isArray(row)) {
+      for (let c = 0; c < cols.length; c++) {
+        const col = cols[c];
+        const colName =
+          typeof col === "string"
+            ? col
+            : col && typeof col.name === "string"
+              ? col.name
+              : `col_${c}`;
+        record[colName] = row[c];
+      }
+    }
+    records.push(record);
+  }
+
+  const workbench: TabularWorkbench = createTabularWorkbench();
+  workbench.createTableFromRecords("data", records);
+
+  const analysis: {
+    workbenchStats?: readonly ColumnStats[];
+    sqlResult?: QueryResult;
+    formulaResult?: SandboxResult;
+    transformResult?: {
+      readonly success: boolean;
+      readonly records?: readonly Record<string, unknown>[];
+      readonly error?: string;
+    };
+  } = {};
+
+  if (options?.includeWorkbenchStats === true) {
+    analysis.workbenchStats = workbench.calculateStats("data");
+  }
+  if (options?.sql !== undefined) {
+    analysis.sqlResult = workbench.execute(options.sql);
+  }
+  if (options?.formula !== undefined) {
+    analysis.formulaResult = evaluateFormula(options.formula, {
+      variables: options.formulaVariables ?? {},
+      tables: { data: table.rows }
+    });
+  }
+  if (options?.transformCode !== undefined) {
+    analysis.transformResult = transformTabularData(records, options.transformCode);
+  }
+
+  return analysis;
+}
+
 export interface InstallWorkstationTableOptions {
   readonly assertTrusted: (event: IpcMainInvokeEvent) => void;
   readonly sourceText: (caseId: string, sourceTurnId: string) => Promise<string | null>;
@@ -139,37 +271,53 @@ export function installWorkstationTable(options: InstallWorkstationTableOptions)
   const ownerFor = (event: IpcMainInvokeEvent) => owners(event.sender, event.senderFrame);
   let inFlight = false;
 
-  ipcMain.handle(IPC_CHANNELS.workstationTableParse, async (event, input: unknown): Promise<ParsedTable> => {
-    options.assertTrusted(event);
-    const owner = ownerFor(event);
-
-    if (inFlight) {
-      throw new Error("A table operation is already running. Wait for it to finish.");
-    }
-
-    const request = WorkstationTableParseInputSchema.parse(input);
-
-    inFlight = true;
-    try {
-      const text = await options.sourceText(request.caseId, request.sourceTurnId);
-      if (text === null) {
-        throw new Error(`Source turn ${request.sourceTurnId} was not found in this work.`);
-      }
-
-      const result = parseTable(text);
-
+  ipcMain.handle(
+    IPC_CHANNELS.workstationTableParse,
+    async (event, input: unknown): Promise<ParsedTable & TableWorkbenchAnalysis> => {
       options.assertTrusted(event);
-      if (ownerFor(event) !== owner) {
-        throw new Error("This window changed while reading the table.");
+      const owner = ownerFor(event);
+
+      if (inFlight) {
+        throw new Error("A table operation is already running. Wait for it to finish.");
       }
 
-      return result;
-    } finally {
-      inFlight = false;
-    }
-  });
+      const request = WorkstationTableParseInputSchema.parse(input);
 
-  ipcMain.handle(IPC_CHANNELS.workstationTableQuery, async (event, input: unknown): Promise<QueryResult> => {
+      inFlight = true;
+      try {
+        const text = await options.sourceText(request.caseId, request.sourceTurnId);
+        if (text === null) {
+          throw new Error(`Source turn ${request.sourceTurnId} was not found in this work.`);
+        }
+
+        const result = parseTable(text);
+
+        options.assertTrusted(event);
+        if (ownerFor(event) !== owner) {
+          throw new Error("This window changed while reading the table.");
+        }
+
+        if (
+          request.sql !== undefined ||
+          request.formula !== undefined ||
+          request.transformCode !== undefined ||
+          request.includeWorkbenchStats !== undefined
+        ) {
+          const analysis = analyzeLoadedTableWithWorkbench(result, request);
+          return {
+            ...result,
+            ...analysis
+          };
+        }
+
+        return result;
+      } finally {
+        inFlight = false;
+      }
+    }
+  );
+
+  ipcMain.handle(IPC_CHANNELS.workstationTableQuery, async (event, input: unknown): Promise<TableQueryResult> => {
     options.assertTrusted(event);
     const owner = ownerFor(event);
 
@@ -201,3 +349,6 @@ export function installWorkstationTable(options: InstallWorkstationTableOptions)
     }
   });
 }
+
+export { createTabularWorkbench, evaluateFormula, transformTabularData };
+export type { ColumnSchema, ColumnStats, QueryResult, SandboxResult, TabularWorkbench };

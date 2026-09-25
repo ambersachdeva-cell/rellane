@@ -85,4 +85,25 @@ describe("continuity IPC authority", () => {
     expect(() => invoke(C.workstationRenameWork, {caseId, title: "Old editor overwrites", expectedTitle: "Original"})).toThrow("changed");
     expect(readCase(db, caseId)?.title).toBe("Production checklist");
   });
+  it("computes learned routines and provider handoff briefs on demand without altering default continuity shape", () => {
+    const caseId = openCase(db, {title: "Quarterly review", question: "Summarize the invoice ledger"});
+    appendTurn(db, caseId, {seat: "owner", kind: "verbatim", body: "Please inspect the attached invoice ledger for \"Acme Corp\" and prepare a summary checklist of overdue balances."});
+    appendTurn(db, caseId, {seat: "Source · ledger.csv", kind: "verbatim", body: "Invoice,Amount\nINV-01,1200"});
+    appendTurn(db, caseId, {seat: "claude", kind: "finding", body: "## Checklist\n- INV-01 overdue"});
+    db.prepare("INSERT INTO case_turn (id, case_id, seq, seat, kind, body, at) VALUES (?, ?, 4, 'claude', 'verbatim', '## Checklist\n- INV-01 overdue', 1000)").run("turn-ans-1", caseId);
+    const enriched = invoke(C.workstationContinuity, {
+      includeLearned: true,
+      handoffCaseId: caseId,
+      currentProviderId: "codex",
+      lastProviderId: "claude",
+      draft: "Draft the follow-up note."
+    }) as {
+      learnedRoutines: unknown[];
+      handoff: { brief: { text: string; evidence: string[] }; composed: { carried: boolean; composed: string } | null };
+    };
+    expect(Array.isArray(enriched.learnedRoutines)).toBe(true);
+    expect(enriched.handoff.brief.text).toContain("Acme Corp");
+    expect(enriched.handoff.composed?.carried).toBe(true);
+    expect(enriched.handoff.composed?.composed).toContain("Draft the follow-up note.");
+  });
 });

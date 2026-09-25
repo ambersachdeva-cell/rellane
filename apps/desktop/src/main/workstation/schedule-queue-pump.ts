@@ -74,6 +74,9 @@ export function createScheduleQueuePump(options: ScheduleQueuePumpOptions) {
       const at = asOf ?? now();
       if (!Number.isSafeInteger(at) || at <= 0) throw new Error("Schedule clock is invalid.");
       const db = options.book();
+      if (!db || typeof (db as { prepare?: unknown }).prepare !== "function") {
+        return { status: "busy" };
+      }
       if (!recovered) {
         recoverCrashedOccurrences(db, { at });
         recovered = true;

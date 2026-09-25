@@ -3,11 +3,22 @@ import { ipcMain } from "electron";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
+import {
+  countWord,
+  probeSentence,
+  runProbes,
+  type Probe,
+  type ProbeResult
+} from "../probes.js";
 
 /** Budget in milliseconds before in-flight probes are abandoned and reported as unknown. */
 export const SELF_CHECK_BUDGET_MS = 8_000;
 
-export const WorkstationSelfCheckInputSchema = z.object({}).strict();
+export const WorkstationSelfCheckInputSchema = z
+  .object({
+    includeProbeSentences: z.boolean().optional()
+  })
+  .strict();
 export type WorkstationSelfCheckInput = z.infer<typeof WorkstationSelfCheckInputSchema>;
 
 export const SelfCheckInputSchema = WorkstationSelfCheckInputSchema;
@@ -44,9 +55,52 @@ export interface ProbedFacts {
   readonly diskFreeBytes: number | null;
   readonly lastBackupAt: number | null;
   readonly now: number;
+  readonly probeResults?: readonly (ProbeResult & { readonly sentence: string })[];
 }
 
 export type SelfCheckProbes = Omit<InstallSelfCheckOptions, "assertTrusted">;
+
+export async function summarizeProbedFactsWithProbes(
+  facts: ProbedFacts,
+  now?: () => number
+): Promise<readonly (ProbeResult & { readonly sentence: string })[]> {
+  const probes: Probe[] = [
+    {
+      id: "book",
+      claim: "Local SQLite Book",
+      run: async () => ({
+        ok: facts.bookOpen,
+        said: facts.bookOpen
+          ? `Book open with ${countWord(facts.bookTables ?? 0, "table")}`
+          : "Book is not open"
+      })
+    },
+    {
+      id: "local-model",
+      claim: "Local GGUF Model",
+      run: async () => ({
+        ok: facts.localModelReady,
+        said: facts.localModelDetail
+      })
+    },
+    {
+      id: "keychain",
+      claim: "OS Keychain",
+      run: async () => ({
+        ok: facts.keychainAvailable,
+        said: facts.keychainAvailable
+          ? "OS encryption available"
+          : "OS keychain unavailable"
+      })
+    }
+  ];
+
+  const results = await runProbes(probes, now);
+  return results.map((r) => ({
+    ...r,
+    sentence: probeSentence(r)
+  }));
+}
 
 /**
  * Strips absolute filesystem paths, binary names, authentication tokens, and stack traces
@@ -354,13 +408,21 @@ export function installSelfCheck(options: InstallSelfCheckOptions): void {
       options.assertTrusted(event);
       const owner = ownerFor(event);
 
-      WorkstationSelfCheckInputSchema.parse(input === undefined ? {} : input);
+      const parsed = WorkstationSelfCheckInputSchema.parse(input === undefined ? {} : input);
 
       const result = await runCoalescedProbe();
 
       options.assertTrusted(event);
       if (ownerFor(event) !== owner) {
         throw new Error("This window changed while checking your system.");
+      }
+
+      if (parsed.includeProbeSentences === true) {
+        const probeResults = await summarizeProbedFactsWithProbes(result);
+        return {
+          ...result,
+          probeResults
+        };
       }
 
       return result;

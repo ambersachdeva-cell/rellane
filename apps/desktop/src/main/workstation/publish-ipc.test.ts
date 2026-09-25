@@ -334,4 +334,32 @@ describe("publish-ipc", () => {
       previewHandler(mockEvent, { caseId: "case-1", format: "pdf" })
     ).rejects.toThrow();
   });
+
+  it("renders Typst and themed multi-section publications via document-publisher", async () => {
+    const writeMock = vi.fn().mockResolvedValue("/cases/case-1/published");
+    const options: InstallPublishOptions = {
+      assertTrusted: vi.fn(),
+      caseFolder: vi.fn().mockResolvedValue("/cases/case-1/published"),
+      latestOutput: vi.fn().mockResolvedValue({
+        title: "Board Memo",
+        body: "Key takeaways for Q3.",
+        sources: [{ label: "Q3 Ledger" }]
+      }),
+      write: writeMock
+    };
+
+    installPublish(options);
+
+    const previewHandler = handlers.get(IPC_CHANNELS.workstationPublishPreview)!;
+    const preview = (await previewHandler(mockEvent, {
+      caseId: "case-1",
+      format: "typst",
+      theme: "editorial",
+      subtitle: "Confidential"
+    })) as PublishPreviewResult;
+
+    expect(preview.files).toHaveLength(1);
+    expect(preview.files[0]!.relativePath).toBe("board-memo.typ");
+    expect(preview.files[0]!.bytes).toBeGreaterThan(20);
+  });
 });

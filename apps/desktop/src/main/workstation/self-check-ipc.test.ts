@@ -146,11 +146,6 @@ describe("self-check-ipc", () => {
   });
 
   it("sanitizes details by removing paths, executables, tokens, and stack traces", async () => {
-    const syntheticJwt = [
-      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
-      "eyJzdWIiOiIxMjM0NTY3ODkwIn0",
-      "dozjgNryP4J3jVmNHl0w"
-    ].join(".");
     const dirtyDetail =
       "Error: command failed: /usr/local/bin/ollama.exe --version with token sk-ant-api03-12345678901234567890\n    at ChildProcess.exithandler (/Users/amber/app.js:12:34)";
 
@@ -174,7 +169,7 @@ describe("self-check-ipc", () => {
       ],
       probeLocalModel: async () => ({
         ready: false,
-        detail: `Failed with Bearer ${syntheticJwt} at /var/run/model.sock:1:1`
+        detail: "Failed with Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w at /var/run/model.sock:1:1"
       }),
       probeFolders: async () => ({ granted: 1, lost: [] }),
       probeTelegram: async () => ({ linked: false, chatPaired: false }),
@@ -257,5 +252,32 @@ describe("self-check-ipc", () => {
 
     const trustedEvent = { trusted: true, sender: { id: 1 }, senderFrame: {} } as unknown as IpcMainInvokeEvent;
     await expect(handler!(trustedEvent, "invalid string input")).rejects.toThrow();
+  });
+
+  it("includes formatted probe sentences when includeProbeSentences is requested", async () => {
+    const options: InstallSelfCheckOptions = {
+      assertTrusted: vi.fn(),
+      probeBook: async () => ({ open: true, tables: 12 }),
+      probeProviders: async () => [],
+      probeLocalModel: async () => ({ ready: true, detail: "Qwen ready" }),
+      probeFolders: async () => ({ granted: 1, lost: [] }),
+      probeTelegram: async () => ({ linked: false, chatPaired: false }),
+      probeKeychain: () => true,
+      probeDisk: async () => 2048,
+      lastBackupAt: async () => null
+    };
+
+    installSelfCheck(options);
+    const handler = registeredHandlers.get("workstation:self-check")!;
+    const event = { sender: { id: 1 }, senderFrame: {} } as unknown as IpcMainInvokeEvent;
+
+    const result = (await handler(event, { includeProbeSentences: true })) as {
+      probeResults?: readonly { id: string; outcome: string; sentence: string }[];
+    };
+
+    expect(result.probeResults).toBeDefined();
+    expect(result.probeResults).toHaveLength(3);
+    expect(result.probeResults?.[0]?.sentence).toContain("Checked just now");
+    expect(result.probeResults?.[0]?.sentence).toContain("12 tables");
   });
 });

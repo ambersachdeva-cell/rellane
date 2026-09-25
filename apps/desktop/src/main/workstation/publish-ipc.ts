@@ -4,11 +4,41 @@ import { ipcMain } from "electron";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
+import {
+  publishDocument,
+  type PublicationFormat,
+  type PublicationSection,
+  type PublicationResult
+} from "./document-publisher.js";
 import { publishOutput, type PublishFormat } from "./publish-output.js";
 
 export const WorkstationPublishInputSchema = z.object({
   caseId: z.string().min(1),
-  format: z.enum(["html", "markdown", "slides"] satisfies [PublishFormat, ...PublishFormat[]])
+  format: z.enum(["html", "markdown", "slides", "typst"]),
+  theme: z.enum(["graphite", "editorial", "classic"]).optional(),
+  sections: z
+    .array(
+      z.object({
+        heading: z.string(),
+        content: z.string(),
+        subheadings: z
+          .array(
+            z.object({
+              title: z.string(),
+              body: z.string()
+            })
+          )
+          .optional(),
+        callout: z
+          .object({
+            type: z.enum(["note", "warning", "metric"]),
+            text: z.string()
+          })
+          .optional()
+      })
+    )
+    .optional(),
+  subtitle: z.string().optional()
 });
 
 export type WorkstationPublishInput = z.infer<typeof WorkstationPublishInputSchema>;
@@ -50,6 +80,51 @@ export interface InstallPublishOptions {
     folder: string,
     files: readonly { readonly relativePath: string; readonly contents: string }[]
   ) => Promise<string>;
+}
+
+export function buildRichPublication(input: {
+  title: string;
+  body: string;
+  format: PublicationFormat;
+  author: string;
+  subtitle?: string | undefined;
+  theme?: "graphite" | "editorial" | "classic" | undefined;
+  sections?:
+    | readonly {
+        readonly heading: string;
+        readonly content: string;
+        readonly subheadings?: readonly { readonly title: string; readonly body: string }[] | undefined;
+        readonly callout?: { readonly type: "note" | "warning" | "metric"; readonly text: string } | undefined;
+      }[]
+    | undefined;
+}): {
+  files: { relativePath: string; contents: string }[];
+  summary: string;
+  warnings: readonly string[];
+} {
+  const sections: readonly PublicationSection[] = input.sections
+    ? input.sections.map((s) => ({
+        heading: s.heading,
+        content: s.content,
+        ...(s.subheadings !== undefined ? { subheadings: s.subheadings } : {}),
+        ...(s.callout !== undefined ? { callout: s.callout } : {})
+      }))
+    : [{ heading: input.title, content: input.body }];
+
+  const pub: PublicationResult = publishDocument({
+    format: input.format,
+    title: input.title,
+    ...(input.subtitle !== undefined ? { subtitle: input.subtitle } : {}),
+    author: input.author,
+    sections,
+    ...(input.theme !== undefined ? { theme: input.theme } : {})
+  });
+
+  return {
+    files: [{ relativePath: pub.filename, contents: pub.content }],
+    summary: `Published ${pub.filename} (${pub.format})`,
+    warnings: [] as readonly string[]
+  };
 }
 
 // Ensure relative paths never escape the target directory using directory traversal or absolute paths.
@@ -109,14 +184,27 @@ export function installPublish(options: InstallPublishOptions): void {
         throw new Error("This case has no saved output to publish.");
       }
 
-      const result = publishOutput({
-        title: output.title,
-        body: output.body,
-        format: request.format,
-        author: "Amber",
-        at: Date.now(),
-        sources: output.sources
-      });
+      const isRich =
+        request.format === "typst" || request.theme !== undefined || request.sections !== undefined;
+
+      const result = isRich
+        ? buildRichPublication({
+            title: output.title,
+            body: output.body,
+            format: request.format,
+            author: "Amber",
+            subtitle: request.subtitle,
+            theme: request.theme,
+            sections: request.sections
+          })
+        : publishOutput({
+            title: output.title,
+            body: output.body,
+            format: request.format as PublishFormat,
+            author: "Amber",
+            at: Date.now(),
+            sources: output.sources
+          });
 
       const files: readonly PublishPreviewFile[] = result.files.map((file) => ({
         relativePath: file.relativePath,
@@ -165,14 +253,27 @@ export function installPublish(options: InstallPublishOptions): void {
           throw new Error("This case does not have a folder to write into.");
         }
 
-        const result = publishOutput({
-          title: output.title,
-          body: output.body,
-          format: request.format,
-          author: "Amber",
-          at: Date.now(),
-          sources: output.sources
-        });
+        const isRich =
+          request.format === "typst" || request.theme !== undefined || request.sections !== undefined;
+
+        const result = isRich
+          ? buildRichPublication({
+              title: output.title,
+              body: output.body,
+              format: request.format,
+              author: "Amber",
+              subtitle: request.subtitle,
+              theme: request.theme,
+              sections: request.sections
+            })
+          : publishOutput({
+              title: output.title,
+              body: output.body,
+              format: request.format as PublishFormat,
+              author: "Amber",
+              at: Date.now(),
+              sources: output.sources
+            });
 
         assertSafePaths(folder, result.files);
 
