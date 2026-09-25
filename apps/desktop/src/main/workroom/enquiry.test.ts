@@ -180,7 +180,7 @@ describe("bounded enquiry review", () => {
       return valid(payload);
     };
     await expect(service.prepareEnquiry(db, input, h.deps)).rejects.toThrow("late answer");
-    expect(turnsFor(db, id).at(-1)?.body).toContain("stopped");
+    expect(turnsFor(db, id).at(-1)?.body).toContain("stop requested; did not complete");
     expect(turnsFor(db, id).some(turn => turn.seat === ENQUIRY_PROPOSAL_SEAT)).toBe(false);
     expect(h.cancelled).toContain(input.operationId);
     expect(service.current(id)).toBeNull();

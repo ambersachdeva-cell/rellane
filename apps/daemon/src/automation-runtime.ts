@@ -17,7 +17,16 @@ import {
 import path from "node:path";
 import {
   AUTOMATION_SCHEMA_VERSION,
+  AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION,
   AutomationAgentSaveInputSchema,
+  AutomationHostAttemptIntentSchema,
+  AutomationHostBindOperationInputSchema,
+  AutomationHostReconcileTerminalInputSchema,
+  AutomationHostReserveAttemptInputSchema,
+  AutomationHostReviewDescriptorSchema,
+  AutomationHostTerminalEvidenceSchema,
+  AutomationHostTerminalStatusSchema,
+  AutomationPendingHostReviewInputSchema,
   AutomationAgentSchema,
   AutomationArtifactReviewInputSchema,
   AutomationArtifactSchema,
@@ -32,18 +41,33 @@ import {
   AutomationOutboxEntrySchema,
   AutomationRunActionInputSchema,
   AutomationRunSnapshotSchema,
+  AutomationReviewBoundWorkflowInputSchema,
   AutomationRunStartInputSchema,
   AutomationSourceDocumentSchema,
   AutomationSourceImportInputSchema,
   AutomationWorkflowSaveInputSchema,
   AutomationWorkflowPackSchema,
   AutomationWorkflowSchema,
+  AutomationWorkflowV2Schema,
   AutomationWorkspaceSnapshotSchema,
   LocalChatResultSchema,
   LOOP_WINDOW_MS,
+  MAX_REVIEW_CONTEXT_CHARACTERS,
   tripsLoopGuard,
   type AutomationAgent,
   type AutomationAgentSaveInput,
+  type AutomationGraphProvenance,
+  type AutomationHostAttemptIntent,
+  type AutomationHostBindOperationInput,
+  type AutomationHostReconcileTerminalInput,
+  type AutomationHostReserveAttemptInput,
+  type AutomationHostReviewDependencyOutput,
+  type AutomationHostReviewDescriptor,
+  type AutomationHostTerminalEvidence,
+  type AutomationHostTerminalStatus,
+  type AutomationModelRoute,
+  type AutomationPendingHostReviewInput,
+  type AutomationReviewBinding,
   type AutomationArtifact,
   type AutomationArtifactReviewInput,
   type AutomationConnector,
@@ -55,6 +79,7 @@ import {
   type AutomationReceipt,
   type AutomationRunActionInput,
   type AutomationRunSnapshot,
+  type AutomationReviewBoundWorkflowInput,
   type AutomationRunStartInput,
   type AutomationRunStep,
   type AutomationSourceDocument,
@@ -336,6 +361,8 @@ export class AutomationRuntime {
     const existing = this.workspace.workflows.find(
       (workflow) => workflow.id === captured.id
     );
+    if (existing?.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+      throw new Error("A review-bound workflow cannot be replaced by a legacy workflow.");
     const at = this.now();
     const workflow = AutomationWorkflowSchema.parse({
       schemaVersion: AUTOMATION_SCHEMA_VERSION,
@@ -354,6 +381,707 @@ export class AutomationRuntime {
     ];
     await this.persist();
     return clone(AutomationWorkflowSchema, workflow);
+  }
+
+  /**
+   * Creates a new, explicitly Case-declared graph that stops before every
+   * model call. This is a state boundary only: Host must later verify the Case
+   * and selected source turns before preparing a model review.
+   */
+  async saveReviewBoundWorkflow(
+    input: AutomationReviewBoundWorkflowInput
+  ): Promise<AutomationWorkflow> {
+    await this.ensureReady();
+    this.assertOpen();
+    const captured = AutomationReviewBoundWorkflowInputSchema.parse(input);
+    if (this.workspace.workflows.some(workflow => workflow.id === captured.workflow.id))
+      throw new Error("Review-bound opt-in requires a new workflow ID.");
+    const agents = new Map(this.workspace.agents.map(agent => [agent.id, agent]));
+    const agentIds = [...new Set(captured.workflow.nodes.map(node => node.agentId))];
+    const agentRevisions = agentIds.map(agentId => {
+      const agent = agents.get(agentId);
+      if (agent === undefined) throw new Error("A review-bound node references an unknown agent.");
+      return { agentId, revision: agent.revision };
+    });
+    const at = this.now();
+    const workflow = AutomationWorkflowSchema.parse({
+      schemaVersion: AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION,
+      ...captured.workflow,
+      reviewBinding: {
+        caseId: captured.caseId,
+        sourceTurnIds: captured.sourceTurnIds,
+        reviewRequired: true,
+        agentRevisions
+      },
+      revision: 1,
+      pausedReason: null,
+      createdAt: at.toISOString(),
+      updatedAt: at.toISOString(),
+      lastRunAt: null,
+      nextRunAt: nextRunAt(captured.workflow, at)
+    });
+    this.workspace.workflows = [workflow, ...this.workspace.workflows];
+    await this.persist();
+    return clone(AutomationWorkflowSchema, workflow);
+  }
+
+  /**
+   * Returns a bounded, read-only pending Host review descriptor for an exact
+   * {runId, nodeId, attemptId} currently awaiting review.
+   */
+  async getPendingHostReviewDescriptor(
+    input: AutomationPendingHostReviewInput
+  ): Promise<AutomationHostReviewDescriptor> {
+    await this.ensureReady();
+    const captured = AutomationPendingHostReviewInputSchema.parse(input);
+    const run = this.workspace.runs.find((candidate) => candidate.id === captured.runId);
+    if (run === undefined) {
+      throw new Error("Automation run not found.");
+    }
+    if (run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      throw new Error("Host review descriptors are only available for review-bound runs.");
+    }
+    if (isTerminal(run.state) || run.state !== "waiting") {
+      throw new Error("Automation run is closed or not awaiting review.");
+    }
+    if (run.activeNodeId !== captured.nodeId) {
+      throw new Error("The specified node is not the active review node.");
+    }
+    const step = run.steps.find((candidate) => candidate.nodeId === captured.nodeId);
+    if (step === undefined) {
+      throw new Error("Automation step not found.");
+    }
+    if (step.state !== "awaiting-review") {
+      throw new Error("Automation step is not awaiting review.");
+    }
+    if (!("attemptId" in step) || step.attemptId !== captured.attemptId) {
+      throw new Error("Automation attempt ID is stale or does not match.");
+    }
+    if (step.finishedAt !== null) {
+      throw new Error("Automation step has already completed.");
+    }
+
+    if (this.now().getTime() >= Date.parse(run.deadlineAt)) {
+      throw new Error("Automation run has exceeded its deadline.");
+    }
+    if (
+      !("workflowSnapshot" in run) ||
+      run.workflowSnapshot === undefined ||
+      run.workflowSnapshot === null
+    ) {
+      throw new Error("Automation run is missing required workflow snapshot.");
+    }
+
+    const snapshot = AutomationWorkflowV2Schema.parse(run.workflowSnapshot);
+
+    if (
+      run.workflowId !== snapshot.id ||
+      run.workflowRevision !== snapshot.revision ||
+      run.workflowName !== snapshot.name
+    ) {
+      throw new Error("Automation run workflow snapshot mismatch: workflow identity does not match snapshot.");
+    }
+
+    if (
+      run.budget.maxDurationMs !== snapshot.budget.maxDurationMs ||
+      run.budget.maxNodeExecutions !== snapshot.budget.maxNodeExecutions ||
+      run.budget.maxOutputCharacters !== snapshot.budget.maxOutputCharacters
+    ) {
+      throw new Error("Automation run workflow snapshot mismatch: budget does not match snapshot.");
+    }
+
+    const normalizeBinding = (binding: AutomationReviewBinding) => ({
+      caseId: binding.caseId,
+      reviewRequired: binding.reviewRequired,
+      sourceTurnIds: [...binding.sourceTurnIds],
+      agentRevisions: [...binding.agentRevisions].sort((a, b) => a.agentId.localeCompare(b.agentId))
+    });
+
+    if (
+      JSON.stringify(normalizeBinding(run.reviewBinding)) !==
+      JSON.stringify(normalizeBinding(snapshot.reviewBinding))
+    ) {
+      throw new Error("Automation run workflow snapshot mismatch: reviewBinding does not match snapshot.");
+    }
+
+    if (run.steps.length !== snapshot.nodes.length) {
+      throw new Error("Automation run workflow snapshot mismatch: step count does not match snapshot node count.");
+    }
+
+    const stepNodeIds = new Set(run.steps.map((candidate) => candidate.nodeId));
+    if (stepNodeIds.size !== run.steps.length) {
+      throw new Error("Automation run workflow snapshot mismatch: duplicate step node IDs.");
+    }
+
+    const snapshotNodeIds = new Set(snapshot.nodes.map((candidate) => candidate.id));
+    if (snapshotNodeIds.size !== snapshot.nodes.length) {
+      throw new Error("Automation run workflow snapshot mismatch: duplicate snapshot node IDs.");
+    }
+
+    const normalizedSteps = [...run.steps]
+      .map((candidate) => ({
+        nodeId: candidate.nodeId,
+        title: candidate.title,
+        instruction: candidate.instruction,
+        kind: candidate.kind,
+        connectorId: candidate.connectorId ?? null,
+        agentId: candidate.agent.agentId,
+        dependsOn: [...candidate.dependsOn]
+      }))
+      .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+
+    const normalizedNodes = [...snapshot.nodes]
+      .map((candidate) => ({
+        nodeId: candidate.id,
+        title: candidate.title,
+        instruction: candidate.instruction,
+        kind: candidate.kind,
+        connectorId: candidate.connectorId ?? null,
+        agentId: candidate.agentId,
+        dependsOn: [...candidate.dependsOn]
+      }))
+      .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
+
+    if (JSON.stringify(normalizedSteps) !== JSON.stringify(normalizedNodes)) {
+      throw new Error("Automation run workflow snapshot mismatch: step structure does not match snapshot nodes.");
+    }
+
+    const currentWorkflow = this.workspace.workflows.find(
+      (candidate) => candidate.id === run.workflowId
+    );
+    if (currentWorkflow === undefined) {
+      throw new Error("Automation workflow not found.");
+    }
+    if (currentWorkflow.revision !== run.workflowRevision) {
+      throw new Error("Automation workflow has changed since the run was started.");
+    }
+    const currentSemanticHash = computeSemanticWorkflowHash(currentWorkflow);
+    const snapshotSemanticHash = computeSemanticWorkflowHash(snapshot);
+    if (currentSemanticHash !== snapshotSemanticHash) {
+      throw new Error("Automation workflow content has changed since the run was started.");
+    }
+
+    const currentAgent = this.workspace.agents.find(
+      (candidate) => candidate.id === step.agent.agentId
+    );
+    if (currentAgent === undefined) {
+      throw new Error("Automation agent not found.");
+    }
+    if (currentAgent.revision !== step.agent.agentRevision) {
+      throw new Error("Automation agent has changed since the run was started.");
+    }
+    if (computeAgentHash(currentAgent) !== computeAgentHash(step.agent)) {
+      throw new Error("Automation agent content has changed since the run was started.");
+    }
+
+    for (const pinned of run.reviewBinding.agentRevisions) {
+      const boundAgent = this.workspace.agents.find(
+        (candidate) => candidate.id === pinned.agentId
+      );
+      if (boundAgent === undefined || boundAgent.revision !== pinned.revision) {
+        throw new Error("A review-bound agent has changed since the run was started.");
+      }
+    }
+
+    const dependencyOutputs: AutomationHostReviewDependencyOutput[] = [];
+    const effectiveSourceTurnIds: string[] = [...run.reviewBinding.sourceTurnIds];
+    for (const depId of step.dependsOn) {
+      const depStep = run.steps.find((candidate) => candidate.nodeId === depId);
+      if (depStep === undefined) {
+        throw new Error(`Automation dependency step ${depId} not found.`);
+      }
+      if (depStep.state !== "completed" || depStep.output === null) {
+        throw new Error(`Dependency output for step ${depStep.title} is missing.`);
+      }
+      dependencyOutputs.push({
+        nodeId: depStep.nodeId,
+        title: depStep.title,
+        output: depStep.output,
+        outputSha256: createHash("sha256").update(depStep.output, "utf8").digest("hex")
+      });
+      if (
+        "answerTurnId" in depStep &&
+        typeof depStep.answerTurnId === "string" &&
+        !effectiveSourceTurnIds.includes(depStep.answerTurnId)
+      ) {
+        effectiveSourceTurnIds.push(depStep.answerTurnId);
+      }
+    }
+
+    const context = dependencyOutputs
+      .map((dep) => `### ${dep.title}\n${dep.output}`)
+      .join("\n\n");
+
+    const totalComposedCharacters =
+      step.agent.systemPrompt.length + step.instruction.length + context.length;
+    if (totalComposedCharacters > MAX_REVIEW_CONTEXT_CHARACTERS) {
+      throw new Error("Composed system, instruction, and dependency context exceeded maximum review size.");
+    }
+
+    const workflowSha256 = computeWorkflowHash(snapshot);
+    const agentSha256 = computeAgentHash(step.agent);
+
+    const provenance: AutomationGraphProvenance = {
+      workflowId: run.workflowId,
+      workflowRevision: run.workflowRevision,
+      workflowName: run.workflowName,
+      runId: run.id,
+      runCreatedAt: run.createdAt,
+      triggerKind: run.triggerKind,
+      nodeId: step.nodeId,
+      nodeTitle: step.title,
+      dependsOn: [...step.dependsOn],
+      attempt: step.attempt,
+      attemptId: step.attemptId
+    };
+
+    const descriptor: AutomationHostReviewDescriptor = {
+      schemaVersion: AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION,
+      runId: run.id,
+      nodeId: step.nodeId,
+      attemptId: step.attemptId,
+      workflowId: run.workflowId,
+      workflowRevision: run.workflowRevision,
+      workflowSha256,
+      agentId: step.agent.agentId,
+      agentRevision: step.agent.agentRevision,
+      agentSha256,
+      caseId: run.reviewBinding.caseId,
+      sourceTurnIds: effectiveSourceTurnIds,
+      contextPolicy: {
+        sourceTurnIds: [...effectiveSourceTurnIds],
+        includeSystemPrompt: true,
+        includeInstruction: true,
+        includeDependencyOutputs: true,
+        allowGlobalMemory: false,
+        allowApprovedExamples: false
+      },
+      instruction: step.instruction,
+      systemPrompt: step.agent.systemPrompt,
+      context,
+      dependencyOutputs,
+      runtimeId: step.agent.runtimeId,
+      modelId: step.agent.modelId,
+      routingMode: step.agent.routingMode,
+      fallbackRoutes: [...step.agent.fallbackRoutes],
+      temperature: step.agent.temperature,
+      maxTokens: step.agent.maxTokens,
+      provenance
+    };
+
+    return AutomationHostReviewDescriptorSchema.parse(descriptor);
+  }
+
+  async reserveHostAttempt(
+    input: AutomationHostReserveAttemptInput
+  ): Promise<AutomationRunSnapshot & { intent: AutomationHostAttemptIntent; correlation: string; run: AutomationRunSnapshot }> {
+    await this.ensureReady();
+    this.assertOpen();
+    const captured = AutomationHostReserveAttemptInputSchema.parse(input);
+    const run = this.requireRun(captured.runId);
+    if (run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      throw new Error("Host attempt reservation is only available for review-bound runs.");
+    }
+    if (isTerminal(run.state) || run.state === "cancelled") {
+      throw new Error("Automation run is closed or cancelled.");
+    }
+    if (this.now().getTime() >= Date.parse(run.deadlineAt)) {
+      throw new Error("Automation run has exceeded its deadline.");
+    }
+    const activeLease = this.workspace.leases.find(
+      (lease) => lease.runId === run.id && lease.state === "active"
+    );
+    if (activeLease === undefined) {
+      throw new Error("Active automation lease is required.");
+    }
+    if (run.activeNodeId !== captured.nodeId) {
+      throw new Error("The specified node is not the active review node.");
+    }
+    const step = run.steps.find((candidate) => candidate.nodeId === captured.nodeId);
+    if (step === undefined) {
+      throw new Error("Automation step not found.");
+    }
+    if (!("attemptId" in step) || step.attemptId !== captured.attemptId) {
+      throw new Error("Automation attempt ID is stale or does not match.");
+    }
+    if (step.state === "host-reserved" || ("intent" in step && step.intent !== null)) {
+      throw new Error("This automation attempt has already been reserved.");
+    }
+    if (step.state !== "awaiting-review") {
+      throw new Error("Automation step is not awaiting review.");
+    }
+
+    const descriptor = await this.getPendingHostReviewDescriptor({
+      runId: captured.runId,
+      nodeId: captured.nodeId,
+      attemptId: captured.attemptId
+    });
+
+    const parsedDescriptor = AutomationHostReviewDescriptorSchema.parse(descriptor);
+    const computedSha256 = createHash("sha256")
+      .update(JSON.stringify(parsedDescriptor), "utf8")
+      .digest("hex");
+
+    if (computedSha256 !== captured.descriptorSha256) {
+      throw new Error("Descriptor SHA256 mismatch or stale descriptor.");
+    }
+
+    const correlation = randomUUID();
+    const intent: AutomationHostAttemptIntent = {
+      correlation,
+      correlationId: correlation,
+      descriptorSha256: captured.descriptorSha256,
+      createdAt: this.now().toISOString()
+    };
+
+    step.state = "host-reserved";
+    step.intent = intent;
+    touch(run, this.now());
+    await this.persist();
+
+    const clonedRun = clone(AutomationRunSnapshotSchema, run);
+    return {
+      ...clonedRun,
+      run: clonedRun,
+      intent: clone(AutomationHostAttemptIntentSchema, intent),
+      correlation
+    };
+  }
+
+  async bindHostOperation(
+    inputOrRunId: AutomationHostBindOperationInput | string,
+    nodeId?: string,
+    attemptId?: string,
+    operationId?: string,
+    correlation?: string
+  ): Promise<AutomationRunSnapshot & { run: AutomationRunSnapshot }> {
+    await this.ensureReady();
+    this.assertOpen();
+    const rawInput = typeof inputOrRunId === "string"
+      ? {
+          runId: inputOrRunId,
+          nodeId: nodeId!,
+          attemptId: attemptId!,
+          operationId: operationId!,
+          correlation
+        }
+      : inputOrRunId;
+    const captured = AutomationHostBindOperationInputSchema.parse(rawInput);
+    const run = this.requireRun(captured.runId);
+    if (run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      throw new Error("Host operation binding is only available for review-bound runs.");
+    }
+    if (isTerminal(run.state) || run.state === "cancelled") {
+      throw new Error("Automation run is closed or cancelled.");
+    }
+    const activeLease = this.workspace.leases.find(
+      (lease) => lease.runId === run.id && lease.state === "active"
+    );
+    if (activeLease === undefined) {
+      throw new Error("Active automation lease is required.");
+    }
+    if (run.activeNodeId !== captured.nodeId) {
+      throw new Error("The specified node is not the active review node.");
+    }
+    const step = run.steps.find((candidate) => candidate.nodeId === captured.nodeId);
+    if (step === undefined) {
+      throw new Error("Automation step not found.");
+    }
+    if (!("attemptId" in step) || step.attemptId !== captured.attemptId) {
+      throw new Error("Automation attempt ID is stale or does not match.");
+    }
+    if (step.state !== "host-reserved") {
+      throw new Error("Automation step must be in host-reserved state to bind an operation.");
+    }
+    if (!("intent" in step) || step.intent === null || step.intent === undefined) {
+      throw new Error("Automation step has no reservation intent.");
+    }
+    const expectedCorrelation = step.intent.correlation;
+    if (captured.correlation !== undefined && captured.correlation !== expectedCorrelation) {
+      throw new Error("Correlation mismatch.");
+    }
+    if (captured.correlationId !== undefined && captured.correlationId !== expectedCorrelation) {
+      throw new Error("Correlation mismatch.");
+    }
+
+    if (step.operationId !== null) {
+      if (step.operationId === captured.operationId) {
+        throw new Error("Duplicate operation binding is refused.");
+      }
+      throw new Error("Attempt is already bound to a different operation ID.");
+    }
+
+    step.operationId = captured.operationId;
+    touch(run, this.now());
+    await this.persist();
+
+    const clonedRun = clone(AutomationRunSnapshotSchema, run);
+    return { ...clonedRun, run: clonedRun };
+  }
+
+  /**
+   * Reconciles an authoritative terminal outcome from the trusted Host bridge.
+   *
+   * Callable only by the trusted adapter in a later package.
+   * DEPENDENCY NOTICE: This daemon API depends on the future trusted desktop bridge
+   * to verify terminal evidence against authoritative Host receipts before calling.
+   */
+  async reconcileHostTerminal(
+    inputOrCorrelation: AutomationHostReconcileTerminalInput | string,
+    operationId?: string,
+    terminalEvidence?: AutomationHostTerminalEvidence
+  ): Promise<AutomationRunSnapshot & { run: AutomationRunSnapshot }> {
+    await this.ensureReady();
+    this.assertOpen();
+    const rawInput = typeof inputOrCorrelation === "string"
+      ? {
+          correlation: inputOrCorrelation,
+          operationId: operationId!,
+          terminalEvidence: terminalEvidence!
+        }
+      : inputOrCorrelation;
+    const captured = AutomationHostReconcileTerminalInputSchema.parse(rawInput);
+    const evidence = AutomationHostTerminalEvidenceSchema.parse(
+      captured.terminalEvidence ?? captured.evidence
+    );
+
+    const run = this.workspace.runs.find((candidate) =>
+      candidate.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION &&
+      candidate.steps.some(
+        (s) => "intent" in s && s.intent !== null && s.intent.correlation === captured.correlation
+      )
+    );
+    if (run === undefined || run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      throw new Error("No automation step found matching the correlation.");
+    }
+    if (captured.runId !== undefined && run.id !== captured.runId) {
+      throw new Error("Automation run ID mismatch.");
+    }
+
+    const step = run.steps.find(
+      (s) => "intent" in s && s.intent !== null && s.intent.correlation === captured.correlation
+    );
+    if (step === undefined) {
+      throw new Error("No automation step found matching the correlation.");
+    }
+    if (captured.nodeId !== undefined && step.nodeId !== captured.nodeId) {
+      throw new Error("Automation step node ID mismatch.");
+    }
+    if (captured.attemptId !== undefined && (!("attemptId" in step) || step.attemptId !== captured.attemptId)) {
+      throw new Error("Automation attempt ID mismatch.");
+    }
+
+    if (!("intent" in step) || step.intent === null) {
+      throw new Error("Step has no reservation intent.");
+    }
+    if (step.intent.correlation !== captured.correlation) {
+      throw new Error("Intent correlation mismatch.");
+    }
+
+    if (step.operationId === null) {
+      if (evidence.status === "interrupted") {
+        step.operationId = captured.operationId;
+      } else {
+        throw new Error("No operation ID has been bound to this reserved attempt.");
+      }
+    }
+    if (step.operationId !== captured.operationId) {
+      throw new Error("Bound operation ID mismatch.");
+    }
+
+    const isUnprovenInterrupted =
+      step.state === "interrupted" &&
+      step.error === "Unproven Host dispatch was interrupted by restart.";
+    const isCancelledWhileReserved =
+      step.state === "cancelled" &&
+      step.error === "Cancelled while reserved for Host.";
+
+    if (
+      step.state === "completed" ||
+      step.state === "failed" ||
+      (step.state === "interrupted" && !isUnprovenInterrupted) ||
+      (step.state === "cancelled" && !isCancelledWhileReserved)
+    ) {
+      throw new Error("Duplicate terminal reconciliation is refused.");
+    }
+    if (step.state !== "host-reserved" && !isUnprovenInterrupted && !isCancelledWhileReserved) {
+      throw new Error("Automation step must be in host-reserved state to reconcile terminal evidence.");
+    }
+
+    for (const depId of step.dependsOn) {
+      const depStep = run.steps.find((s) => s.nodeId === depId);
+      if (depStep === undefined || depStep.state !== "completed" || depStep.output === null) {
+        throw new Error(`Dependency step ${depId} is incomplete or missing output.`);
+      }
+    }
+
+    if (!run.reviewBinding || !run.reviewBinding.caseId) {
+      throw new Error("Review binding Case provenance is missing.");
+    }
+
+    if (evidence.status === "completed" && this.now().getTime() >= Date.parse(run.deadlineAt)) {
+      throw new Error("Automation run has exceeded its deadline.");
+    }
+
+    if (run.state !== "cancelled" && evidence.status === "completed") {
+      const activeLease = this.workspace.leases.find(
+        (lease) => lease.runId === run.id && lease.state === "active"
+      );
+      if (activeLease === undefined) {
+        throw new Error("Active automation lease is required.");
+      }
+    }
+
+    if (evidence.status === "completed") {
+      if (evidence.answerTurnId === null) {
+        throw new Error("Completed terminal outcome requires a non-null answerTurnId.");
+      }
+      if (evidence.output === null) {
+        throw new Error("Completed terminal outcome requires non-null output.");
+      }
+      if (evidence.outputSha256 === null) {
+        throw new Error("Completed terminal outcome requires non-null outputSha256.");
+      }
+      const actualHash = createHash("sha256").update(evidence.output, "utf8").digest("hex");
+      if (actualHash !== evidence.outputSha256) {
+        throw new Error("Terminal output SHA256 mismatch.");
+      }
+
+      const existingOutput = run.steps
+        .filter((s) => s.nodeId !== step.nodeId)
+        .reduce((sum, s) => sum + (s.output?.length ?? 0), 0);
+      if (existingOutput + evidence.output.length > run.budget.maxOutputCharacters) {
+        step.state = "failed";
+        step.output = evidence.output.slice(0, Math.max(0, run.budget.maxOutputCharacters - existingOutput));
+        step.error = "The automation exceeded its output budget.";
+        step.finishedAt = this.now().toISOString();
+        failRun(this.workspace, run, this.now(), step.error);
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      step.output = evidence.output;
+      if ("attemptId" in step) {
+        step.answerTurnId = evidence.answerTurnId;
+      }
+      step.state = "completed";
+      step.finishedAt = this.now().toISOString();
+      step.error = null;
+
+      if (run.state === "cancelled") {
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      const allCompleted = run.steps.every((s) => s.state === "completed");
+      if (allCompleted) {
+        run.error = null;
+        finalizeRun(this.workspace, run, this.now(), "completed");
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      const totalAttempts = run.steps.reduce((sum, s) => sum + s.attempt, 0);
+      if (totalAttempts >= run.budget.maxNodeExecutions) {
+        failRun(this.workspace, run, this.now(), "The automation exceeded its node execution budget.");
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      const completedNodeIds = new Set(
+        run.steps.filter((s) => s.state === "completed").map((s) => s.nodeId)
+      );
+      const readySuccessor = run.steps.find(
+        (s) => s.state === "pending" && s.dependsOn.every((depId) => completedNodeIds.has(depId))
+      );
+      if (readySuccessor === undefined) {
+        failRun(this.workspace, run, this.now(), "The automation has no executable dependency-ready node.");
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      const depOutputs: string[] = [];
+      for (const depId of readySuccessor.dependsOn) {
+        const depStep = run.steps.find((s) => s.nodeId === depId);
+        if (depStep?.output) {
+          depOutputs.push(`### ${depStep.title}\n${depStep.output}`);
+        }
+      }
+      const contextText = depOutputs.join("\n\n");
+      const totalContextChars =
+        readySuccessor.agent.systemPrompt.length + readySuccessor.instruction.length + contextText.length;
+      if (totalContextChars > MAX_REVIEW_CONTEXT_CHARACTERS) {
+        failRun(
+          this.workspace,
+          run,
+          this.now(),
+          "Composed system, instruction, and dependency context exceeded maximum review size."
+        );
+        await this.persist();
+        const clonedRun = clone(AutomationRunSnapshotSchema, run);
+        return { ...clonedRun, run: clonedRun };
+      }
+
+      const freshAttemptId = randomUUID();
+      readySuccessor.state = "awaiting-review";
+      readySuccessor.attempt += 1;
+      readySuccessor.attemptId = freshAttemptId;
+      readySuccessor.startedAt = this.now().toISOString();
+      readySuccessor.finishedAt = null;
+      readySuccessor.operationId = null;
+      readySuccessor.output = null;
+      readySuccessor.error = null;
+      if ("intent" in readySuccessor) {
+        readySuccessor.intent = null;
+      }
+      run.state = "waiting";
+      run.activeNodeId = readySuccessor.nodeId;
+      run.finishedAt = null;
+      run.error = null;
+      touch(run, this.now());
+      await this.persist();
+      const clonedRun = clone(AutomationRunSnapshotSchema, run);
+      return { ...clonedRun, run: clonedRun };
+    }
+
+    if (evidence.status === "failed") {
+      step.state = "failed";
+      step.error = "Host execution failed.";
+      step.finishedAt = this.now().toISOString();
+      if (run.state !== "failed" && run.state !== "cancelled") {
+        failRun(this.workspace, run, this.now(), step.error);
+      }
+    } else if (evidence.status === "stopped") {
+      step.state = "cancelled";
+      step.error = "Host execution was stopped.";
+      step.finishedAt = this.now().toISOString();
+      if (run.state !== "cancelled") {
+        finalizeRun(this.workspace, run, this.now(), "cancelled");
+      }
+    } else {
+      step.state = "interrupted";
+      step.error = "Host execution was interrupted.";
+      step.finishedAt = this.now().toISOString();
+      if (run.state !== "cancelled" && (run.state !== "interrupted" || run.receipts.length === 0)) {
+        finalizeRun(this.workspace, run, this.now(), "interrupted");
+      }
+      const lease = this.workspace.leases.find(
+        (candidate) => candidate.runId === run.id && candidate.state === "active"
+      );
+      if (lease !== undefined) {
+        lease.state = "released";
+        lease.releasedAt = this.now().toISOString();
+      }
+    }
+
+    await this.persist();
+    const clonedRun = clone(AutomationRunSnapshotSchema, run);
+    return { ...clonedRun, run: clonedRun };
   }
 
   async saveMemory(
@@ -492,6 +1220,8 @@ export class AutomationRuntime {
       (candidate) => candidate.id === workflowId
     );
     if (workflow === undefined) throw new Error("Automation workflow not found.");
+    if (workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+      throw new Error("Review-bound workflows cannot be exported as legacy workflow packs.");
     const agentIds = new Set(workflow.nodes.map((node) => node.agentId));
     const connectorIds = new Set(
       workflow.nodes.flatMap((node) => node.connectorId === null ? [] : [node.connectorId])
@@ -534,6 +1264,10 @@ export class AutomationRuntime {
     await this.ensureReady();
     this.assertOpen();
     const captured = AutomationWorkflowPackSchema.parse(pack);
+    if (this.workspace.workflows.some(workflow =>
+      workflow.id === captured.workflow.id &&
+      workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION))
+      throw new Error("A legacy pack cannot replace a review-bound workflow.");
     for (const agent of captured.agents) await this.saveAgent(agent);
     for (const connector of captured.connectors) {
       const existing = this.workspace.connectors.find((item) => item.id === connector.id);
@@ -585,6 +1319,9 @@ export class AutomationRuntime {
         problem,
         summary: problem
       });
+
+    if (workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+      return said("This Case-bound graph requires Host review before every model step.");
 
     const agents = new Map(this.workspace.agents.map((agent) => [agent.id, agent]));
     const missing = workflow.nodes.find((node) => !agents.has(node.agentId));
@@ -691,6 +1428,12 @@ export class AutomationRuntime {
     }
 
     const agents = new Map(this.workspace.agents.map((agent) => [agent.id, agent]));
+    if (workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      for (const pinned of workflow.reviewBinding.agentRevisions) {
+        if (agents.get(pinned.agentId)?.revision !== pinned.revision)
+          throw new Error("A review-bound agent changed; create a new reviewed workflow version.");
+      }
+    }
     const created = this.now();
     const runId = randomUUID();
     const steps = workflow.nodes.map((node): AutomationRunStep => {
@@ -717,6 +1460,8 @@ export class AutomationRuntime {
         },
         state: "pending",
         attempt: 0,
+        ...(workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION
+          ? { attemptId: null, intent: null } : {}),
         operationId: null,
         resolvedRoute: null,
         citations: [],
@@ -726,23 +1471,41 @@ export class AutomationRuntime {
         error: null
       };
     });
+    let firstReviewNodeId: string | null = null;
+    if (workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+      const roots = steps.filter(step => step.dependsOn.length === 0);
+      if (roots.length !== 1 || !("attemptId" in roots[0]!))
+        throw new Error("A review-bound graph requires exactly one root model node.");
+      const ready = roots[0]!;
+      ready.state = "awaiting-review";
+      ready.attempt = 1;
+      ready.attemptId = randomUUID();
+      ready.startedAt = created.toISOString();
+      ready.intent = null;
+      firstReviewNodeId = ready.nodeId;
+    }
     const run = AutomationRunSnapshotSchema.parse({
-      schemaVersion: AUTOMATION_SCHEMA_VERSION,
+      schemaVersion: workflow.schemaVersion,
       id: runId,
       workflowId: workflow.id,
       workflowRevision: workflow.revision,
       workflowName: workflow.name,
-      state: "queued",
+      state: firstReviewNodeId === null ? "queued" : "waiting",
       triggerKind,
+      ...(workflow.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION
+        ? {
+            reviewBinding: structuredClone(workflow.reviewBinding),
+            workflowSnapshot: clone(AutomationWorkflowV2Schema, workflow)
+          } : {}),
       budget: workflow.budget,
       createdAt: created.toISOString(),
       updatedAt: created.toISOString(),
-      startedAt: null,
+      startedAt: firstReviewNodeId === null ? null : created.toISOString(),
       finishedAt: null,
       deadlineAt: new Date(
         created.getTime() + workflow.budget.maxDurationMs
       ).toISOString(),
-      activeNodeId: null,
+      activeNodeId: firstReviewNodeId,
       error: null,
       steps,
       receipts: []
@@ -766,7 +1529,7 @@ export class AutomationRuntime {
       nextRunAt: nextRunAt(workflow, created)
     };
     await this.persist();
-    this.kick(run.id);
+    if (workflow.schemaVersion === AUTOMATION_SCHEMA_VERSION) this.kick(run.id);
     return clone(AutomationRunSnapshotSchema, run);
   }
 
@@ -778,6 +1541,8 @@ export class AutomationRuntime {
 
     switch (captured.action) {
       case "pause":
+        if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+          throw new Error("Review-bound attempts cannot pause before Host reconciliation.");
         if (run.state === "queued" || run.state === "running") {
           run.state = "paused";
           touch(run, this.now());
@@ -785,6 +1550,8 @@ export class AutomationRuntime {
         }
         break;
       case "resume":
+        if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+          throw new Error("Review-bound runs cannot resume until Host has verified the exact attempt.");
         if (run.state !== "paused" && run.state !== "interrupted") {
           throw new Error("Only paused or interrupted runs can resume.");
         }
@@ -806,17 +1573,24 @@ export class AutomationRuntime {
           run.error = "Cancelled by the user.";
           const operationId = activeStep(run)?.operationId;
           if (operationId !== null && operationId !== undefined) {
-            this.runtime.cancel(operationId);
+            if (run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) {
+              this.runtime.cancel(operationId);
+            }
           }
           for (const step of run.steps) {
             if (
               step.state === "pending" ||
               step.state === "running" ||
-              step.state === "waiting-approval"
+              step.state === "waiting-approval" ||
+              step.state === "awaiting-review"
             ) {
               step.state = "cancelled";
               step.operationId = null;
               step.finishedAt = cancelledAt.toISOString();
+            } else if (step.state === "host-reserved") {
+              step.state = "cancelled";
+              step.finishedAt = cancelledAt.toISOString();
+              step.error = "Cancelled while reserved for Host.";
             }
           }
           for (const request of this.workspace.capabilityRequests) {
@@ -830,6 +1604,8 @@ export class AutomationRuntime {
         }
         break;
       case "retry": {
+        if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+          throw new Error("Review-bound attempts cannot retry without Host reconciliation.");
         this.acquireLease(run);
         const target = captured.nodeId === undefined
           ? run.steps.find((step) => [
@@ -853,6 +1629,8 @@ export class AutomationRuntime {
       }
       case "approve-tool":
       case "deny-tool": {
+        if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+          throw new Error("Review-bound runs have no daemon tool approval path.");
         const request = this.workspace.capabilityRequests.find(
           (candidate) => candidate.id === captured.requestId &&
             candidate.runId === run.id
@@ -1011,6 +1789,8 @@ export class AutomationRuntime {
     const at = this.now();
     for (const run of this.workspace.runs) {
       if (isTerminal(run.state)) continue;
+      if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION &&
+          run.state === "interrupted") continue;
       if (run.state === "paused" || run.state === "waiting") continue;
       const step = activeStep(run);
       if (step?.operationId !== null && step?.operationId !== undefined) {
@@ -1052,6 +1832,46 @@ export class AutomationRuntime {
     let changed = false;
     const at = this.now();
     for (const run of this.workspace.runs) {
+      if (run.schemaVersion !== AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) continue;
+      if (isTerminal(run.state) || run.state === "interrupted") continue;
+      const step = activeStep(run);
+      if (step?.state === "host-reserved") {
+        step.state = "interrupted";
+        step.finishedAt = at.toISOString();
+        step.error = "Unproven Host dispatch was interrupted by restart.";
+        run.state = "interrupted";
+        run.activeNodeId = null;
+        run.finishedAt = at.toISOString();
+        run.error = "Review-bound attempt unproven dispatch was interrupted by restart; reconciliation is required.";
+        touch(run, at);
+        changed = true;
+        continue;
+      }
+      if (run.state === "waiting" && !this.workspace.leases.some(lease =>
+        lease.runId === run.id && lease.state === "active")) {
+        // The attempt may have reached a future Host before the lease was lost.
+        // Keep its identity and hold the workflow; never recreate or dispatch it.
+        this.workspace.leases.unshift(AutomationLeaseSchema.parse({
+          schemaVersion: AUTOMATION_SCHEMA_VERSION,
+          id: randomUUID(),
+          workflowId: run.workflowId,
+          runId: run.id,
+          state: "active",
+          acquiredAt: at.toISOString(),
+          releasedAt: null
+        }));
+        if (step?.state === "awaiting-review") {
+          step.state = "interrupted";
+          step.finishedAt = at.toISOString();
+          step.error = "Review-bound attempt lease was missing after restart.";
+        }
+        run.error = "Review-bound attempt lease was missing after restart; reconciliation is required.";
+        finalizeRun(this.workspace, run, at, "interrupted");
+        changed = true;
+      }
+    }
+    for (const run of this.workspace.runs) {
+      if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION) continue;
       if (run.state !== "queued" && run.state !== "running") continue;
       const step = activeStep(run);
       if (step?.state === "running" || step?.state === "waiting-approval") {
@@ -1096,7 +1916,10 @@ export class AutomationRuntime {
   private async execute(runId: string): Promise<void> {
     while (!this.closing) {
       const run = this.requireRun(runId);
-      if (isTerminal(run.state) || run.state === "paused") return;
+      if (isTerminal(run.state) || run.state === "paused" || run.state === "waiting") return;
+      // No legacy execution path may dispatch a review-bound model attempt.
+      if (run.schemaVersion === AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION)
+        throw new Error("Review-bound runs require Host attempt reconciliation before execution.");
       const at = this.now();
       if (at.getTime() >= Date.parse(run.deadlineAt)) {
         failRun(this.workspace, run, at, "The automation exceeded its time budget.");
@@ -1925,4 +2748,41 @@ function parseEncryptedEnvelope(value: unknown): EncryptedAutomationEnvelope {
     throw new Error("The encrypted automation workspace is invalid.");
   }
   return record as unknown as EncryptedAutomationEnvelope;
+}
+
+function computeWorkflowHash(workflow: AutomationWorkflow): string {
+  const parsed = AutomationWorkflowSchema.parse(workflow);
+  return createHash("sha256").update(JSON.stringify(parsed), "utf8").digest("hex");
+}
+
+function computeSemanticWorkflowHash(workflow: AutomationWorkflow): string {
+  const parsed = AutomationWorkflowSchema.parse(workflow);
+  const { lastRunAt: _lastRunAt, nextRunAt: _nextRunAt, ...semantic } = parsed;
+  return createHash("sha256").update(JSON.stringify(semantic), "utf8").digest("hex");
+}
+
+function computeAgentHash(agent: {
+  readonly id?: string;
+  readonly agentId?: string;
+  readonly name: string;
+  readonly systemPrompt: string;
+  readonly runtimeId: string;
+  readonly modelId: string;
+  readonly routingMode: "fixed" | "fallback";
+  readonly fallbackRoutes: readonly AutomationModelRoute[];
+  readonly temperature: number;
+  readonly maxTokens: number;
+}): string {
+  const payload = JSON.stringify({
+    id: agent.agentId ?? agent.id,
+    name: agent.name,
+    systemPrompt: agent.systemPrompt,
+    runtimeId: agent.runtimeId,
+    modelId: agent.modelId,
+    routingMode: agent.routingMode,
+    fallbackRoutes: agent.fallbackRoutes,
+    temperature: agent.temperature,
+    maxTokens: agent.maxTokens
+  });
+  return createHash("sha256").update(payload, "utf8").digest("hex");
 }

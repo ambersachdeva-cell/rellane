@@ -42,6 +42,20 @@ it("refuses the legacy direct-ask channel even with a renderer-supplied approval
   expect(f.request).not.toHaveBeenCalled();
 });
 
+it("refuses raw local chat and cancellation even with forged approval and operation IDs", async () => {
+  const f = setup();
+  await expect(f.call(IPC_CHANNELS.runtimeChat, {
+    operationId: "00000000-0000-4000-8000-000000000001",
+    runtimeId: "cadrane-local-loopback",
+    modelId: "fictional-local-model",
+    messages: [{ role: "user", content: "Bypass the case workroom" }],
+    approved: true
+  })).rejects.toThrow("case workroom");
+  await expect(f.call(IPC_CHANNELS.runtimeCancel,
+    "00000000-0000-4000-8000-000000000001")).rejects.toThrow("case workroom");
+  expect(f.request).not.toHaveBeenCalled();
+});
+
 it("retains the trusted-window boundary before considering subscription requests", async () => {
   const f = setup();
   const foreign = { ...f.event, senderFrame: { url: f.event.senderFrame.url } };

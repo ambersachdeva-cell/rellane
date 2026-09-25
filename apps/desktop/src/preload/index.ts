@@ -1,4 +1,4 @@
-import type { CaseArtifactFormat, CaseArtifactSave, CaseDataQuery, CaseDataSave, CaseEnquiryRequest, CaseEnquirySave } from "@cadrane/contracts";
+import type { CaseArtifactEditPreviewInput, CaseArtifactFormat, CaseArtifactSave, CaseDataQuery, CaseDataSave, CaseEnquiryRequest, CaseEnquirySave } from "@cadrane/contracts";
 import { contextBridge, ipcRenderer } from "electron";
 import { writeComposerDraft } from "../renderer/workstation/composer-drafts.js";
 import {
@@ -6,6 +6,8 @@ import {
   type AutomationAgentSaveInput,
   type AutomationArtifactReviewInput,
   type AutomationConnectorEnsureLocalInput,
+  type AutomationPendingHostReviewInput,
+  type AutomationReviewBoundWorkflowInput,
   type AutomationRunActionInput,
   type AutomationMemoryDocumentSaveInput,
   type AutomationRunStartInput,
@@ -13,7 +15,6 @@ import {
   type AutomationWorkflowPackExportInput,
   type DesktopBridge,
   type LicenseAcceptanceIntent,
-  type LocalChatRequest,
   type CaseLocalRequest,
   type HandoffEvent,
   type BenchProgress,
@@ -23,7 +24,9 @@ import {
   type WorkstationProjectAssignInput,
   type WorkstationProjectCaptureInput,
   type WorkstationRoutineSaveInput,
-  type WorkstationCheckCitationsInput
+  type WorkstationCheckCitationsInput,
+  type GovernedProjectMemoryCommand,
+  type GovernedProjectMemoryConflictCommand
 } from "@cadrane/contracts";
 import { AGENT_PROGRESS_EVENT, BENCH_PROGRESS_EVENT, IPC_CHANNELS } from "../shared/ipc-channels.js";
 
@@ -33,9 +36,7 @@ const bridge: DesktopBridge = Object.freeze({
     profile: () => ipcRenderer.invoke(IPC_CHANNELS.systemProfile)
   }),
   runtimes: Object.freeze({
-    discover: () => ipcRenderer.invoke(IPC_CHANNELS.runtimeDiscover),
-    chat: (request: LocalChatRequest) => ipcRenderer.invoke(IPC_CHANNELS.runtimeChat, request),
-    cancel: (operationId: string) => ipcRenderer.invoke(IPC_CHANNELS.runtimeCancel, operationId)
+    discover: () => ipcRenderer.invoke(IPC_CHANNELS.runtimeDiscover)
   }),
   automations: Object.freeze({
     snapshot: () => ipcRenderer.invoke(IPC_CHANNELS.automationSnapshot, {}),
@@ -43,6 +44,8 @@ const bridge: DesktopBridge = Object.freeze({
       ipcRenderer.invoke(IPC_CHANNELS.automationAgentSave, input),
     saveWorkflow: (input: AutomationWorkflowSaveInput) =>
       ipcRenderer.invoke(IPC_CHANNELS.automationWorkflowSave, input),
+    saveReviewBoundWorkflow: (input: AutomationReviewBoundWorkflowInput) =>
+      ipcRenderer.invoke(IPC_CHANNELS.automationWorkflowSaveReviewBound, input),
     saveMemory: (input: AutomationMemoryDocumentSaveInput) =>
       ipcRenderer.invoke(IPC_CHANNELS.automationMemorySave, input),
     importSources: () => ipcRenderer.invoke(IPC_CHANNELS.automationSourceImport, {}),
@@ -257,6 +260,9 @@ const bridge: DesktopBridge = Object.freeze({
     read: () => ipcRenderer.invoke(IPC_CHANNELS.todayRead)
   }),
   cases: Object.freeze({
+    artifactLineage: (input: { caseId: string }) => ipcRenderer.invoke(IPC_CHANNELS.casesArtifactLineage, input),
+    previewArtifactEdit: (input: CaseArtifactEditPreviewInput) => ipcRenderer.invoke(IPC_CHANNELS.casesPreviewArtifactEdit, input),
+    applyArtifactEdit: (input: { token: string }) => ipcRenderer.invoke(IPC_CHANNELS.casesApplyArtifactEdit, input),
     previewSource: (input: { id: string }) => ipcRenderer.invoke(IPC_CHANNELS.casesPreviewSource, input),
     addSource: (input: { id: string; token: string; startOffset?: number; endOffset?: number }) => ipcRenderer.invoke(IPC_CHANNELS.casesAddSource, input),
     discardSource: (input: { id: string; token?: string }) => ipcRenderer.invoke(IPC_CHANNELS.casesDiscardSource, input),
@@ -332,21 +338,34 @@ const bridge: DesktopBridge = Object.freeze({
       ipcRenderer.invoke(IPC_CHANNELS.workstationStop, input),
     decide: (input: { operationId: string; permissionId: string; allow: boolean }) =>
       ipcRenderer.invoke(IPC_CHANNELS.workstationDecide, input),
+    graphPrepare: (input: AutomationPendingHostReviewInput) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationGraphPrepare, input),
+    graphStart: (input: { token: string }) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationGraphStart, input),
+    graphStop: (input: { caseId: string; operationId: string }) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationGraphStop, input),
+    graphReconcile: () =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationGraphReconcile, {}),
     checkCitations: (input: WorkstationCheckCitationsInput) =>
       ipcRenderer.invoke(IPC_CHANNELS.workstationCheckCitations, input),
     // The newer capabilities. Each is a pass-through and nothing more: the
     // preload decides nothing, so there is one place — the host — where every
     // rule about what may happen actually lives.
     running: () => ipcRenderer.invoke(IPC_CHANNELS.workstationRunning, {}),
+    agentPrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationAgentPrepare, input),
     agentStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationAgentStart, input),
     agentPoll: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationAgentPoll, input),
     agentStop: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationAgentStop, input),
+    dispatchPrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDispatchPrepare, input),
     dispatchStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDispatchStart, input),
     dispatchPoll: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDispatchPoll, input),
     dispatchStop: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDispatchStop, input),
     pairingStatus: () => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingStatus, {}),
     pairingStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingStart, input),
     pairingStop: () => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingStop, {}),
+    pairingHandoverCandidates: () => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingHandoverCandidates, {}),
+    pairingHandoverPrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingHandoverPrepare, input),
+    pairingHandoverApprove: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPairingHandoverApprove, input),
     dictationStatus: () => ipcRenderer.invoke(IPC_CHANNELS.workstationDictationStatus, {}),
     dictationWrite: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDictationWrite, input),
     dictationStop: () => ipcRenderer.invoke(IPC_CHANNELS.workstationDictationStop, {}),
@@ -356,6 +375,7 @@ const bridge: DesktopBridge = Object.freeze({
     semanticSearch: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationSemanticSearch, input),
     publishPreview: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPublishPreview, input),
     publishWrite: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPublishWrite, input),
+    crewPrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationCrewPrepare, input),
     crewStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationCrewStart, input),
     crewPoll: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationCrewPoll, input),
     crewStop: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationCrewStop, input),
@@ -375,9 +395,15 @@ const bridge: DesktopBridge = Object.freeze({
     searchBook: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationBookSearch, input),
     exportAudit: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationAuditExport, input),
     deliveryPack: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDeliveryPack, input),
+    portableWorkspace: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPortableWorkspace, input),
+    recovery: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationRecovery, input),
+    selfCheck: () => ipcRenderer.invoke(IPC_CHANNELS.workstationSelfCheck, {}),
+    importDocument: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationDocumentImport, input),
+    speak: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationSpeak, input),
     listCaptureTargets: () => ipcRenderer.invoke(IPC_CHANNELS.workstationCaptureList, {}),
     captureTarget: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationCaptureTake, input),
     analysePaste: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPasteAnalyse, input),
+    researchPrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationResearchPrepare, input),
     researchStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationResearchStart, input),
     researchPoll: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationResearchPoll, input),
     researchStop: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationResearchStop, input),
@@ -385,6 +411,10 @@ const bridge: DesktopBridge = Object.freeze({
     memoryLearn: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationMemoryLearn, input),
     memorySet: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationMemorySet, input),
     memoryForget: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationMemoryForget, input),
+    memoryGoverned: (input: GovernedProjectMemoryCommand) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationMemoryGoverned, input),
+    memoryConflicts: (input: GovernedProjectMemoryConflictCommand) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationMemoryConflicts, input),
     changesList: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationChangesList, input),
     changeContents: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationChangeContents, input),
     changeRestore: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationChangeRestore, input),
@@ -392,7 +422,34 @@ const bridge: DesktopBridge = Object.freeze({
     watchSave: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationWatchSave, input),
     watchRemove: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationWatchRemove, input),
     watchNow: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationWatchNow, input),
+    scheduleList: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleList, input),
+    scheduleSave: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleSave, input),
+    schedulePreview: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationSchedulePreview, input),
+    scheduleGrantReview: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleGrantReview, input),
+    scheduleGrantConfirm: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleGrantConfirm, input),
+    scheduleRevoke: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleRevoke, input),
+    scheduleQueue: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleQueue, input),
+    schedulePrepare: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationSchedulePrepare, input),
+    scheduleStart: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleStart, input),
+    schedulePoll: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationSchedulePoll, input),
+    scheduleStop: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationScheduleStop, input),
     usage: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationUsage, input),
+    modelOutcomeEvidence: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelOutcomeEvidence, input),
+    modelPreferencesRead: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelPreferencesRead, input),
+    modelPreferencesSave: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelPreferencesSave, input),
+    modelPreferencesForget: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelPreferencesForget, input),
+    soloModelAdvice: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationSoloModelAdvice, input),
+    teamModelAdvice: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationTeamModelAdvice, input),
+    modelAdaptationPropose: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelAdaptationPropose, input),
+    modelAdaptationAccept: (input: unknown) =>
+      ipcRenderer.invoke(IPC_CHANNELS.workstationModelAdaptationAccept, input),
     phoneKnocks: () => ipcRenderer.invoke(IPC_CHANNELS.workstationPhoneKnocks, {}),
     phonePair: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.workstationPhonePair, input),
   }),
@@ -437,6 +494,9 @@ const bridge: DesktopBridge = Object.freeze({
     previewSource: (input: { agentId: string }) => ipcRenderer.invoke(IPC_CHANNELS.agentPreviewSource, input),
     discardSource: (input: { agentId: string; token?: string }) => ipcRenderer.invoke(IPC_CHANNELS.agentDiscardSource, input),
     draft: (input: { handle: string; sentence: string }) => ipcRenderer.invoke(IPC_CHANNELS.agentDraft, input),
+    draftHistory: () => ipcRenderer.invoke(IPC_CHANNELS.agentDraftHistory),
+    forgetDraftHistory: (input: { reviewSha256: string; confirmed: true }) =>
+      ipcRenderer.invoke(IPC_CHANNELS.agentDraftForget, input),
     save: (input: unknown) => ipcRenderer.invoke(IPC_CHANNELS.agentSave, input),
     /** Writes the brief to a file that carries no folders and no permissions. */
     exportOne: (input: { agentId: string }) =>

@@ -567,7 +567,226 @@ CREATE INDEX workstation_image_asset_case_created_idx
   ON workstation_image_asset (case_id, created_at ASC, id ASC);
 ` };
 
-export const MIGRATIONS: readonly Migration[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+/**
+ * v10 — canonical minimum project memory and governance disclosures.
+ *
+ * Appends a monotonic memory_epoch to workstation_project and adds entry and
+ * revision tables for project-scoped memory. Approved history is immutable
+ * unless explicitly forgotten.
+ */
+const V10: Migration = {
+  version: 10,
+  summary: "Canonical project memory entry, revision history, and disclosure epoch",
+  sql: `
+ALTER TABLE workstation_project ADD COLUMN memory_epoch INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE workstation_project_memory_entry (
+  id               TEXT PRIMARY KEY,
+  project_id       TEXT NOT NULL REFERENCES workstation_project (id) ON DELETE CASCADE,
+  kind             TEXT NOT NULL CHECK (kind IN ('instruction', 'decision', 'exclusion', 'finding')),
+  head_revision    INTEGER NOT NULL CHECK (head_revision >= 1),
+  active_revision  INTEGER CHECK (active_revision IS NULL OR (active_revision >= 1 AND active_revision <= head_revision)),
+  created_at       INTEGER NOT NULL
+);
+CREATE INDEX workstation_project_memory_entry_project_idx
+  ON workstation_project_memory_entry (project_id);
+
+CREATE TABLE workstation_project_memory_revision (
+  entry_id         TEXT NOT NULL REFERENCES workstation_project_memory_entry (id) ON DELETE CASCADE,
+  revision         INTEGER NOT NULL CHECK (revision >= 1),
+  state            TEXT NOT NULL CHECK (state IN ('proposed', 'approved', 'rejected', 'forgotten')),
+  body             TEXT NOT NULL,
+  source_refs_json TEXT NOT NULL,
+  created_by       TEXT NOT NULL,
+  created_at       INTEGER NOT NULL,
+  approver_id      TEXT,
+  approved_at      INTEGER,
+  reason           TEXT,
+  PRIMARY KEY (entry_id, revision)
+);
+CREATE INDEX workstation_project_memory_revision_entry_idx
+  ON workstation_project_memory_revision (entry_id, revision DESC);
+`
+};
+
+/** Exact reviewed context retained for restart inspection and selective forget. */
+const V11: Migration = {
+  version: 11,
+  summary: "Reviewed workstation context and dispatch attempts",
+  sql: `
+CREATE TABLE workstation_context_snapshot (
+  id TEXT PRIMARY KEY,
+  case_id TEXT NOT NULL REFERENCES work_case (id) ON DELETE CASCADE,
+  project_id TEXT REFERENCES workstation_project (id) ON DELETE CASCADE,
+  memory_epoch INTEGER NOT NULL,
+  provider_id TEXT NOT NULL,
+  model_id TEXT,
+  packet_hash TEXT NOT NULL,
+  packet TEXT,
+  manifest_json TEXT,
+  created_at INTEGER NOT NULL,
+  dispatch_attempted_at INTEGER,
+  redacted_at INTEGER
+);
+CREATE INDEX workstation_context_snapshot_case_idx ON workstation_context_snapshot (case_id);
+CREATE TABLE workstation_context_snapshot_constraint (
+  snapshot_id TEXT NOT NULL REFERENCES workstation_context_snapshot (id) ON DELETE CASCADE,
+  memory_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  PRIMARY KEY (snapshot_id, memory_id)
+);
+CREATE INDEX workstation_context_snapshot_constraint_memory_idx
+  ON workstation_context_snapshot_constraint (memory_id);
+`
+};
+
+/** Owner-authored model preferences belong to a project and can be forgotten. */
+const V12: Migration = {
+  version: 12,
+  summary: "Project model preferences with revision and forgetting",
+  sql: `
+CREATE TABLE workstation_project_model_preference (
+  project_id   TEXT PRIMARY KEY REFERENCES workstation_project (id) ON DELETE CASCADE,
+  revision     INTEGER NOT NULL CHECK (revision >= 1),
+  payload_json TEXT NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  deleted_at   INTEGER
+);
+`
+};
+
+/** Owner-declared contradictions between exact approved project-memory versions. */
+const V13: Migration = {
+  version: 13,
+  summary: "Versioned project memory conflicts and owner resolutions",
+  sql: `
+CREATE TABLE workstation_project_memory_conflict (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES workstation_project (id) ON DELETE CASCADE,
+  first_memory_id TEXT NOT NULL REFERENCES workstation_project_memory_entry (id) ON DELETE CASCADE,
+  second_memory_id TEXT NOT NULL REFERENCES workstation_project_memory_entry (id) ON DELETE CASCADE,
+  head_revision INTEGER NOT NULL CHECK (head_revision >= 1),
+  created_at INTEGER NOT NULL,
+  CHECK (first_memory_id < second_memory_id),
+  UNIQUE (project_id, first_memory_id, second_memory_id)
+);
+CREATE INDEX workstation_project_memory_conflict_project_idx
+  ON workstation_project_memory_conflict (project_id);
+CREATE TABLE workstation_project_memory_conflict_revision (
+  conflict_id TEXT NOT NULL REFERENCES workstation_project_memory_conflict (id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  state TEXT NOT NULL CHECK (state IN ('declared', 'resolved')),
+  first_active_revision INTEGER CHECK (first_active_revision IS NULL OR first_active_revision >= 1),
+  second_active_revision INTEGER CHECK (second_active_revision IS NULL OR second_active_revision >= 1),
+  resolution TEXT CHECK (resolution IN ('first_wins', 'second_wins', 'both_retired')),
+  actor_id TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (conflict_id, revision),
+  CHECK ((state = 'declared' AND resolution IS NULL
+    AND first_active_revision IS NOT NULL AND second_active_revision IS NOT NULL)
+    OR (state = 'resolved' AND resolution IS NOT NULL))
+);
+`
+};
+
+/** Explicit finding audiences live with each immutable memory revision. */
+const V14: Migration = {
+  version: 14,
+  summary: "Versioned owner-assigned finding role tags",
+  sql: `
+ALTER TABLE workstation_project_memory_revision
+  ADD COLUMN role_tags_json TEXT NOT NULL DEFAULT '[]';
+`
+};
+
+/** Future adaptive advice needs exact proposal evidence and recoverable policy versions. */
+const V15: Migration = {
+  version: 15,
+  summary: "Append-only project model policy and adaptation proposal history",
+  sql: `
+CREATE TABLE workstation_project_model_adaptation_proposal (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES workstation_project (id) ON DELETE CASCADE,
+  base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+  base_deleted_at INTEGER,
+  catalog_sha256 TEXT NOT NULL CHECK (length(catalog_sha256) = 64),
+  catalog_json TEXT NOT NULL CHECK (json_valid(catalog_json) = 1 AND length(catalog_json) <= 32768),
+  evidence_sha256 TEXT NOT NULL CHECK (length(evidence_sha256) = 64),
+  evidence_refs_json TEXT NOT NULL CHECK (json_valid(evidence_refs_json) = 1 AND length(evidence_refs_json) <= 1048576),
+  evidence_operations INTEGER NOT NULL CHECK (evidence_operations BETWEEN 0 AND 200),
+  delta_json TEXT NOT NULL CHECK (json_valid(delta_json) = 1 AND length(delta_json) <= 32768),
+  reasons_json TEXT NOT NULL CHECK (json_valid(reasons_json) = 1 AND length(reasons_json) <= 8192),
+  unknowns_json TEXT NOT NULL CHECK (json_valid(unknowns_json) = 1 AND length(unknowns_json) <= 8192),
+  created_at INTEGER NOT NULL CHECK (created_at > 0),
+  UNIQUE (project_id, id)
+);
+CREATE INDEX workstation_project_model_adaptation_proposal_project_idx
+  ON workstation_project_model_adaptation_proposal (project_id, created_at DESC);
+CREATE TRIGGER workstation_project_model_adaptation_proposal_no_update
+  BEFORE UPDATE ON workstation_project_model_adaptation_proposal
+  BEGIN SELECT RAISE(ABORT, 'Model adaptation proposals are immutable'); END;
+CREATE TABLE workstation_project_model_preference_revision (
+  project_id TEXT NOT NULL REFERENCES workstation_project (id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  change_kind TEXT NOT NULL CHECK (change_kind IN ('legacy_baseline', 'owner_save', 'owner_forget', 'adaptive_accept')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json) = 1),
+  updated_at INTEGER NOT NULL CHECK (updated_at > 0),
+  deleted_at INTEGER,
+  proposal_id TEXT,
+  PRIMARY KEY (project_id, revision),
+  FOREIGN KEY (project_id, proposal_id)
+    REFERENCES workstation_project_model_adaptation_proposal (project_id, id) ON DELETE CASCADE,
+  CHECK ((change_kind = 'adaptive_accept') = (proposal_id IS NOT NULL)),
+  CHECK ((change_kind = 'owner_forget' AND deleted_at IS NOT NULL)
+    OR change_kind = 'legacy_baseline'
+    OR (change_kind IN ('owner_save', 'adaptive_accept') AND deleted_at IS NULL))
+);
+CREATE TRIGGER workstation_project_model_preference_revision_no_update
+  BEFORE UPDATE ON workstation_project_model_preference_revision
+  BEGIN SELECT RAISE(ABORT, 'Project model preference revisions are immutable'); END;
+`
+};
+
+/** Preparatory local brief drafts have no Case; retain their exact dispatch packet and restart truth separately. */
+const V16: Migration = {
+  version: 16,
+  summary: "Durable local Agent brief draft admission and receipts",
+  sql: `
+CREATE TABLE workstation_local_brief_attempt (
+  id TEXT PRIMARY KEY,
+  input_json TEXT NOT NULL CHECK (json_valid(input_json) = 1 AND length(input_json) <= 32768),
+  input_sha256 TEXT NOT NULL CHECK (length(input_sha256) = 64),
+  created_at INTEGER NOT NULL CHECK (created_at > 0)
+);
+CREATE TRIGGER workstation_local_brief_attempt_no_update
+  BEFORE UPDATE ON workstation_local_brief_attempt
+  BEGIN SELECT RAISE(ABORT, 'Local brief admission is immutable'); END;
+CREATE TABLE workstation_local_brief_request (
+  attempt_id TEXT PRIMARY KEY REFERENCES workstation_local_brief_attempt (id) ON DELETE CASCADE,
+  request_json TEXT NOT NULL CHECK (json_valid(request_json) = 1 AND length(request_json) <= 32768),
+  request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+  model_id TEXT NOT NULL,
+  attempted_at INTEGER NOT NULL CHECK (attempted_at > 0)
+);
+CREATE TRIGGER workstation_local_brief_request_no_update
+  BEFORE UPDATE ON workstation_local_brief_request
+  BEGIN SELECT RAISE(ABORT, 'Local brief request is immutable'); END;
+CREATE TABLE workstation_local_brief_receipt (
+  attempt_id TEXT NOT NULL REFERENCES workstation_local_brief_attempt (id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 3),
+  event TEXT NOT NULL CHECK (event IN ('admitted', 'dispatch_attempt', 'completed', 'failed', 'interrupted')),
+  result_sha256 TEXT CHECK (result_sha256 IS NULL OR length(result_sha256) = 64),
+  at INTEGER NOT NULL CHECK (at > 0),
+  PRIMARY KEY (attempt_id, sequence)
+);
+CREATE TRIGGER workstation_local_brief_receipt_no_update
+  BEFORE UPDATE ON workstation_local_brief_receipt
+  BEGIN SELECT RAISE(ABORT, 'Local brief receipts are immutable'); END;
+`
+};
+
+export const MIGRATIONS: readonly Migration[] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16];
 
 /** The version a fresh database ends up at. */
 export const LATEST_VERSION = MIGRATIONS.reduce(

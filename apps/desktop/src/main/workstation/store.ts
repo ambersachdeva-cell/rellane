@@ -9,6 +9,7 @@
  */
 
 import type { DatabaseSync } from "node:sqlite";
+import { z } from "zod";
 import type {
   WorkstationPermission,
   WorkstationProviderId,
@@ -17,11 +18,25 @@ import type {
 } from "@cadrane/contracts";
 import { appendTurn, openCases, readCase } from "../book/cases.js";
 
+export interface WorkstationGraphAttemptBinding {
+  readonly caseId: string;
+  readonly graphRunId: string;
+  readonly nodeId: string;
+  readonly attemptId: string;
+  readonly correlation: string;
+  readonly descriptorSha256: string;
+}
+
+export type WorkstationSessionGraphBinding = WorkstationGraphAttemptBinding;
+
 export interface WorkstationSessionReceipt {
   readonly version: 1;
   readonly event: "start" | "checkpoint" | "finish" | "interrupted";
   readonly snapshot: WorkstationSnapshot;
   readonly workspacePath: string;
+  readonly contextSnapshotId?: string;
+  readonly projectId?: string | null;
+  readonly graph?: WorkstationGraphAttemptBinding;
 }
 
 export type {
@@ -38,6 +53,11 @@ export const MAX_RECEIPT_ACTIVITY_ITEMS = 100;
 export const MAX_RECEIPT_ACTIVITY_ITEM_LENGTH = 1_000;
 export const MAX_RECEIPT_DETAIL_LENGTH = 5_000;
 export const MAX_WORKSPACE_PATH_LENGTH = 4_096;
+
+const GraphUuidSchema = z.uuid().refine(
+  value => value !== "00000000-0000-0000-0000-000000000000"
+);
+export const SHA256_REGEX = /^[0-9a-fA-F]{64}$/;
 
 export const WORKSTATION_PROVIDER_IDS: readonly WorkstationProviderId[] = [
   "codex",
@@ -82,6 +102,12 @@ export function validateReceipt(input: unknown): WorkstationSessionReceipt | nul
   }
 
   const record = input as Record<string, unknown>;
+
+  const contextSnapshotId = record["contextSnapshotId"];
+  if (contextSnapshotId !== undefined &&
+      (typeof contextSnapshotId !== "string" || contextSnapshotId.trim().length === 0 || contextSnapshotId.length > 128)) return null;
+  const projectId = record["projectId"];
+  if (projectId !== undefined && projectId !== null && (typeof projectId !== "string" || projectId.trim().length === 0)) return null;
 
   if (record["version"] !== 1) {
     return null;
@@ -200,10 +226,77 @@ export function validateReceipt(input: unknown): WorkstationSessionReceipt | nul
     return null;
   }
 
+  let graph: WorkstationGraphAttemptBinding | undefined;
+  if ("graph" in record) {
+    const graphRaw = record["graph"];
+    if (typeof graphRaw !== "object" || graphRaw === null || Array.isArray(graphRaw)) {
+      return null;
+    }
+    const g = graphRaw as Record<string, unknown>;
+    const allowedKeys = new Set([
+      "caseId",
+      "graphRunId",
+      "nodeId",
+      "attemptId",
+      "correlation",
+      "descriptorSha256"
+    ]);
+    for (const key of Object.keys(g)) {
+      if (!allowedKeys.has(key)) {
+        return null;
+      }
+    }
+
+    const gCaseId = g["caseId"];
+    if (typeof gCaseId !== "string" || !GraphUuidSchema.safeParse(gCaseId).success) {
+      return null;
+    }
+    if (gCaseId !== caseId) {
+      return null;
+    }
+
+    const graphRunId = g["graphRunId"];
+    if (typeof graphRunId !== "string" || !GraphUuidSchema.safeParse(graphRunId).success) {
+      return null;
+    }
+
+    const nodeId = g["nodeId"];
+    if (typeof nodeId !== "string" || !GraphUuidSchema.safeParse(nodeId).success) {
+      return null;
+    }
+
+    const attemptId = g["attemptId"];
+    if (typeof attemptId !== "string" || !GraphUuidSchema.safeParse(attemptId).success) {
+      return null;
+    }
+
+    const correlation = g["correlation"];
+    if (typeof correlation !== "string" || !GraphUuidSchema.safeParse(correlation).success) {
+      return null;
+    }
+
+    const descriptorSha256 = g["descriptorSha256"];
+    if (typeof descriptorSha256 !== "string" || !SHA256_REGEX.test(descriptorSha256)) {
+      return null;
+    }
+
+    graph = {
+      caseId: gCaseId,
+      graphRunId,
+      nodeId,
+      attemptId,
+      correlation,
+      descriptorSha256
+    };
+  }
+
   return {
     version: 1,
     event,
     workspacePath: workspacePathRaw,
+    ...(typeof contextSnapshotId === "string" ? { contextSnapshotId } : {}),
+    ...(projectId !== undefined ? { projectId: projectId as string | null } : {}),
+    ...(graph ? { graph } : {}),
     snapshot: {
       operationId,
       caseId,
@@ -254,6 +347,20 @@ function boundReceipt(receipt: WorkstationSessionReceipt): WorkstationSessionRec
     version: 1,
     event: receipt.event,
     workspacePath: receipt.workspacePath.slice(0, MAX_WORKSPACE_PATH_LENGTH),
+    ...(receipt.contextSnapshotId ? { contextSnapshotId: receipt.contextSnapshotId } : {}),
+    ...(receipt.projectId !== undefined ? { projectId: receipt.projectId } : {}),
+    ...(receipt.graph
+      ? {
+          graph: {
+            caseId: receipt.graph.caseId,
+            graphRunId: receipt.graph.graphRunId,
+            nodeId: receipt.graph.nodeId,
+            attemptId: receipt.graph.attemptId,
+            correlation: receipt.graph.correlation,
+            descriptorSha256: receipt.graph.descriptorSha256
+          }
+        }
+      : {}),
     snapshot: {
       operationId: snap.operationId,
       caseId: snap.caseId,
@@ -399,11 +506,15 @@ export function recoverInterruptedSessions(
           version: 1,
           event: "interrupted",
           workspacePath: receipt.workspacePath,
+          ...(receipt.contextSnapshotId ? { contextSnapshotId: receipt.contextSnapshotId } : {}),
+          ...(receipt.projectId !== undefined ? { projectId: receipt.projectId } : {}),
+          ...(receipt.graph ? { graph: receipt.graph } : {}),
           snapshot: {
             operationId: receipt.snapshot.operationId,
             caseId: receipt.snapshot.caseId,
             providerId: receipt.snapshot.providerId,
             modelId: receipt.snapshot.modelId,
+            ...(receipt.snapshot.reportedModelId ? { reportedModelId: receipt.snapshot.reportedModelId } : {}),
             sessionId: receipt.snapshot.sessionId,
             status: "interrupted",
             startedAt: receipt.snapshot.startedAt,

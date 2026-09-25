@@ -1,4 +1,5 @@
 import type { IpcMainInvokeEvent } from "electron";
+import type { NativeAskOutcome } from "./types.js";
 import { ipcMain } from "electron";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
@@ -6,6 +7,8 @@ import {
   installDispatchRun,
   type DispatchBoard
 } from "./dispatch-run-ipc.js";
+
+const native = (text: string): NativeAskOutcome => ({ text, sessionId: "session-test", finishReason: "completed", requestedModelId: null, cancellationRequested: false, resultSource: "worker", reportedModelId: "test-model" });
 
 type IpcHandler = (event: IpcMainInvokeEvent, input: unknown) => Promise<unknown>;
 
@@ -55,7 +58,7 @@ describe("dispatch-run-ipc", () => {
       readonly signal: AbortSignal;
     }) => {
       if (input.providerId === "bot-fast") {
-        return { text: "Here is the concise answer from the fast bot.", turnId: "turn-fast" };
+        return { ...native("Here is the concise answer from the fast bot."), turnId: "turn-fast" };
       }
       if (input.providerId === "bot-fail") {
         throw new Error("Bot process terminated unexpectedly.");
@@ -161,7 +164,7 @@ describe("dispatch-run-ipc", () => {
     ]);
 
     const askProvider = vi.fn().mockResolvedValue({
-      text: "Report complete.",
+      ...native("Report complete."),
       turnId: "turn-report"
     });
 

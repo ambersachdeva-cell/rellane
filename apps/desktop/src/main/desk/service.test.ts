@@ -50,7 +50,6 @@ const room: EngineRoomStatus = {
   allUnavailable: false
 };
 
-const empty: EngineRoomStatus = { ...room, engines: [], allUnavailable: true };
 const agents = [{ id: "filing-clerk", name: "Filing clerk" }];
 
 beforeEach(async () => {
@@ -153,20 +152,21 @@ Total Rs. 11,116.00/-`;
 });
 
 describe("anything else", () => {
-  it("goes to the cheapest ready engine, with the book to hand", async () => {
-    const ask = vi.fn(async (_input: { modelId: string; system: string }) => "Sharma usually pays in the third week.");
+  it("does not silently choose a ready subscription or send the book", async () => {
+    const ask = vi.fn(async () => "Sharma usually pays in the third week.");
+    const roomProbe = vi.fn(async () => room);
 
     const answer = await say("what do you think about the Sharma job", {
       book: db,
       agents,
       ask: ask as never,
-      room: async () => room
+      room: roomProbe
     });
 
-    expect(answer.kind).toBe("ask");
-    const call = ask.mock.calls[0]?.[0];
-    expect(call?.modelId).toBe("haiku");
-    expect(call?.system).toContain("Devgiri Traders");
+    expect(answer.kind).toBe("refused");
+    expect(answer.said).toContain("review");
+    expect(ask).not.toHaveBeenCalled();
+    expect(roomProbe).not.toHaveBeenCalled();
   });
 
   it("tells a model never to invent a figure", () => {
@@ -175,29 +175,32 @@ describe("anything else", () => {
     expect(deskPrompt(db)).toContain("Never invent a customer");
   });
 
-  it("says plainly when there is nobody to ask", async () => {
+  it("refuses without probing even when no model is known", async () => {
+    const roomProbe = vi.fn(async () => ({ ...room, engines: [], allUnavailable: true }));
     const answer = await say("what do you think", {
       book: db,
       agents,
-      room: async () => empty
+      room: roomProbe
     });
 
     expect(answer.kind).toBe("refused");
-    expect(answer.said).toContain("No engine is connected");
+    expect(answer.said).toContain("review");
+    expect(roomProbe).not.toHaveBeenCalled();
   });
 
-  it("never throws, whatever the engine does", async () => {
+  it("never invokes an injected failing CLI adapter", async () => {
+    const ask = vi.fn(async () => {
+      throw new Error("the CLI fell over");
+    });
     const answer = await say("what do you think", {
       book: db,
       agents,
-      ask: (async () => {
-        throw new Error("the CLI fell over");
-      }) as never,
+      ask: ask as never,
       room: async () => room
     });
 
     expect(answer.kind).toBe("refused");
-    expect(answer.said).toContain("the CLI fell over");
+    expect(ask).not.toHaveBeenCalled();
   });
 });
 
@@ -232,7 +235,7 @@ describe("chasing one customer", () => {
     const answer = await say("chase Devgiri Traders", {
       book: db,
       agents,
-      trading: { name: "Example Studio", upiId: "demo@okhdfcbank" },
+      trading: { name: "Sachdeva Digital", upiId: "amber@okhdfcbank" },
       room: async () => room,
       now: () => NOW
     });
@@ -240,7 +243,7 @@ describe("chasing one customer", () => {
     expect(answer.kind).toBe("chase");
     expect(answer.draft?.text).toContain("₹9,440");
     expect(answer.draft?.text).toContain("A-114");
-    expect(answer.draft?.text).toContain("Example Studio");
+    expect(answer.draft?.text).toContain("Sachdeva Digital");
     expect(answer.draft?.pay).toContain("upi://pay");
     expect(answer.said).toContain("Rellane cannot send anything itself");
   });

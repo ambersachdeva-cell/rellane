@@ -1,8 +1,10 @@
 import type { IpcMainInvokeEvent } from "electron";
 import { ipcMain } from "electron";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
+import { nativeAskCompleted, nativeAskDetail, nativeAskEffectiveReason, type NativeAskOutcome } from "./types.js";
+import type { WorkstationReview } from "@cadrane/contracts";
 
 export type LaneState =
   | "queued"
@@ -11,6 +13,7 @@ export type LaneState =
   | "answered"
   | "stopped"
   | "failed"
+  | "interrupted"
   | "unavailable";
 
 export interface DispatchLane {
@@ -20,6 +23,8 @@ export interface DispatchLane {
   readonly line: string;
   readonly elapsed: string;
   readonly answerTurnId: string | null;
+  readonly draftTurnId: string | null;
+  readonly outcome: NativeAskOutcome | null;
   readonly chars: number;
   readonly canStop: boolean;
 }
@@ -46,6 +51,21 @@ export const WorkstationDispatchStartInputSchema = z.object({
   sourceTurnIds: z.array(z.string().min(1)).optional()
 });
 
+/** A Compare review names every paid call and exact model before launch. */
+export const WorkstationDispatchPrepareInputSchema = z.strictObject({
+  caseId: z.string().min(1),
+  brief: z.string().trim().min(1).max(MAX_DISPATCH_BRIEF_CHARS),
+  selections: z.array(z.strictObject({
+    providerId: z.string().min(1),
+    modelId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/u)
+  })).min(MIN_DISPATCH_PROVIDERS).max(MAX_DISPATCH_PROVIDERS)
+    .refine((items) => new Set(items.map((item) => item.providerId)).size === items.length,
+      "Choose each connection once."),
+  sourceTurnIds: z.array(z.uuid()).max(20).optional()
+    .refine((ids) => ids === undefined || new Set(ids).size === ids.length,
+      "Choose each source once.")
+});
+
 export type WorkstationDispatchStartInput = z.infer<typeof WorkstationDispatchStartInputSchema>;
 
 export const WorkstationDispatchPollInputSchema = z.object({
@@ -63,7 +83,7 @@ export type WorkstationDispatchStopInput = z.infer<typeof WorkstationDispatchSto
 
 export interface InstallDispatchRunOptions {
   readonly assertTrusted: (event: IpcMainInvokeEvent) => void;
-  /** Runs the brief on one provider. Resolves with the text it produced. */
+  /** Runs the brief on one provider and preserves the native result. */
   readonly askProvider: (input: {
     readonly providerId: string;
     readonly caseId: string;
@@ -79,7 +99,7 @@ export interface InstallDispatchRunOptions {
      * underneath. The adapters were reporting; nobody was listening.
      */
     readonly onActivity?: (line: string) => void;
-  }) => Promise<{ readonly text: string; readonly turnId: string }>;
+  }) => Promise<NativeAskOutcome & { readonly turnId: string | null }>;
   /** Which providers exist and whether each is usable right now. */
   readonly providers: () => Promise<readonly { readonly id: string; readonly label: string; readonly usable: boolean }[]>;
   readonly now?: () => number;
@@ -119,6 +139,8 @@ interface InternalLane {
   readonly startedAt: number;
   readonly endedAt: number | null;
   readonly answerTurnId: string | null;
+  readonly draftTurnId: string | null;
+  readonly outcome: NativeAskOutcome | null;
   readonly chars: number;
   readonly canStop: boolean;
   readonly controller: AbortController;
@@ -154,6 +176,7 @@ interface HeadlineCounts {
   readonly working: number;
   readonly answered: number;
   readonly failed: number;
+  readonly interrupted: number;
   readonly stopped: number;
   readonly unavailable: number;
   readonly total: number;
@@ -188,6 +211,7 @@ function formatHeadline(counts: HeadlineCounts): string {
       clauses.push(`${countToWord(counts.failed)} failed`);
     }
   }
+  if (counts.interrupted > 0) clauses.push(`${countToWord(counts.interrupted)} interrupted`);
 
   if (counts.stopped > 0) {
     if (clauses.length === 0) {
@@ -253,6 +277,7 @@ function toDispatchBoard(run: InternalRun, clock: () => number): DispatchBoard {
   let workingCount = 0;
   let answeredCount = 0;
   let failedCount = 0;
+  let interruptedCount = 0;
   let stoppedCount = 0;
   let unavailableCount = 0;
 
@@ -273,6 +298,9 @@ function toDispatchBoard(run: InternalRun, clock: () => number): DispatchBoard {
       case "failed":
         failedCount++;
         break;
+      case "interrupted":
+        interruptedCount++;
+        break;
       case "stopped":
         stoppedCount++;
         break;
@@ -288,6 +316,8 @@ function toDispatchBoard(run: InternalRun, clock: () => number): DispatchBoard {
       line: lane.line,
       elapsed: formatElapsed(elapsedMs),
       answerTurnId: lane.answerTurnId,
+      draftTurnId: lane.draftTurnId,
+      outcome: lane.outcome,
       chars: lane.chars,
       canStop: lane.canStop
     });
@@ -297,6 +327,7 @@ function toDispatchBoard(run: InternalRun, clock: () => number): DispatchBoard {
     working: workingCount,
     answered: answeredCount,
     failed: failedCount,
+    interrupted: interruptedCount,
     stopped: stoppedCount,
     unavailable: unavailableCount,
     total: lanes.length
@@ -388,6 +419,8 @@ export function installDispatchRun(options: InstallDispatchRunOptions): void {
             startedAt,
             endedAt: startedAt,
             answerTurnId: null,
+            draftTurnId: null,
+            outcome: null,
             chars: 0,
             canStop: false,
             controller: new AbortController()
@@ -401,6 +434,8 @@ export function installDispatchRun(options: InstallDispatchRunOptions): void {
             startedAt,
             endedAt: null,
             answerTurnId: null,
+            draftTurnId: null,
+            outcome: null,
             chars: 0,
             canStop: true,
             controller: new AbortController()
@@ -442,16 +477,25 @@ export function installDispatchRun(options: InstallDispatchRunOptions): void {
             if (currentIdx >= 0 && currentIdx < newRun.lanes.length) {
               const current = newRun.lanes[currentIdx]!;
               if (current.state === "stopped" || current.controller.signal.aborted) {
+                newRun.lanes[currentIdx] = {
+                  ...current,
+                  draftTurnId: result.turnId,
+                  outcome: result,
+                  chars: result.text.length
+                };
                 return;
               }
+              const completed = nativeAskCompleted(result);
               const firstLine = result.text.trim().split(/\r?\n/).find((l) => l.trim().length > 0);
-              const preview = firstLine && firstLine.length > 0 ? firstLine : "Answer received.";
+              const preview = completed ? (firstLine ?? "Answer received.") : nativeAskDetail(result);
               newRun.lanes[currentIdx] = {
                 ...current,
-                state: "answered",
+                state: completed ? "answered" : nativeAskEffectiveReason(result) === "stopped" ? "stopped" : "failed",
                 endedAt: clock(),
                 line: preview,
-                answerTurnId: result.turnId,
+                answerTurnId: completed ? result.turnId : null,
+                draftTurnId: completed ? null : result.turnId,
+                outcome: result,
                 chars: result.text.length,
                 canStop: false
               };
@@ -513,4 +557,245 @@ export function installDispatchRun(options: InstallDispatchRunOptions): void {
       return toDispatchBoard(run, clock);
     }
   );
+}
+
+/** The production Compare route: one parent review, host-owned serial children. */
+export function installReviewedDispatchRun(options: {
+  readonly assertTrusted: (event: IpcMainInvokeEvent) => void;
+  readonly ownerFor: (event: IpcMainInvokeEvent) => object;
+  readonly prepareLane: (input: {
+    readonly caseId: string; readonly providerId: string; readonly modelId: string;
+    readonly brief: string; readonly sourceTurnIds: readonly string[]; readonly owner: object;
+  }) => Promise<WorkstationReview>;
+  readonly runLane: (input: {
+    readonly review: WorkstationReview; readonly owner: object; readonly signal: AbortSignal;
+    readonly onActivity: (line: string) => void;
+  }) => Promise<NativeAskOutcome & { readonly turnId: string | null }>;
+  readonly persistParent: (input: { readonly event: "parent"; readonly runId: string;
+    readonly caseId: string; readonly brief: string; readonly at: number;
+    readonly children: readonly { readonly providerId: string; readonly label: string;
+      readonly modelId: string; readonly contextSnapshotId: string; readonly sourceHash: string }[] }) => Promise<void>;
+  readonly persistChild: (caseId: string, input: { readonly event: "child"; readonly runId: string;
+    readonly index: number; readonly state: "starting" | "answered" | "stopped" | "failed" | "interrupted";
+    readonly at: number; readonly line: string; readonly answerTurnId: string | null;
+    readonly draftTurnId: string | null; readonly chars: number }) => Promise<void>;
+  readonly recover: (runId: string) => Promise<DispatchBoard | null>;
+  readonly now?: () => number;
+}): { readonly stopActive: () => Promise<boolean>; readonly cancelOwner: (owner: object) => Promise<void>; readonly shutdown: () => Promise<void> } {
+  const clock = options.now ?? (() => Date.now());
+  const pending = new Map<string, { readonly owner: object; readonly caseId: string;
+    readonly brief: string; readonly reviews: readonly WorkstationReview[]; readonly expiresAt: number }>();
+  const revokedOwners = new WeakSet<object>();
+  const runs = new Map<string, InternalRun & { readonly owner: object }>();
+  let activeRun: (InternalRun & { readonly owner: object }) | null = null;
+  const persistLane = (run: InternalRun, index: number, state: "starting" | "answered" | "stopped" | "failed" | "interrupted",
+    line: string, answerTurnId: string | null, draftTurnId: string | null, chars: number) =>
+    options.persistChild(run.caseId, { event: "child", runId: run.runId, index,
+      state, at: clock(), line: line.slice(0, 800), answerTurnId, draftTurnId, chars });
+
+  ipcMain.handle(IPC_CHANNELS.workstationDispatchPrepare, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    const request = WorkstationDispatchPrepareInputSchema.parse(input);
+    const owner = options.ownerFor(event);
+    if (revokedOwners.has(owner)) throw new Error("That Compare window is no longer active.");
+    const reviews: WorkstationReview[] = [];
+    for (const selected of request.selections) {
+      const review = await options.prepareLane({ caseId: request.caseId,
+        providerId: selected.providerId, modelId: selected.modelId,
+        brief: request.brief, sourceTurnIds: request.sourceTurnIds ?? [], owner });
+      if (review.caseId !== request.caseId || review.providerId !== selected.providerId ||
+          review.modelId !== selected.modelId)
+        throw new Error("A Compare lane did not match its selected connection and model.");
+      reviews.push(review);
+    }
+    if (revokedOwners.has(owner)) throw new Error("That Compare window is no longer active.");
+    const token = randomBytes(32).toString("hex");
+    const expiresAt = Math.min(...reviews.map((review) => review.expiresAt));
+    for (const [key, value] of pending) if (value.expiresAt < clock()) pending.delete(key);
+    if (pending.size >= 8) pending.delete(pending.keys().next().value!);
+    pending.set(token, { owner, caseId: request.caseId, brief: request.brief, reviews, expiresAt });
+    return { token, expiresAt,
+      reviews: reviews.map(({ token: _laneToken, ...shown }) => shown) };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.workstationDispatchStart, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    const request = z.strictObject({ token: z.string().regex(/^[0-9a-f]{64}$/u) }).parse(input);
+    const manifest = pending.get(request.token);
+    pending.delete(request.token);
+    if (manifest === undefined || manifest.owner !== options.ownerFor(event) ||
+        revokedOwners.has(manifest.owner) || clock() > manifest.expiresAt)
+      throw new Error("That Compare review expired or belongs to another window. Review it again.");
+    if (activeRun !== null && !toDispatchBoard(activeRun, clock).done)
+      throw new Error("The previous Compare is still running. Stop it or wait for its result.");
+    const runId = randomUUID();
+    await options.persistParent({ event: "parent", runId, caseId: manifest.caseId,
+      brief: manifest.brief, at: clock(), children: manifest.reviews.map((review) => {
+        if (!review.contextSnapshotId || !review.modelId)
+          throw new Error("A Compare lane has no saved context or chosen model. Nothing was sent.");
+        return { providerId: review.providerId, label: review.providerLabel,
+          modelId: review.modelId, contextSnapshotId: review.contextSnapshotId,
+          sourceHash: review.sourceHash };
+      }) });
+    if (revokedOwners.has(manifest.owner))
+      throw new Error("That Compare window closed before dispatch. No provider was started.");
+    const run: InternalRun & { readonly owner: object } = {
+      runId, owner: manifest.owner, caseId: manifest.caseId, brief: manifest.brief,
+      lanes: manifest.reviews.map((review): InternalLane => ({
+        providerId: review.providerId, label: review.providerLabel, state: "queued",
+        line: "Waiting for its reviewed turn.", startedAt: clock(), endedAt: null,
+        answerTurnId: null, draftTurnId: null, outcome: null, chars: 0,
+        canStop: true, controller: new AbortController()
+      }))
+    };
+    runs.set(runId, run);
+    while (runs.size > 24) {
+      const oldest = runs.keys().next().value;
+      if (oldest === undefined || oldest === activeRun?.runId) break;
+      runs.delete(oldest);
+    }
+    activeRun = run;
+    void (async () => {
+      for (let i = 0; i < manifest.reviews.length; i += 1) {
+        const review = manifest.reviews[i]!;
+        const lane = run.lanes[i]!;
+        if (lane.controller.signal.aborted) continue;
+        run.lanes[i] = { ...lane, state: "working", line: "Starting reviewed session.", startedAt: clock() };
+        try {
+          await persistLane(run, i, "starting", "Host admission pending.", null, null, 0);
+        } catch {
+          run.lanes[i] = { ...run.lanes[i]!, state: "failed",
+            line: "Could not save the child intent. Nothing was sent.", endedAt: clock(), canStop: false };
+          for (let j = i + 1; j < run.lanes.length; j += 1) {
+            const queued = run.lanes[j]!;
+            queued.controller.abort();
+            run.lanes[j] = { ...queued, state: "interrupted", line: "Not started; parent recording failed.",
+              endedAt: clock(), canStop: false };
+          }
+          return;
+        }
+        if (lane.controller.signal.aborted || revokedOwners.has(manifest.owner)) {
+          run.lanes[i] = { ...run.lanes[i]!, state: "stopped", line: "Stopped before provider dispatch.",
+            endedAt: clock(), canStop: false };
+          try { await persistLane(run, i, "stopped", "Stopped before provider dispatch.", null, null, 0); }
+          catch { /* The starting receipt still records that dispatch was cancelled. */ }
+          continue;
+        }
+        try {
+          const result = await options.runLane({ review, owner: manifest.owner,
+            signal: lane.controller.signal,
+            onActivity: (line) => {
+              noteActivity(runId, lane.providerId, line);
+              const current = run.lanes[i]!;
+              if (current.state === "working")
+                run.lanes[i] = { ...current, line: laneActivity.get(activityKey(runId, lane.providerId)) ?? current.line };
+            } });
+          const current = run.lanes[i]!;
+          const completed = nativeAskCompleted(result);
+          const stopped = nativeAskEffectiveReason(result) === "stopped";
+          run.lanes[i] = { ...current,
+            state: completed ? "answered" : stopped ? "stopped" : "failed",
+            line: completed ? result.text.trim().split(/\r?\n/u)[0] ?? "Answer received." : nativeAskDetail(result),
+            endedAt: clock(), answerTurnId: completed ? result.turnId : null,
+            draftTurnId: completed ? null : result.turnId, outcome: result,
+            chars: result.text.length, canStop: false };
+          const settled = run.lanes[i]!;
+          await persistLane(run, i, settled.state === "answered" ? "answered" : settled.state === "stopped" ? "stopped" : "failed",
+            settled.line, settled.answerTurnId, settled.draftTurnId, settled.chars);
+        } catch (error) {
+          const current = run.lanes[i]!;
+          run.lanes[i] = { ...current, state: "interrupted",
+            line: `The host result needs inspection: ${toPlainErrorMessage(error)}`,
+            endedAt: clock(), canStop: false };
+          try { await persistLane(run, i, "interrupted", run.lanes[i]!.line,
+            current.answerTurnId, current.draftTurnId, current.chars); } catch { /* host receipt remains authoritative */ }
+          for (let j = i + 1; j < run.lanes.length; j += 1) {
+            const queued = run.lanes[j]!;
+            queued.controller.abort();
+            run.lanes[j] = { ...queued, state: "interrupted", line: "Not started after an uncertain child result.",
+              endedAt: clock(), canStop: false };
+          }
+          return;
+        }
+      }
+    })();
+    return { runId };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.workstationDispatchPoll, async (event, input: unknown): Promise<DispatchBoard> => {
+    options.assertTrusted(event);
+    const request = WorkstationDispatchPollInputSchema.parse(input);
+    const run = runs.get(request.runId);
+    if (run === undefined) {
+      const recovered = await options.recover(request.runId);
+      if (recovered !== null) return recovered;
+      throw new Error("That Compare run is unavailable.");
+    }
+    if (run.owner !== options.ownerFor(event)) throw new Error("That Compare run is unavailable.");
+    return toDispatchBoard(run, clock);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.workstationDispatchStop, async (event, input: unknown): Promise<DispatchBoard> => {
+    options.assertTrusted(event);
+    const request = WorkstationDispatchStopInputSchema.parse(input);
+    const run = runs.get(request.runId);
+    if (run === undefined || run.owner !== options.ownerFor(event)) throw new Error("That Compare run is unavailable.");
+    if (request.providerId !== undefined && !run.lanes.some((lane) => lane.providerId === request.providerId))
+      throw new Error("That Compare lane does not exist.");
+    for (let i = 0; i < run.lanes.length; i += 1) {
+      const lane = run.lanes[i]!;
+      if (request.providerId !== undefined && lane.providerId !== request.providerId) continue;
+      if (lane.state === "queued") {
+        lane.controller.abort();
+        run.lanes[i] = { ...lane, state: "stopped", line: "Stopped before dispatch.",
+          endedAt: clock(), canStop: false };
+        await persistLane(run, i, "stopped", "Stopped before dispatch.", null, null, 0);
+      } else if (lane.state === "working" && lane.canStop) {
+        lane.controller.abort();
+        run.lanes[i] = { ...lane, line: "Stop requested; waiting for the provider to settle.", canStop: false };
+      }
+    }
+    return toDispatchBoard(run, clock);
+  });
+  const cancelOwner = async (owner: object): Promise<void> => {
+    revokedOwners.add(owner);
+    for (const [token, review] of pending) if (review.owner === owner) pending.delete(token);
+    const changes: Promise<void>[] = [];
+    for (const run of runs.values()) {
+      if (run.owner !== owner) continue;
+      for (let i = 0; i < run.lanes.length; i += 1) {
+        const lane = run.lanes[i]!;
+        if (lane.state === "queued") {
+          lane.controller.abort();
+          run.lanes[i] = { ...lane, state: "stopped", line: "Owner window closed before dispatch.",
+            endedAt: clock(), canStop: false };
+          changes.push(persistLane(run, i, "stopped", "Owner window closed before dispatch.", null, null, 0));
+        } else if (lane.state === "working") lane.controller.abort();
+      }
+    }
+    await Promise.allSettled(changes);
+  };
+  const stopActive = async (): Promise<boolean> => {
+    const run = activeRun;
+    if (run === null || toDispatchBoard(run, clock).done) return false;
+    const changes: Promise<void>[] = [];
+    for (let i = 0; i < run.lanes.length; i += 1) {
+      const lane = run.lanes[i]!;
+      if (lane.state === "queued") {
+        lane.controller.abort();
+        run.lanes[i] = { ...lane, state: "stopped", line: "Global Stop before dispatch.",
+          endedAt: clock(), canStop: false };
+        changes.push(persistLane(run, i, "stopped", "Global Stop before dispatch.", null, null, 0));
+      } else if (lane.state === "working") {
+        lane.controller.abort();
+        run.lanes[i] = { ...lane, line: "Global Stop requested; waiting for provider to settle.", canStop: false };
+      }
+    }
+    await Promise.allSettled(changes);
+    return true;
+  };
+  return { stopActive, cancelOwner, shutdown: async () => {
+    const owners = new Set([...runs.values()].map((run) => run.owner));
+    await Promise.allSettled([...owners].map((owner) => cancelOwner(owner)));
+  } };
 }

@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 export const AUTOMATION_SCHEMA_VERSION = 1 as const;
+/** Opt-in Case-bound graph records coexist with untouched v1 records. */
+export const AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION = 2 as const;
 
 const IdSchema = z.uuid();
 const IsoDateSchema = z.iso.datetime({ offset: true });
@@ -189,7 +191,34 @@ export type AutomationWorkflowSaveInput = z.infer<
   typeof AutomationWorkflowSaveInputSchema
 >;
 
-export const AutomationWorkflowSchema = z.strictObject({
+export const AutomationReviewBoundWorkflowInputSchema = z.strictObject({
+  workflow: AutomationWorkflowSaveInputSchema,
+  caseId: IdSchema,
+  sourceTurnIds: z.array(IdSchema).min(1).max(128)
+}).superRefine((input, context) => {
+  if (new Set(input.sourceTurnIds).size !== input.sourceTurnIds.length)
+    context.addIssue({ code: "custom", path: ["sourceTurnIds"], message: "Source turns must be unique." });
+  if (input.workflow.nodes.some(node => node.kind !== "model"))
+    context.addIssue({ code: "custom", path: ["workflow", "nodes"],
+      message: "This first review-bound graph version accepts model nodes only." });
+  if (input.workflow.nodes.filter(node => node.dependsOn.length === 0).length !== 1)
+    context.addIssue({ code: "custom", path: ["workflow", "nodes"],
+      message: "This review-bound graph version requires exactly one root model node." });
+});
+export type AutomationReviewBoundWorkflowInput = z.infer<typeof AutomationReviewBoundWorkflowInputSchema>;
+
+export const AutomationReviewBindingSchema = z.strictObject({
+  caseId: IdSchema,
+  sourceTurnIds: z.array(IdSchema).min(1).max(128),
+  reviewRequired: z.literal(true),
+  agentRevisions: z.array(z.strictObject({
+    agentId: IdSchema,
+    revision: z.number().int().positive().safe()
+  })).min(1).max(32)
+});
+export type AutomationReviewBinding = z.infer<typeof AutomationReviewBindingSchema>;
+
+export const AutomationWorkflowV1Schema = z.strictObject({
   schemaVersion: z.literal(AUTOMATION_SCHEMA_VERSION),
   id: IdSchema,
   name: NameSchema,
@@ -212,6 +241,40 @@ export const AutomationWorkflowSchema = z.strictObject({
   lastRunAt: IsoDateSchema.nullable(),
   nextRunAt: IsoDateSchema.nullable()
 });
+export const AutomationWorkflowV2Schema = AutomationWorkflowV1Schema.extend({
+  schemaVersion: z.literal(AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION),
+  reviewBinding: AutomationReviewBindingSchema
+}).superRefine((workflow, context) => {
+  const graph = AutomationWorkflowSaveInputSchema.safeParse({
+    id: workflow.id,
+    name: workflow.name,
+    description: workflow.description,
+    enabled: workflow.enabled,
+    trigger: workflow.trigger,
+    budget: workflow.budget,
+    nodes: workflow.nodes
+  });
+  if (!graph.success)
+    context.addIssue({ code: "custom", path: ["nodes"],
+      message: "A review-bound graph must have valid, acyclic dependencies." });
+  if (workflow.nodes.some(node => node.kind !== "model"))
+    context.addIssue({ code: "custom", path: ["nodes"],
+      message: "Review-bound graphs in this version accept model nodes only." });
+  const expected = new Set(workflow.nodes.map(node => node.agentId));
+  const actual = workflow.reviewBinding.agentRevisions.map(item => item.agentId);
+  if (actual.length !== expected.size || new Set(actual).size !== actual.length ||
+      actual.some(id => !expected.has(id)))
+    context.addIssue({ code: "custom", path: ["reviewBinding", "agentRevisions"],
+      message: "Pinned agent revisions must cover exactly the workflow agents." });
+  if (new Set(workflow.reviewBinding.sourceTurnIds).size !==
+      workflow.reviewBinding.sourceTurnIds.length)
+    context.addIssue({ code: "custom", path: ["reviewBinding", "sourceTurnIds"],
+      message: "Source turns must be unique." });
+});
+export const AutomationWorkflowSchema = z.discriminatedUnion("schemaVersion", [
+  AutomationWorkflowV1Schema,
+  AutomationWorkflowV2Schema
+]);
 export type AutomationWorkflow = z.infer<typeof AutomationWorkflowSchema>;
 
 export const AutomationRunStateSchema = z.enum([
@@ -254,7 +317,7 @@ export type AutomationRunAgentSnapshot = z.infer<
   typeof AutomationRunAgentSnapshotSchema
 >;
 
-export const AutomationRunStepSchema = z.strictObject({
+export const AutomationRunStepV1Schema = z.strictObject({
   nodeId: IdSchema,
   title: NameSchema,
   instruction: PromptSchema,
@@ -272,6 +335,33 @@ export const AutomationRunStepSchema = z.strictObject({
   output: z.string().max(2_000_000).nullable(),
   error: z.string().max(4_000).nullable()
 });
+export const AutomationHostAttemptIntentSchema = z.strictObject({
+  correlation: IdSchema,
+  correlationId: IdSchema,
+  descriptorSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  createdAt: IsoDateSchema
+});
+export type AutomationHostAttemptIntent = z.infer<
+  typeof AutomationHostAttemptIntentSchema
+>;
+
+export const AutomationRunStepV2Schema = AutomationRunStepV1Schema.extend({
+  state: z.enum([
+    "pending", "awaiting-review", "host-reserved", "running", "waiting-approval", "completed",
+    "failed", "cancelled", "interrupted", "skipped"
+  ]),
+  attemptId: IdSchema.nullable(),
+  intent: AutomationHostAttemptIntentSchema.nullable().default(null),
+  answerTurnId: IdSchema.nullable().optional()
+}).superRefine((step, context) => {
+  if (step.state === "awaiting-review" && step.attemptId === null)
+    context.addIssue({ code: "custom", path: ["attemptId"],
+      message: "An awaiting-review step needs a stable attempt ID." });
+  if (step.state === "host-reserved" && (step.attemptId === null || step.intent === null))
+    context.addIssue({ code: "custom", path: ["intent"],
+      message: "A host-reserved step needs a stable attempt ID and intent." });
+});
+export const AutomationRunStepSchema = z.union([AutomationRunStepV1Schema, AutomationRunStepV2Schema]);
 export type AutomationRunStep = z.infer<typeof AutomationRunStepSchema>;
 
 export const AutomationMemoryDocumentSaveInputSchema = z.strictObject({
@@ -547,7 +637,7 @@ export const AutomationReceiptSchema = z.strictObject({
 });
 export type AutomationReceipt = z.infer<typeof AutomationReceiptSchema>;
 
-export const AutomationRunSnapshotSchema = z.strictObject({
+export const AutomationRunSnapshotV1Schema = z.strictObject({
   schemaVersion: z.literal(AUTOMATION_SCHEMA_VERSION),
   id: IdSchema,
   workflowId: IdSchema,
@@ -563,11 +653,219 @@ export const AutomationRunSnapshotSchema = z.strictObject({
   deadlineAt: IsoDateSchema,
   activeNodeId: IdSchema.nullable(),
   error: z.string().max(4_000).nullable(),
-  steps: z.array(AutomationRunStepSchema).min(1).max(32),
+  steps: z.array(AutomationRunStepV1Schema).min(1).max(32),
   receipts: z.array(AutomationReceiptSchema).max(32)
 });
+export const AutomationRunSnapshotV2Schema = AutomationRunSnapshotV1Schema.extend({
+  schemaVersion: z.literal(AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION),
+  reviewBinding: AutomationReviewBindingSchema,
+  workflowSnapshot: AutomationWorkflowV2Schema.optional(),
+  steps: z.array(AutomationRunStepV2Schema).min(1).max(32)
+}).superRefine((run, context) => {
+  if (run.steps.some(step => step.kind !== "model"))
+    context.addIssue({ code: "custom", path: ["steps"],
+      message: "Review-bound runs in this version accept model nodes only." });
+  const pinned = new Map(run.reviewBinding.agentRevisions.map(item =>
+    [item.agentId, item.revision]));
+  const agentIds = new Set(run.steps.map(step => step.agent.agentId));
+  if (new Set(run.reviewBinding.sourceTurnIds).size !==
+      run.reviewBinding.sourceTurnIds.length ||
+      pinned.size !== run.reviewBinding.agentRevisions.length ||
+      pinned.size !== agentIds.size ||
+      run.steps.some(step => pinned.get(step.agent.agentId) !== step.agent.agentRevision))
+    context.addIssue({ code: "custom", path: ["reviewBinding"],
+      message: "Review-bound run sources and agent revisions must match the pinned graph." });
+  if (run.state === "waiting") {
+    const waiting = run.steps.filter(step =>
+      step.state === "awaiting-review" || step.state === "host-reserved"
+    );
+    if (waiting.length !== 1 || waiting[0]?.nodeId !== run.activeNodeId ||
+        (waiting[0]?.attempt ?? 0) < 1 ||
+        (waiting[0]?.state === "awaiting-review" && waiting[0]?.operationId !== null) ||
+        waiting[0]?.finishedAt !== null)
+      context.addIssue({ code: "custom", path: ["activeNodeId"],
+        message: "A waiting review-bound run needs one exact awaiting-review node." });
+  }
+});
+export const AutomationRunSnapshotSchema = z.discriminatedUnion("schemaVersion", [
+  AutomationRunSnapshotV1Schema,
+  AutomationRunSnapshotV2Schema
+]);
 export type AutomationRunSnapshot = z.infer<
   typeof AutomationRunSnapshotSchema
+>;
+
+export const AutomationHostReserveAttemptResultSchema = z
+  .strictObject({
+    run: AutomationRunSnapshotV2Schema,
+    intent: AutomationHostAttemptIntentSchema,
+    correlation: IdSchema
+  })
+  .superRefine((result, context) => {
+    if (result.correlation !== result.intent.correlation) {
+      context.addIssue({
+        code: "custom",
+        path: ["correlation"],
+        message: "Reservation result correlation must match intent correlation."
+      });
+    }
+
+    if (
+      result.run.state === "completed" ||
+      result.run.state === "failed" ||
+      result.run.state === "cancelled"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "state"],
+        message: "Reserved run state must not be closed or cancelled."
+      });
+    }
+
+    if (result.run.activeNodeId === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "activeNodeId"],
+        message: "A reserved review-bound run needs an active node ID."
+      });
+      return;
+    }
+
+    const targetStep = result.run.steps.find(
+      (step) => step.nodeId === result.run.activeNodeId
+    );
+    if (targetStep === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Reservation target step not found."
+      });
+      return;
+    }
+
+    if (targetStep.state !== "host-reserved") {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Reservation target step state must be host-reserved."
+      });
+    }
+
+    if (targetStep.attemptId === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Reservation target step must have an attempt ID."
+      });
+    }
+
+    if (targetStep.operationId !== null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Reservation target step must not have an operation ID."
+      });
+    }
+
+    if (targetStep.intent === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Reservation target step must have an intent."
+      });
+    } else {
+      if (targetStep.intent.correlation !== result.correlation) {
+        context.addIssue({
+          code: "custom",
+          path: ["run", "steps"],
+          message: "Reservation target step correlation mismatch."
+        });
+      }
+      if (targetStep.intent.descriptorSha256 !== result.intent.descriptorSha256) {
+        context.addIssue({
+          code: "custom",
+          path: ["run", "steps"],
+          message: "Reservation target step descriptor SHA256 mismatch."
+        });
+      }
+    }
+  });
+export type AutomationHostReserveAttemptResult = z.infer<
+  typeof AutomationHostReserveAttemptResultSchema
+>;
+
+export const AutomationHostBindOperationResultSchema = z
+  .strictObject({
+    run: AutomationRunSnapshotV2Schema
+  })
+  .superRefine((result, context) => {
+    if (
+      result.run.state === "completed" ||
+      result.run.state === "failed" ||
+      result.run.state === "cancelled"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "state"],
+        message: "Bound run state must not be closed or cancelled."
+      });
+    }
+
+    if (result.run.activeNodeId === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "activeNodeId"],
+        message: "A bound review-bound run must have an active node ID."
+      });
+      return;
+    }
+
+    const targetStep = result.run.steps.find(
+      (step) => step.nodeId === result.run.activeNodeId
+    );
+    if (targetStep === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Operation binding target step not found."
+      });
+      return;
+    }
+
+    if (targetStep.state !== "host-reserved") {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Operation binding target step state must be host-reserved."
+      });
+    }
+
+    if (targetStep.attemptId === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Operation binding target step must have an attempt ID."
+      });
+    }
+
+    if (targetStep.operationId === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Operation binding target step must have an operation ID."
+      });
+    }
+
+    if (targetStep.intent === null) {
+      context.addIssue({
+        code: "custom",
+        path: ["run", "steps"],
+        message: "Operation binding target step must have an intent."
+      });
+    }
+  });
+export type AutomationHostBindOperationResult = z.infer<
+  typeof AutomationHostBindOperationResultSchema
 >;
 
 export const AutomationWorkspaceSnapshotSchema = z.strictObject({
@@ -647,3 +945,226 @@ export function tripsLoopGuard(previousStartsMs: readonly number[], atMs: number
   const since = atMs - LOOP_WINDOW_MS;
   return previousStartsMs.filter((start) => start >= since).length >= LOOP_RUNS;
 }
+
+export const MAX_REVIEW_CONTEXT_CHARACTERS = 8_000;
+
+export const AutomationHostReviewDependencyOutputSchema = z.strictObject({
+  nodeId: IdSchema,
+  title: NameSchema,
+  output: z.string().max(2_000_000),
+  outputSha256: z.string().regex(/^[a-f0-9]{64}$/u)
+});
+export type AutomationHostReviewDependencyOutput = z.infer<
+  typeof AutomationHostReviewDependencyOutputSchema
+>;
+
+export const AutomationGraphProvenanceSchema = z.strictObject({
+  workflowId: IdSchema,
+  workflowRevision: z.number().int().positive().safe(),
+  workflowName: NameSchema,
+  runId: IdSchema,
+  runCreatedAt: IsoDateSchema,
+  triggerKind: z.enum(["manual", "interval", "folder"]),
+  nodeId: IdSchema,
+  nodeTitle: NameSchema,
+  dependsOn: z.array(IdSchema).max(32),
+  attempt: z.number().int().positive().safe(),
+  attemptId: IdSchema
+});
+export type AutomationGraphProvenance = z.infer<
+  typeof AutomationGraphProvenanceSchema
+>;
+
+export const AutomationHostReviewContextPolicySchema = z.strictObject({
+  sourceTurnIds: z.array(IdSchema).min(1).max(128),
+  includeSystemPrompt: z.literal(true),
+  includeInstruction: z.literal(true),
+  includeDependencyOutputs: z.literal(true),
+  allowGlobalMemory: z.literal(false),
+  allowApprovedExamples: z.literal(false)
+});
+export type AutomationHostReviewContextPolicy = z.infer<
+  typeof AutomationHostReviewContextPolicySchema
+>;
+
+export const AutomationHostReviewDescriptorSchema = z.strictObject({
+  schemaVersion: z.literal(AUTOMATION_REVIEW_BOUND_SCHEMA_VERSION),
+  runId: IdSchema,
+  nodeId: IdSchema,
+  attemptId: IdSchema,
+  workflowId: IdSchema,
+  workflowRevision: z.number().int().positive().safe(),
+  workflowSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  agentId: IdSchema,
+  agentRevision: z.number().int().positive().safe(),
+  agentSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+  caseId: IdSchema,
+  sourceTurnIds: z.array(IdSchema).min(1).max(128),
+  contextPolicy: AutomationHostReviewContextPolicySchema,
+  instruction: PromptSchema,
+  systemPrompt: PromptSchema,
+  context: z.string().max(MAX_REVIEW_CONTEXT_CHARACTERS),
+  dependencyOutputs: z.array(AutomationHostReviewDependencyOutputSchema).max(32),
+  runtimeId: z.string().trim().min(1).max(80),
+  modelId: z.string().trim().min(1).max(512),
+  routingMode: z.enum(["fixed", "fallback"]),
+  fallbackRoutes: z.array(AutomationModelRouteSchema).max(3),
+  temperature: z.number().min(0).max(2),
+  maxTokens: z.number().int().min(32).max(8_192),
+  provenance: AutomationGraphProvenanceSchema
+}).superRefine((descriptor, context) => {
+  if (
+    descriptor.runId !== descriptor.provenance.runId ||
+    descriptor.nodeId !== descriptor.provenance.nodeId ||
+    descriptor.attemptId !== descriptor.provenance.attemptId ||
+    descriptor.workflowId !== descriptor.provenance.workflowId ||
+    descriptor.workflowRevision !== descriptor.provenance.workflowRevision
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["provenance"],
+      message: "Top-level descriptor identity must match provenance."
+    });
+  }
+
+  if (new Set(descriptor.sourceTurnIds).size !== descriptor.sourceTurnIds.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["sourceTurnIds"],
+      message: "Source turn IDs must be unique."
+    });
+  }
+
+  if (new Set(descriptor.contextPolicy.sourceTurnIds).size !== descriptor.contextPolicy.sourceTurnIds.length) {
+    context.addIssue({
+      code: "custom",
+      path: ["contextPolicy", "sourceTurnIds"],
+      message: "Context policy source turn IDs must be unique."
+    });
+  }
+
+  if (
+    descriptor.sourceTurnIds.length !== descriptor.contextPolicy.sourceTurnIds.length ||
+    descriptor.sourceTurnIds.some((id, index) => id !== descriptor.contextPolicy.sourceTurnIds[index])
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["contextPolicy", "sourceTurnIds"],
+      message: "Context policy source turn IDs must match descriptor source turn IDs."
+    });
+  }
+
+  if (
+    descriptor.dependencyOutputs.length !== descriptor.provenance.dependsOn.length ||
+    descriptor.dependencyOutputs.some((dep, index) => dep.nodeId !== descriptor.provenance.dependsOn[index])
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["dependencyOutputs"],
+      message: "Dependency outputs must match provenance dependency IDs and order."
+    });
+  }
+
+  const expectedContext = descriptor.dependencyOutputs
+    .map((dep) => `### ${dep.title}\n${dep.output}`)
+    .join("\n\n");
+  if (descriptor.context !== expectedContext) {
+    context.addIssue({
+      code: "custom",
+      path: ["context"],
+      message: "Descriptor context must exactly match joined dependency outputs."
+    });
+  }
+
+  const totalCharacters =
+    descriptor.systemPrompt.length + descriptor.instruction.length + descriptor.context.length;
+  if (totalCharacters > MAX_REVIEW_CONTEXT_CHARACTERS) {
+    context.addIssue({
+      code: "custom",
+      path: ["context"],
+      message: `Total systemPrompt, instruction, and context characters cannot exceed ${MAX_REVIEW_CONTEXT_CHARACTERS}.`
+    });
+  }
+});
+export type AutomationHostReviewDescriptor = z.infer<
+  typeof AutomationHostReviewDescriptorSchema
+>;
+
+export const AutomationPendingHostReviewInputSchema = z.strictObject({
+  runId: IdSchema,
+  nodeId: IdSchema,
+  attemptId: IdSchema
+});
+export type AutomationPendingHostReviewInput = z.infer<
+  typeof AutomationPendingHostReviewInputSchema
+>;
+
+export const AutomationHostReserveAttemptInputSchema = z.strictObject({
+  runId: IdSchema,
+  nodeId: IdSchema,
+  attemptId: IdSchema,
+  descriptorSha256: z.string().regex(/^[a-f0-9]{64}$/u)
+});
+export type AutomationHostReserveAttemptInput = z.infer<
+  typeof AutomationHostReserveAttemptInputSchema
+>;
+
+export const AutomationHostBindOperationInputSchema = z.strictObject({
+  runId: IdSchema,
+  nodeId: IdSchema,
+  attemptId: IdSchema,
+  operationId: IdSchema,
+  correlation: IdSchema.optional(),
+  correlationId: IdSchema.optional()
+});
+export type AutomationHostBindOperationInput = z.infer<
+  typeof AutomationHostBindOperationInputSchema
+>;
+
+export const AutomationHostTerminalStatusSchema = z.enum([
+  "completed",
+  "failed",
+  "stopped",
+  "interrupted"
+]);
+export type AutomationHostTerminalStatus = z.infer<
+  typeof AutomationHostTerminalStatusSchema
+>;
+
+export const AutomationHostTerminalEvidenceSchema = z.strictObject({
+  status: AutomationHostTerminalStatusSchema,
+  answerTurnId: IdSchema.nullable(),
+  output: z.string().max(2_000_000).nullable(),
+  outputSha256: z.string().regex(/^[a-f0-9]{64}$/u).nullable()
+});
+export type AutomationHostTerminalEvidence = z.infer<
+  typeof AutomationHostTerminalEvidenceSchema
+>;
+
+export const AutomationHostReconcileTerminalInputSchema = z.strictObject({
+  runId: IdSchema.optional(),
+  nodeId: IdSchema.optional(),
+  attemptId: IdSchema.optional(),
+  correlation: IdSchema,
+  operationId: IdSchema,
+  evidence: AutomationHostTerminalEvidenceSchema.optional(),
+  terminalEvidence: AutomationHostTerminalEvidenceSchema.optional()
+}).superRefine((input, context) => {
+  if (input.evidence === undefined && input.terminalEvidence === undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["terminalEvidence"],
+      message: "Terminal evidence is required."
+    });
+  }
+});
+export type AutomationHostReconcileTerminalInput = z.infer<
+  typeof AutomationHostReconcileTerminalInputSchema
+>;
+
+export const AutomationHostReconcileTerminalResultSchema = z.strictObject({
+  run: AutomationRunSnapshotV2Schema
+});
+export type AutomationHostReconcileTerminalResult = z.infer<
+  typeof AutomationHostReconcileTerminalResultSchema
+>;

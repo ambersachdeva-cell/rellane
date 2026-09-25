@@ -13,24 +13,28 @@ const testProviders: DispatchPanelProps["providers"] = [
     label: "Claude 3.5 Sonnet",
     usable: true,
     detail: "Ready to run",
+    models: [{ id: "sonnet", label: "Sonnet" }],
   },
   {
     id: "gemini",
     label: "Gemini 1.5 Pro",
     usable: true,
     detail: "Ready to run",
+    models: [{ id: "gemini-1.5-pro", label: "Gemini 1.5 Pro" }],
   },
   {
     id: "codex",
     label: "Codex CLI",
     usable: true,
     detail: "Ready to run",
+    models: [],
   },
   {
     id: "local-qwen",
     label: "Local Qwen",
     usable: false,
     detail: "Ollama not running",
+    models: [],
   },
 ];
 
@@ -95,17 +99,23 @@ describe("DispatchPanel", () => {
     fireEvent.change(briefInput, { target: { value: "Review VAT filings" } });
 
     const enabledSendButton = screen.getByRole("button", { name: "Send to 1 bot" });
+    expect(enabledSendButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Claude 3.5 Sonnet model"), { target: { value: "sonnet" } });
     expect(enabledSendButton).not.toBeDisabled();
 
     const geminiCard = screen.getByRole("button", { name: /gemini 1\.5 pro/i });
     fireEvent.click(geminiCard);
 
     const multiSendButton = screen.getByRole("button", { name: "Send to 2 bots" });
+    fireEvent.change(screen.getByLabelText("Gemini 1.5 Pro model"), { target: { value: "gemini-1.5-pro" } });
     expect(multiSendButton).not.toBeDisabled();
 
     fireEvent.click(multiSendButton);
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("Review VAT filings", ["claude", "gemini"]);
+    expect(onSend).toHaveBeenCalledWith("Review VAT filings", [
+      { providerId: "claude", modelId: "sonnet" },
+      { providerId: "gemini", modelId: "gemini-1.5-pro" }
+    ]);
   });
 
   it("excludes an unavailable bot from the count and shows why it cannot run", () => {
@@ -127,11 +137,13 @@ describe("DispatchPanel", () => {
     fireEvent.click(codexCard);
 
     const activeSendButton = screen.getByRole("button", { name: "Send to 1 bot" });
+    expect(activeSendButton).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Codex CLI model"), { target: { value: "gpt-5-codex" } });
     expect(activeSendButton).not.toBeDisabled();
 
     fireEvent.click(activeSendButton);
     expect(onSend).toHaveBeenCalledTimes(1);
-    expect(onSend).toHaveBeenCalledWith("Check server metrics", ["codex"]);
+    expect(onSend).toHaveBeenCalledWith("Check server metrics", [{ providerId: "codex", modelId: "gpt-5-codex" }]);
   });
 
   it("calls onStopLane with provider id when stop is pressed on a working lane", () => {

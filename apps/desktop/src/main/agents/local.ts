@@ -4,17 +4,24 @@ import {
   CadraneLocalBaseUrlSchema, LocalChatRequestSchema, LocalChatResultSchema,
   RuntimeDescriptorSchema, type AgentBrief, type EngineRoomStatus
 } from "@cadrane/contracts";
+import type { LocalChatRequest } from "@cadrane/contracts";
 import type { LocalWorkroomDeps } from "../workroom/local.js";
 import type { RunDeps } from "./run.js";
 
 const RUNTIME = "cadrane-local-loopback";
 const MAX_CONTEXT = 12_000;
 
+export interface LocalAgentStepHooks {
+  beforeChat(request: LocalChatRequest): void;
+  afterChat(request: LocalChatRequest, outcome: "completed" | "interrupted"): void;
+}
+
 export async function prepareLocalAgent(
   brief: AgentBrief,
   runtime: LocalWorkroomDeps,
   signal: AbortSignal,
-  responseProfile: "local-draft-v1" | "bill-excerpts-v1" | "print-enquiry-v1" = "local-draft-v1"
+  responseProfile: "local-draft-v1" | "bill-excerpts-v1" | "print-enquiry-v1" = "local-draft-v1",
+  hooks?: LocalAgentStepHooks
 ): Promise<{ room: EngineRoomStatus; ask: RunDeps["ask"] }> {
   if (brief.engine.pinnedEngineId !== null && brief.engine.pinnedEngineId !== "local")
     throw new Error("This agent is pinned to an external engine. Agent runs need an outbound review before using a subscription; nothing was sent. Choose this Mac in a new brief.");
@@ -56,7 +63,12 @@ export async function prepareLocalAgent(
       // this call, and a late response is discarded even if cancellation fails.
       const onStop = () => { void runtime.cancel(operationId).catch(() => undefined); };
       input.signal.addEventListener("abort", onStop, { once: true });
+      let started = false;
+      let terminalAttempted = false;
       try {
+        input.signal.throwIfAborted();
+        hooks?.beforeChat(request);
+        started = true;
         input.signal.throwIfAborted();
         const answer = LocalChatResultSchema.parse(await runtime.chat(request));
         input.signal.throwIfAborted();
@@ -66,7 +78,12 @@ export async function prepareLocalAgent(
         const content = answer.content.trim();
         if (!content || content.length > 16_000)
           throw new Error("The local model returned no usable answer. Ask for a shorter result.");
+        terminalAttempted = true;
+        hooks?.afterChat(request, "completed");
         return content;
+      } catch (error) {
+        if (started && !terminalAttempted) hooks?.afterChat(request, "interrupted");
+        throw error;
       } finally {
         input.signal.removeEventListener("abort", onStop);
       }

@@ -42,6 +42,37 @@ export interface NativeWorkerResult {
   readonly finishReason: "completed" | "denied" | "stopped" | "failed";
   readonly modelId?: string; readonly reportedModelId?: string; readonly detail?: string;
 }
+/** One native ask, including the requested choice and the adapter's observed result. */
+export interface NativeAskOutcome extends NativeWorkerResult {
+  readonly requestedModelId: string | null;
+  /** Owner/domain cancellation is separate from the adapter's own terminal reason. */
+  readonly cancellationRequested: boolean;
+  /** Transport failures have a synthesized reason; they are not provider reports. */
+  readonly resultSource: "worker" | "transport";
+}
+
+export function nativeAskCompleted(outcome: NativeAskOutcome): boolean {
+  return !outcome.cancellationRequested && outcome.finishReason === "completed" && outcome.text.trim().length > 0;
+}
+
+export function nativeAskEffectiveReason(outcome: NativeAskOutcome): NativeWorkerResult["finishReason"] {
+  return outcome.cancellationRequested ? "stopped" : outcome.finishReason;
+}
+
+export function nativeAskDetail(outcome: NativeAskOutcome): string {
+  if (outcome.cancellationRequested) {
+    const reported = outcome.resultSource === "worker" ? `The provider reported ${outcome.finishReason}.` : "The provider connection ended.";
+    return `Stopped. ${reported}${outcome.detail?.trim() ? ` ${outcome.detail.trim()}` : ""}`;
+  }
+  if (outcome.finishReason === "completed" && outcome.text.trim().length === 0)
+    return "The provider finished without an answer.";
+  const detail = outcome.detail?.trim();
+  if (detail) return detail;
+  if (outcome.finishReason === "completed") return "The provider completed the answer.";
+  if (outcome.finishReason === "denied") return "The provider declined a permission request.";
+  if (outcome.finishReason === "stopped") return "The provider was stopped.";
+  return "The provider could not finish this request.";
+}
 export interface NativeWorker {
   run(prompt: string): Promise<NativeWorkerResult>;
   interrupt(): Promise<{ acknowledged: boolean; detail: string }>;
@@ -57,10 +88,13 @@ export interface ContextSource { readonly id: string; readonly label: string; re
 export interface WorkstationContext {
   readonly packet: string; readonly preview: string; readonly sourceIds: readonly string[];
   readonly sha256: string; readonly omitted: readonly string[];
+  readonly constraintIds?: readonly string[];
 }
 export interface WorkstationSessionReceipt {
   readonly version: 1; readonly event: "start" | "checkpoint" | "finish" | "interrupted";
   readonly snapshot: WorkstationSnapshot; readonly workspacePath: string;
+  readonly contextSnapshotId?: string;
+  readonly projectId?: string | null;
 }
 export interface ExtractedArtifact {
   readonly title: string; readonly body: string; readonly language: string | null;

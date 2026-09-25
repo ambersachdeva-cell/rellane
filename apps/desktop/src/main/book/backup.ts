@@ -99,6 +99,12 @@ export class BackupUnreadable extends Error {
   }
 }
 
+/** Optional caps for the isolated R24 path; absent caps retain scheduled-backup behavior. */
+export interface BackupByteLimits {
+  readonly maxSnapshotBytes: number;
+  readonly maxArchiveBytes: number;
+}
+
 /**
  * Derives the archive key from the recovery secret.
  *
@@ -129,7 +135,8 @@ function deriveKey(secret: Buffer, salt: Buffer, format: number = FORMAT): Buffe
 export async function createBackup(
   db: DatabaseSync,
   destination: string,
-  secret: Buffer
+  secret: Buffer,
+  limits?: BackupByteLimits
 ): Promise<BackupResult> {
   const started = Date.now();
   await mkdir(dirname(destination), { recursive: true });
@@ -142,7 +149,16 @@ export async function createBackup(
     // parameter, and the path is one we generated rather than one a person typed.
     db.exec(`VACUUM INTO '${snapshot.replace(/'/gu, "''")}'`);
 
+    if (limits !== undefined) {
+      const detail = await stat(snapshot);
+      if (!detail.isFile() || detail.size <= 0 || detail.size > limits.maxSnapshotBytes) {
+        throw new BackupUnreadable("The Book snapshot exceeds the bounded archive limit.");
+      }
+    }
+
     const plain = await readFile(snapshot);
+    if (limits !== undefined && plain.byteLength > limits.maxSnapshotBytes)
+      throw new BackupUnreadable("The Book snapshot exceeds the bounded archive limit.");
     const schema = schemaVersionOf(snapshot);
 
     const salt = randomBytes(SALT_BYTES);
@@ -153,7 +169,10 @@ export async function createBackup(
     // mostly repeated text. Safe here because the archive is one fixed blob —
     // the compression-oracle attacks that make this dangerous need an attacker
     // who can inject chosen plaintext and watch the length change repeatedly.
-    const packed = gzipSync(plain, { level: 6 });
+    const packed = gzipSync(plain, {
+      level: 6,
+      ...(limits === undefined ? {} : { maxOutputLength: limits.maxArchiveBytes })
+    });
 
     // The header is built *before* encryption now, so it can be fed to the
     // cipher as additional authenticated data. Built after, it could only ever
@@ -168,19 +187,25 @@ export async function createBackup(
       plainBytes: plain.byteLength
     };
     const headerLine = `${JSON.stringify(header)}\n`;
+    const headerBytes = Buffer.from(headerLine, "utf8");
+    if (limits !== undefined &&
+        headerBytes.byteLength + packed.byteLength + TAG_BYTES > limits.maxArchiveBytes)
+      throw new BackupUnreadable("The Book archive exceeds the bounded output limit.");
 
     const cipher = createCipheriv("aes-256-gcm", key, nonce);
     // Authenticated, not encrypted: the header stays readable, and any edit to
     // it now fails the tag rather than silently steering the restore.
-    cipher.setAAD(Buffer.from(headerLine, "utf8"));
+    cipher.setAAD(headerBytes);
     const body = Buffer.concat([cipher.update(packed), cipher.final()]);
     const tag = cipher.getAuthTag();
 
     const archive = Buffer.concat([
-      Buffer.from(headerLine, "utf8"),
+      headerBytes,
       body,
       tag
     ]);
+    if (limits !== undefined && archive.byteLength > limits.maxArchiveBytes)
+      throw new BackupUnreadable("The Book archive exceeds the bounded output limit.");
 
     // Written aside and renamed, so an interrupted backup never replaces a good
     // archive with half a file. The moment a backup is being taken is not the
@@ -202,7 +227,13 @@ export async function createBackup(
       tookMs: Date.now() - started
     };
   } finally {
-    await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    if (limits === undefined) {
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      // A bounded portable path must not report success while its temporary
+      // plaintext SQLite snapshot remains at rest after a cleanup failure.
+      await rm(staging, { recursive: true, force: true });
+    }
   }
 }
 
@@ -268,12 +299,20 @@ function parseHeader(file: Buffer): {
 export async function restoreBackup(
   path: string,
   destination: string,
-  secret: Buffer
+  secret: Buffer,
+  limits?: BackupByteLimits
 ): Promise<BackupHeader> {
+  if (limits !== undefined) {
+    const detail = await stat(path);
+    if (!detail.isFile() || detail.size <= 0 || detail.size > limits.maxArchiveBytes)
+      throw new BackupUnreadable("The Book archive exceeds the bounded verification limit.");
+  }
   const file = await readFile(path).catch(() => null);
   if (file === null) {
     throw new BackupUnreadable(`There is no backup at ${path}.`);
   }
+  if (limits !== undefined && file.byteLength > limits.maxArchiveBytes)
+    throw new BackupUnreadable("The Book archive exceeds the bounded verification limit.");
 
   /**
    * The sidecars count too.
@@ -296,6 +335,7 @@ export async function restoreBackup(
   }
 
   const { header, body, headerLine } = parseHeader(file);
+  if (limits !== undefined) assertBoundedHeader(header, headerLine, limits);
   if (body.byteLength <= TAG_BYTES) {
     throw new BackupUnreadable("That backup is incomplete — it holds no data.");
   }
@@ -324,7 +364,10 @@ export async function restoreBackup(
     );
   }
 
-  const plain = gunzipSync(packed);
+  const plain = gunzipSync(packed,
+    limits === undefined ? undefined : { maxOutputLength: limits.maxSnapshotBytes });
+  if (limits !== undefined && plain.byteLength !== header.plainBytes)
+    throw new BackupUnreadable("The Book archive size does not match its authenticated header.");
   await mkdir(dirname(destination), { recursive: true });
   await writeFile(destination, plain);
 
@@ -333,6 +376,28 @@ export async function restoreBackup(
     bytes: plain.byteLength
   });
   return header;
+}
+
+function assertBoundedHeader(
+  header: BackupHeader,
+  headerLine: Buffer,
+  limits: BackupByteLimits
+): void {
+  if (headerLine.byteLength > 1024 || header.format !== FORMAT ||
+      !Number.isSafeInteger(header.schema) || header.schema < 1 ||
+      !Number.isSafeInteger(header.plainBytes) || header.plainBytes <= 0 ||
+      header.plainBytes > limits.maxSnapshotBytes ||
+      typeof header.createdAt !== "string" || header.createdAt.length > 64 ||
+      !canonicalBase64(header.salt, SALT_BYTES) ||
+      !canonicalBase64(header.nonce, NONCE_BYTES))
+    throw new BackupUnreadable("The bounded Book archive header is invalid or oversized.");
+}
+
+function canonicalBase64(value: unknown, expectedBytes: number): boolean {
+  if (typeof value !== "string" || value.length > 64 ||
+      !/^[A-Za-z0-9+/]+={0,2}$/u.test(value)) return false;
+  const decoded = Buffer.from(value, "base64");
+  return decoded.byteLength === expectedBytes && decoded.toString("base64") === value;
 }
 
 export interface VerifyResult {
@@ -354,13 +419,17 @@ export interface VerifyResult {
  * Nothing here touches the live book, and the temp copy is destroyed before it
  * returns.
  */
-export async function verifyBackup(path: string, secret: Buffer): Promise<VerifyResult> {
+export async function verifyBackup(
+  path: string,
+  secret: Buffer,
+  limits?: BackupByteLimits
+): Promise<VerifyResult> {
   const at = new Date().toISOString();
   const staging = await mkdtemp(join(tmpdir(), "cadrane-verify-"));
   const restored = join(staging, "book.sqlite");
 
   try {
-    const header = await restoreBackup(path, restored, secret);
+    const header = await restoreBackup(path, restored, secret, limits);
 
     const db = new DatabaseSync(restored);
     try {
@@ -416,7 +485,11 @@ export async function verifyBackup(path: string, secret: Buffer): Promise<Verify
         error instanceof Error ? error.message : "The backup could not be opened."
     };
   } finally {
-    await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    if (limits === undefined) {
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    } else {
+      await rm(staging, { recursive: true, force: true });
+    }
   }
 }
 

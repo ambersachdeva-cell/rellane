@@ -14,7 +14,7 @@
  * of them.
  */
 import { randomBytes, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
@@ -27,13 +27,19 @@ import {
   type IpcMainInvokeEvent
 } from "electron";
 import {
+  AutomationPendingHostReviewInputSchema,
   WorkstationDecideInputSchema,
   WorkstationPrepareInputSchema,
   WorkstationRevealWorkspaceInputSchema,
   WorkstationStartInputSchema,
   WorkstationStateInputSchema,
   WorkstationStopInputSchema,
+  type AgentRunResult,
+  type AutomationHostReconcileTerminalResult,
+  type AutomationPendingHostReviewInput,
+  type WorkstationContextSuggestion,
   type WorkstationProviderId,
+  type WorkstationReview,
   type WorkstationWorkspace
 } from "@cadrane/contracts";
 import { z } from "zod";
@@ -46,6 +52,9 @@ import { createClaudeWorker } from "./claude.js";
 import { createGeminiWorker } from "./gemini.js";
 import { discoverWorkstationProviders } from "./providers.js";
 import { buildWorkstationContext } from "./context.js";
+import { approvedProjectConstraints, approvedProjectFindings, projectMemoryEpoch } from "./project-memory-book.js";
+import { projectForWork } from "./projects.js";
+import { saveContextSnapshot, readContextSnapshot, markContextDispatchAttempt } from "./context-snapshot-store.js";
 import { extractWorkstationArtifacts } from "./artifacts.js";
 import { WORKSTATION_ROUTINES } from "./routines.js";
 import { hermesSkillRoutines } from "./upstream-skills.js";
@@ -61,8 +70,17 @@ import {
   saveSessionReceipt,
   WORKSTATION_SESSION_SEAT
 } from "./store.js";
-import { WorkstationHost, workspaceFolderName } from "./service.js";
-import type { NativeWorker, NativeWorkerOptions } from "./types.js";
+import {
+  WorkstationHost,
+  workspaceFolderName,
+  type WorkstationGraphHostDeps,
+  type WorkstationGraphReview
+} from "./service.js";
+import { LocalCaseRunScope, type LocalCaseRunInput, type LocalAgentRunInput,
+  type LocalSuggestionRunInput } from "./local-case-run-scope.js";
+import { LocalBriefDraftScope, type LocalBriefDraftInput, type LocalBriefHistory } from "./local-brief-draft-scope.js";
+import type { DraftResult } from "../agents/draft.js";
+import { type NativeAskOutcome, type NativeWorker, type NativeWorkerOptions } from "./types.js";
 import { installWorkstationContinuity } from "./continuity-ipc.js";
 import {
   defaultHermesCitationsRuntimeOptions,
@@ -83,28 +101,54 @@ import { installDocumentParse } from "./document-parse-ipc.js";
 import { installDictation } from "./dictation-ipc.js";
 import { installSemanticSearch } from "./book-semantic-ipc.js";
 import { installPublish } from "./publish-ipc.js";
-import { installDispatchRun } from "./dispatch-run-ipc.js";
-import { installAgentStream } from "./agent-stream-ipc.js";
-import { installCrewRun } from "./crew-run-ipc.js";
-import { installAgentStore } from "./agent-store-ipc.js";
-import { installTelegramWork } from "./telegram-work-ipc.js";
-import { installResearch } from "./research-run-ipc.js";
+import { installReviewedDispatchRun } from "./dispatch-run-ipc.js";
+import { recoveredCompareBoard, saveCompareChild, saveCompareParent } from "./compare-run-store.js";
+import { installReviewedAgentStream, WORKSTATION_AGENT_GOAL_LIMIT, type WorkstationAgentPollResult } from "./agent-stream-ipc.js";
+import { installReviewedCrewRun, type CrewRunView } from "./crew-run-ipc.js";
+import { installAgentStore, loadStoredAgentContract } from "./agent-store-ipc.js";
+import { exactPhoneReview, installTelegramWork, sanitiseReply } from "./telegram-work-ipc.js";
+import { installReviewedResearchRun, type ResearchRunView } from "./research-run-ipc.js";
+import { recoverReviewedParent, saveReviewedChild, saveReviewedParent, type RecoveredReviewedParent } from "./reviewed-parent-store.js";
 import { installProjectMemory } from "./project-memory-ipc.js";
+import { installProjectMemoryConflicts } from "./project-memory-conflict-ipc.js";
 import { installFileHistory } from "./file-history-ipc.js";
+import { safeRestoreFile } from "./file-restore-writer.js";
+import { createScheduledHostAdmission } from "./scheduled-host-admission.js";
+import { installScheduleIpc } from "./schedule-ipc.js";
+import { createScheduleQueuePump } from "./schedule-queue-pump.js";
 import { installWatch } from "./watch-runner-ipc.js";
 import { installUsage, WORKSTATION_USAGE_RECEIPT_CAP } from "./usage-ipc.js";
+import { installModelOutcomeEvidence } from "./model-outcome-evidence-ipc.js";
+import { installModelPreferencesIpc } from "./model-preferences-ipc.js";
+import { installModelAdviceIpc } from "./model-advice-ipc.js";
 import { readBefore, readContentBefore, saveBefore, snapshotFolder } from "./change-store.js";
 import { AnnouncedCalls, describeCall, waitingCalls } from "./phone-approvals.js";
 import { forgetSeen, lastSeen, loadWatches, remember, saveWatches } from "./watch-store.js";
 import { readPageSource } from "./web-read.js";
 import { listWorkspace, previewFile } from "./workspace-files.js";
 import { listHermesSkills, readHermesSkill } from "./upstream-skills.js";
-import { runHermesLoop, type HermesToolDefinition } from "./hermes-agent-loop.js";
-import { tmpdir } from "node:os";
 import { artifactVersions } from "../workroom/artifacts.js";
 import { createRemoteDispatchServer } from "./remote-dispatch-server.js";
+import { installRemoteHostBridge } from "./remote-host-bridge.js";
 import { parseDocument } from "./universal-parser.js";
 import { transcribeAudio } from "./whisper-dictation.js";
+import { installSelfCheck } from "./self-check-ipc.js";
+import {
+  exportPortableOperatorWorkspace,
+  verifyPortableOperatorWorkspaceDigest,
+  projectOperatorWorkspaceView,
+  PortableOperatorWorkspaceStore,
+  type PortableOperatorWorkspaceDefinition
+} from "./portable-operator-workspace.js";
+import {
+  preflightWorkspaceRecovery,
+  captureWorkspace,
+  importWorkspace,
+  reopenRecoveredWorkspace,
+  type CaptureWorkspaceOptions,
+  type ImportWorkspaceOptions
+} from "./workspace-recovery-coordinator.js";
+import { createTrustedHostQuiescenceCoordinator } from "./recovery-quiescence-host-bridge.js";
 
 /**
  * The largest file this bridge will read whole in order to diff it.
@@ -154,6 +198,17 @@ function titleFromRequest(request: string): string {
   return trimmed.length > 0 ? trimmed : "From your phone";
 }
 
+export const WORKSTATION_GRAPH_PREPARE_CHANNEL =
+  "cadrane:v4:workstation-graph-prepare" as const;
+export const WORKSTATION_GRAPH_START_CHANNEL =
+  "cadrane:v4:workstation-graph-start" as const;
+export const WORKSTATION_GRAPH_STOP_CHANNEL =
+  "cadrane:v4:workstation-graph-stop" as const;
+export const WORKSTATION_GRAPH_RECONCILE_CHANNEL =
+  "cadrane:v4:workstation-graph-reconcile" as const;
+export const AUTOMATION_WORKFLOW_SAVE_REVIEW_BOUND_CHANNEL =
+  "cadrane:v4:automation-workflow-save-review-bound" as const;
+
 export interface WorkstationIpcOptions {
   /**
    * Puts one Telegram chat on the list this Mac obeys.
@@ -169,6 +224,7 @@ export interface WorkstationIpcOptions {
   readonly assertTrusted: (event: IpcMainInvokeEvent) => void;
   readonly book: () => DatabaseSync;
   readonly userData: () => string;
+  readonly graph?: WorkstationGraphHostDeps;
   /**
    * The Telegram chats this Mac is willing to obey, from the owner's own
    * contact list. Empty means it obeys nobody, which is the state a fresh
@@ -180,8 +236,28 @@ export interface WorkstationIpcOptions {
 }
 
 export interface WorkstationIpc {
+  localBriefHistory(event: IpcMainInvokeEvent): LocalBriefHistory;
+  forgetLocalBriefHistory(event: IpcMainInvokeEvent, reviewSha256: string): { removed: number };
+  runLocalBrief(event: IpcMainInvokeEvent,
+    input: Omit<LocalBriefDraftInput, "owner" | "workspacePath">): Promise<DraftResult>;
   /** Refuses to close or erase a case with a session still working in it. */
   assertIdle(caseId: string): void;
+  runLocalCase(event: IpcMainInvokeEvent, input: Omit<LocalCaseRunInput, "owner" | "workspacePath">): Promise<void>;
+  localCaseState(event: IpcMainInvokeEvent, caseId: string): { operationId: string; stopping: boolean } | null;
+  stopLocalCase(event: IpcMainInvokeEvent, caseId: string, operationId: string): Promise<{ stopped: boolean }>;
+  runLocalAgent(event: IpcMainInvokeEvent,
+    input: Omit<LocalAgentRunInput, "owner" | "workspacePath">): Promise<AgentRunResult>;
+  stopLocalAgent(event: IpcMainInvokeEvent, agentId: string): { stopped: boolean };
+  runLocalSuggestion(event: IpcMainInvokeEvent,
+    input: Omit<LocalSuggestionRunInput, "owner" | "workspacePath">): Promise<WorkstationContextSuggestion>;
+  prepareGraphNode(event: IpcMainInvokeEvent,
+    input: AutomationPendingHostReviewInput): Promise<WorkstationGraphReview>;
+  startGraphNode(event: IpcMainInvokeEvent,
+    token: string): Promise<AutomationHostReconcileTerminalResult>;
+  stopGraphNode(event: IpcMainInvokeEvent,
+    caseId: string,
+    operationId: string): Promise<{ stopped: boolean }>;
+  reconcileGraphHostRuns(event?: IpcMainInvokeEvent): Promise<number>;
   /** Safe stop and receipts, for a quit or a reload. */
   shutdown(): Promise<void>;
   /**
@@ -217,7 +293,19 @@ function createWorker(providerId: WorkstationProviderId, options: NativeWorkerOp
 }
 
 export function installWorkstationIpc(options: WorkstationIpcOptions): WorkstationIpc {
+  const localCaseScope = new LocalCaseRunScope();
+  const localBriefScope = new LocalBriefDraftScope();
+  let reviewedDispatch: ReturnType<typeof installReviewedDispatchRun> | null = null;
+  let reviewedAgent: ReturnType<typeof installReviewedAgentStream> | null = null;
+  let reviewedCrew: ReturnType<typeof installReviewedCrewRun> | null = null;
+  let reviewedResearch: ReturnType<typeof installReviewedResearchRun> | null = null;
+  let scheduled: ReturnType<typeof installScheduleIpc> | null = null;
   const owners = createAgentSourceOwners((owner) => {
+    void reviewedDispatch?.cancelOwner(owner);
+    void reviewedAgent?.cancelOwner(owner);
+    void reviewedCrew?.cancelOwner(owner);
+    void reviewedResearch?.cancelOwner(owner);
+    scheduled?.cancelOwner(owner);
     host.invalidate(owner);
   });
 
@@ -235,6 +323,9 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
   const memoryFolder = path.join(options.userData(), "workstation", "memory");
 
   const host = new WorkstationHost({
+    localCaseScope,
+    localBriefScope,
+    ...(options.graph ? { graph: options.graph } : {}),
     book: options.book,
     readCase,
     turnsFor,
@@ -251,6 +342,22 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
     },
     discoverProviders: discoverWorkstationProviders,
     buildContext: buildWorkstationContext,
+    memory: {
+      projectForCase: (db, caseId) => {
+        const link = db.prepare("SELECT project_id AS projectId FROM workstation_project_link WHERE case_id = ?")
+          .get(caseId) as { projectId: string } | undefined;
+        const project = projectForWork(db, caseId);
+        if (link && (!project || project.id !== link.projectId))
+          throw new Error("This case's project record is unavailable. Nothing was sent.");
+        return project?.id ?? null;
+      },
+      epoch: projectMemoryEpoch,
+      constraints: approvedProjectConstraints,
+      findings: approvedProjectFindings,
+      saveSnapshot: saveContextSnapshot,
+      readSnapshot: readContextSnapshot,
+      markDispatchAttempt: markContextDispatchAttempt
+    },
     createWorker,
     saveReceipt: saveSessionReceipt,
     latestReceipt: latestSessionReceipt,
@@ -278,13 +385,10 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         path: folder
       };
     },
+    canonicalWorkspacePath: (workspacePath: string) => realpath(workspacePath),
     now: () => Date.now(),
-    onRunStart: ({ caseId, operationId, workspacePath }) => {
-      // Not awaited: a session starts whether or not its folder could be
-      // written down, and the panel says "not recorded" rather than inventing
-      // a before it never took.
-      void saveBefore(changeHistoryFolder, caseId, operationId, workspacePath);
-    },
+    onRunStart: ({ caseId, operationId, workspacePath }) =>
+      saveBefore(changeHistoryFolder, caseId, operationId, workspacePath),
     token: () => randomBytes(32).toString("hex"),
     newId: () => randomUUID(),
     /**
@@ -309,6 +413,11 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         })
     }
   });
+  host.registerParentStop(async () => reviewedDispatch?.stopActive() ?? false);
+  host.registerParentStop(async () => reviewedAgent?.stopActive() ?? false);
+  host.registerParentStop(async () => reviewedCrew?.stopActive() ?? false);
+  host.registerParentStop(async () => reviewedResearch?.stopActive() ?? false);
+  host.registerParentStop(async () => scheduled?.stopActive() ?? false);
 
   const ownerFor = (event: IpcMainInvokeEvent): object =>
     owners(event.sender, event.senderFrame);
@@ -322,10 +431,64 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
   const recoverOnce = (): void => {
     try {
       host.recover();
+      localCaseScope.recover(options.book());
+      localBriefScope.recover(options.book());
     } catch {
       // No book yet. The next read tries again.
     }
   };
+
+  /** Schedules remain inert until the owner explicitly grants queueing and later Starts one reviewed occurrence. */
+  const scheduleAdmission = createScheduledHostAdmission({ book: options.book, host });
+  scheduled = installScheduleIpc({
+    assertTrusted: options.assertTrusted,
+    ownerFor,
+    book: options.book,
+    admission: scheduleAdmission,
+    confirmOwnerGrant: async (event, review) => {
+      options.assertTrusted(event);
+      const window = options.getWindow();
+      if (window === null) return false;
+      const definition = review.definition;
+      if (definition.instruction.length > 4000) {
+        throw new Error("This schedule's instructions are too long for the native approval dialog. Shorten them before enabling it.");
+      }
+      const response = await dialog.showMessageBox(window, {
+        type: "question",
+        title: "Enable this schedule",
+        message: "Allow this exact schedule to place due work in the queue?",
+        detail: [
+          `Case: ${definition.caseId}`,
+          `Project: ${definition.projectId ?? "None"}`,
+          `Provider and model: ${definition.providerId} / ${definition.modelId}`,
+          `Time: ${definition.expression} in ${definition.timezone}`,
+          `Grant expires: ${new Date(review.grantExpiresAt).toISOString()}`,
+          "This approval queues work only. Each model run still needs its own reviewed Start.",
+          "",
+          "Exact instructions:",
+          definition.instruction
+        ].join("\n"),
+        buttons: ["Cancel", "Enable queueing"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true
+      });
+      return response.response === 1;
+    }
+  });
+  let scheduleBookOpened = false;
+  const schedulePump = createScheduleQueuePump({
+    book: () => {
+      const db = options.book();
+      scheduleBookOpened = true;
+      return db;
+    },
+    onError: (error) => {
+      // A lazily unopened Book is expected during setup. Once it has opened,
+      // a failed scan or admission must remain visible for diagnosis.
+      if (scheduleBookOpened) console.error("Schedule queue admission paused:", error);
+    }
+  });
 
   ipcMain.handle(IPC_CHANNELS.workstationProviders, async (event) => {
     options.assertTrusted(event);
@@ -417,6 +580,33 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
     return host.decide(request.operationId, request.permissionId, request.allow, ownerFor(event));
   });
 
+  ipcMain.handle(WORKSTATION_GRAPH_PREPARE_CHANNEL, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    recoverOnce();
+    localCaseScope.recover(options.book());
+    const request = AutomationPendingHostReviewInputSchema.parse(input);
+    return host.prepareGraphNode(request, ownerFor(event));
+  });
+
+  ipcMain.handle(WORKSTATION_GRAPH_START_CHANNEL, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    recoverOnce();
+    localCaseScope.recover(options.book());
+    const request = WorkstationStartInputSchema.parse(input);
+    return host.startGraphNode(request, ownerFor(event));
+  });
+
+  ipcMain.handle(WORKSTATION_GRAPH_STOP_CHANNEL, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    const request = WorkstationStopInputSchema.parse(input);
+    return host.stopGraphNode(request.caseId, request.operationId, ownerFor(event));
+  });
+
+  ipcMain.handle(WORKSTATION_GRAPH_RECONCILE_CHANNEL, async (event) => {
+    options.assertTrusted(event);
+    return host.reconcileGraphHostRuns();
+  });
+
   // Quitting is not a crash and must not read like one. The hook itself belongs
   // in the app's own ordered shutdown — before the book closes, or the
   // interrupted receipt has nowhere to land — so `shutdown` is handed back
@@ -441,6 +631,91 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
   // binary already vendored in this bundle.
   installWorkstationDocumentImport({ assertTrusted: options.assertTrusted });
   installWorkstationSpeech({ assertTrusted: options.assertTrusted, userData: options.userData });
+  installSelfCheck({
+    assertTrusted: options.assertTrusted,
+    probeBook: async () => {
+      try {
+        const db = options.book();
+        const row = db.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table'").get() as { count?: number } | undefined;
+        return { open: true, tables: typeof row?.count === "number" ? row.count : null };
+      } catch {
+        return { open: false, tables: null };
+      }
+    },
+    probeProviders: async () => {
+      const providers = await host.providers();
+      return providers.map((p) => ({
+        id: p.id,
+        label: p.label,
+        detected: p.state === "detected",
+        detail: p.detail ?? p.state
+      }));
+    },
+    probeLocalModel: async () => ({ ready: true, detail: "Ready" }),
+    probeFolders: async () => ({ granted: 0, lost: [] }),
+    probeTelegram: async () => {
+      const contacts = options.telegramContacts ? await options.telegramContacts().catch(() => []) : [];
+      return { linked: Boolean(options.telegramSend), chatPaired: contacts.length > 0 };
+    },
+    probeKeychain: () => true,
+    probeDisk: async () => null,
+    lastBackupAt: async () => null
+  });
+
+  const portableWorkspaceStore = new PortableOperatorWorkspaceStore();
+  ipcMain.handle(IPC_CHANNELS.workstationPortableWorkspace, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    const cmd = z.object({ action: z.string() }).passthrough().parse(input);
+    switch (cmd.action) {
+      case "export":
+        return exportPortableOperatorWorkspace(cmd.input);
+      case "verify":
+        return { valid: verifyPortableOperatorWorkspaceDigest(cmd.definition as PortableOperatorWorkspaceDefinition) };
+      case "view":
+        return projectOperatorWorkspaceView(
+          cmd.definition as PortableOperatorWorkspaceDefinition,
+          (cmd.mode === "customer" ? "customer" : "developer")
+        );
+      case "import":
+        return portableWorkspaceStore.importWorkspace(cmd.definition as PortableOperatorWorkspaceDefinition);
+      case "edit-output":
+        return portableWorkspaceStore.editOutput(
+          String(cmd.workspaceId ?? ""),
+          String(cmd.outputId ?? ""),
+          String(cmd.nextContent ?? "")
+        );
+      case "update":
+        return portableWorkspaceStore.updateWorkspace(
+          String(cmd.workspaceId ?? ""),
+          cmd.nextDefinition as PortableOperatorWorkspaceDefinition
+        );
+      case "rollback":
+        return portableWorkspaceStore.rollbackWorkspace(String(cmd.workspaceId ?? ""));
+      default:
+        throw new Error(`Unsupported portable workspace action: ${cmd.action}`);
+    }
+  });
+
+  const recoveryQuiescence = createTrustedHostQuiescenceCoordinator();
+  ipcMain.handle(IPC_CHANNELS.workstationRecovery, async (event, input: unknown) => {
+    options.assertTrusted(event);
+    const cmd = z.object({ action: z.string() }).passthrough().parse(input);
+    switch (cmd.action) {
+      case "preflight":
+        return preflightWorkspaceRecovery(recoveryQuiescence);
+      case "capture":
+        return captureWorkspace({
+          ...(cmd.options as Omit<CaptureWorkspaceOptions, "quiescenceCoordinator">),
+          quiescenceCoordinator: recoveryQuiescence
+        });
+      case "import":
+        return importWorkspace(cmd.options as ImportWorkspaceOptions);
+      case "reopen":
+        return reopenRecoveredWorkspace(String(cmd.rootPath ?? ""));
+      default:
+        throw new Error(`Unsupported workspace recovery action: ${cmd.action}`);
+    }
+  });
 
   /**
    * The one folder a piece of work is allowed to touch.
@@ -632,6 +907,12 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
    * an afternoon fail for a reason no one holding a phone could diagnose — and
    * a piece of work that finishes is this product's unit anyway.
    */
+  const phoneApprovals = new Map<string, {
+    readonly code: string; readonly operationId: string; readonly permissionId: string;
+    readonly title: string; readonly detail: string; readonly expiresAt: number;
+  }>();
+  let phoneReview: { readonly code: string; readonly token: string; readonly caseId: string;
+    readonly providerId: WorkstationProviderId; readonly modelId: string; readonly expiresAt: number } | null = null;
   const phone = installTelegramWork({
     assertTrusted: options.assertTrusted,
     ownerChatId: () => lastKnownOwnerChat,
@@ -649,13 +930,17 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         knocks.delete(oldest);
       }
     },
-    decidePending: async (allow: boolean) => {
+    decidePending: async (allow: boolean, code: string) => {
       const waiting = waitingCalls(host.liveSnapshots());
-      const oldest = waiting[0];
-      if (oldest === undefined) {
-        return { decided: false, detail: "Nothing is waiting on an answer right now." };
-      }
-      await host.decide(oldest.operationId, oldest.permissionId, allow, PHONE_OWNER);
+      const match = [...phoneApprovals.values()].find((one) => one.code === code);
+      if (match === undefined || Date.now() > match.expiresAt)
+        return { decided: false, detail: "That approval code is missing or expired. Check the current request on your Mac." };
+      const exact = waiting.find((one) => one.operationId === match.operationId &&
+        one.permissionId === match.permissionId && one.title === match.title && one.detail === match.detail);
+      if (exact === undefined)
+        return { decided: false, detail: "That action changed or is no longer waiting. Nothing was approved." };
+      await host.decideFromPhone(match.operationId, match.permissionId, allow);
+      phoneApprovals.delete(`${match.operationId}:${match.permissionId}`);
       /**
        * Says which call it answered, not only that it answered. A bare "done"
        * after a delay is how the wrong thing gets approved without anybody
@@ -667,43 +952,27 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         : "";
       return {
         decided: true,
-        detail: `${allow ? "Allowed once" : "Declined"}: ${oldest.title}.${more}`
+        detail: `${allow ? "Allowed once" : "Declined"}: ${exact.title}.${more}`
       };
     },
-    startWork: async ({ request, seats }) => {
+    startWork: async ({ request, selection }) => {
+      phoneReview = null;
+      if (selection === undefined || !/^(codex|claude|gemini[123])$/u.test(selection.providerId))
+        return { started: false, detail: "Choose the exact connection and model: /ask codex/model-id: your request (or claude, gemini1, gemini2, gemini3)." };
+      const selectedId = selection.providerId as WorkstationProviderId;
       const wantsTools = WANTS_TOOLS.test(request);
       const available = await host.providers();
-      const detected = available.filter((one) => one.state === "detected");
-      if (detected.length === 0) {
+      const provider = available.find((one) => one.id === selectedId);
+      if (provider?.state !== "detected") {
         return {
           started: false,
-          detail: "No subscription is signed in on your Mac right now, so there is nothing to ask."
+          detail: "That connection was not detected on this Mac. Choose an available connection and model. Sign-in is checked only by a real attempt."
         };
       }
+      if (wantsTools && provider.id !== "codex")
+        return { started: false, detail: "File tools require an explicitly chosen Codex model. Nothing was switched or sent." };
 
-      /**
-       * Tools are Codex-only, because Codex is the connection that reviews each
-       * call. Said out loud rather than silently switching: being moved to a
-       * different subscription without being told is worse than being refused.
-       */
-      const named = seats
-        .map((seat) => detected.find((one) => one.id === seat))
-        .find((one) => one !== undefined);
-      let provider = named ?? detected[0]!;
-      let switchNote = "";
-      if (wantsTools) {
-        const codex = detected.find((one) => one.id === "codex");
-        if (codex === undefined) {
-          return {
-            started: false,
-            detail: "Working on files needs Codex, which is not signed in on your Mac. Send it again without files, or sign in there."
-          };
-        }
-        if (provider.id !== "codex") {
-          switchNote = ` Using Codex rather than ${provider.label}, because it is the one that checks each file with you.`;
-        }
-        provider = codex;
-      }
+      const packet = buildWorkstationContext({ prompt: request, sources: [] }).packet;
 
       const db = options.book();
       const title = titleFromRequest(request);
@@ -711,7 +980,6 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
       db.exec("BEGIN IMMEDIATE");
       try {
         caseId = openCase(db, { title, question: request });
-        appendTurn(db, caseId, { seat: "owner", kind: "verbatim", body: request });
         db.exec("COMMIT");
       } catch (problem) {
         db.exec("ROLLBACK");
@@ -722,21 +990,40 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         {
           caseId,
           providerId: provider.id,
+          modelId: selection.modelId,
           prompt: request,
           sourceTurnIds: [],
           enableTools: wantsTools
         },
         PHONE_OWNER
       );
-      await host.start({ token: review.token }, PHONE_OWNER);
-
-      const toolNote = wantsTools
-        ? " It will ask you here before it touches any file."
-        : "";
+      if (review.contextPreview !== packet)
+        return { started: false, detail: "The reviewed context changed. Nothing was sent; review this work on your Mac." };
+      const code = (randomBytes(4).readUInt32BE(0) % 1_000_000).toString().padStart(6, "0");
+      const ownerChat = lastKnownOwnerChat;
+      const send = options.telegramSend;
+      const reviewText = ownerChat === null ? null : exactPhoneReview(review, code, ownerChat);
+      if (send === undefined || ownerChat === null || reviewText === null)
+        return { started: false, detail: "This exact review cannot be delivered to your paired phone. Review and send it on your Mac." };
+      await send(ownerChat, reviewText);
+      if (lastKnownOwnerChat !== ownerChat || Date.now() > review.expiresAt)
+        return { started: false, detail: "The paired phone or review changed during delivery. Nothing was started; ask again." };
+      phoneReview = { code, token: review.token, caseId, providerId: provider.id,
+        modelId: selection.modelId, expiresAt: review.expiresAt };
       return {
-        started: true,
-        detail: `Started on ${provider.label}, in "${title}".${switchNote}${toolNote} Say stop to halt it.`
+        started: false,
+        detail: "The exact review and confirmation code were delivered to your paired phone. Nothing has run yet."
       };
+    },
+    confirmWork: async (code: string) => {
+      const pending = phoneReview;
+      if (pending === null || pending.code !== code || Date.now() > pending.expiresAt)
+        return { started: false, detail: "That review code is missing or expired. Nothing was sent." };
+      phoneReview = null;
+      const started = await host.start({ token: pending.token }, PHONE_OWNER);
+      if (started.caseId !== pending.caseId || started.providerId !== pending.providerId || started.modelId !== pending.modelId)
+        throw new Error("The started session did not match the reviewed choice.");
+      return { started: true, detail: `Started ${pending.providerId} / ${pending.modelId}. Say stop to request cancellation; check status for the final result.` };
     },
     status: async () => {
       const live = host.liveSnapshots();
@@ -747,15 +1034,12 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
       };
     },
     stopAll: async () => {
-      const live = host.liveSnapshots();
-      for (const snapshot of live) {
-        try {
-          await host.stop(snapshot.caseId, snapshot.operationId, noChosenWorkspace);
-        } catch {
-          // A session that has already finished is not a failure to stop it.
-        }
-      }
-      return { detail: live.length === 0 ? "Nothing was running." : "Stopped." };
+      const result = await host.stopAllFromPhone();
+      if (result.failures > 0)
+        return { detail: `Stop could not be confirmed for ${result.failures} item${result.failures === 1 ? "" : "s"}. Check your Mac.` };
+      if (result.sessions === 0 && result.parents === 0)
+        return { detail: "Nothing was running." };
+      return { detail: "Global Stop requested for active and queued work. Check status for final results." };
     },
     reply: async (text: string) => {
       const send = options.telegramSend;
@@ -773,10 +1057,11 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
    * The bind address is chosen by the owner and is never wider than what he
    * chose: there is no path here that listens on every interface.
    */
-  installRemotePairing({
+  const pairing = installRemotePairing({
     assertTrusted: options.assertTrusted,
     startServer: async ({ host: bindHost }) => {
-      const server = createRemoteDispatchServer({ host: bindHost, port: 0 });
+      const server = createRemoteDispatchServer({ host: bindHost, port: 0, sessionTtlMs: 10 * 60_000 });
+      const bridge = installRemoteHostBridge(server, host);
       const session = await server.start();
       return {
         url: session.serverUrl,
@@ -784,7 +1069,12 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
         // Long enough to walk to the other device, short enough that a code
         // left on screen is not a standing key to this Mac.
         expiresAt: Date.now() + 10 * 60_000,
-        stop: () => server.stop()
+        stop: () => server.stop(),
+        handover: {
+          candidates: () => ({ principals: server.pairedPrincipals(), runs: bridge.handoverCandidates() }),
+          prepare: (input) => bridge.prepareOneRunHandover(input),
+          approve: (token) => bridge.approveOneRunHandover(token)
+        }
       };
     },
     /**
@@ -928,211 +1218,170 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
     }
   });
 
-  /**
-   * A scratch folder for an ask that is not a session.
-   *
-   * A worker still needs somewhere to be started from, and it must not be a
-   * case's own folder: `admit` refuses two sessions sharing one, and a lane is
-   * explicitly allowed to run beside others. Nothing is written here.
-   */
-  const askScratch = async (): Promise<string> => {
-    const folder = path.join(tmpdir(), "rellane-ask", randomUUID());
-    await mkdir(folder, { recursive: true, mode: 0o700 });
-    return folder;
+  /** Every orchestration child starts a fresh, exact reviewed host session. */
+  const prepareReviewedChild = (input: {
+    readonly caseId: string;
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly prompt: string;
+    readonly sourceTurnIds: readonly string[];
+    readonly owner: object;
+    readonly contextRoleId?: string;
+  }): Promise<WorkstationReview> => host.prepare({
+    caseId: input.caseId,
+    providerId: input.providerId as WorkstationProviderId,
+    modelId: input.modelId,
+    prompt: input.prompt,
+    sourceTurnIds: input.sourceTurnIds,
+    ...(input.contextRoleId === undefined ? {} : { contextRoleId: input.contextRoleId })
+  }, input.owner, { freshSession: true });
+
+  const runReviewedChild = async (input: {
+    readonly review: WorkstationReview;
+    readonly owner: object;
+    readonly signal: AbortSignal;
+    readonly onActivity?: (line: string) => void;
+  }): Promise<NativeAskOutcome & { readonly turnId: string | null }> => {
+    const { review, owner, signal, onActivity } = input;
+    const started = await host.start({ token: review.token }, owner, signal);
+    if (started.caseId !== review.caseId || started.providerId !== review.providerId ||
+        started.modelId !== review.modelId)
+      throw new Error("The child session did not match its reviewed choice.");
+    const terminal = await host.awaitTerminal(started.caseId, started.operationId, owner,
+      signal, onActivity);
+    return {
+      text: terminal.text,
+      sessionId: terminal.sessionId,
+      finishReason: terminal.status === "completed" ? "completed" as const
+        : terminal.status === "stopped" ? "stopped" as const : "failed" as const,
+      detail: terminal.detail,
+      requestedModelId: review.modelId,
+      ...(terminal.reportedModelId ? { reportedModelId: terminal.reportedModelId } : {}),
+      // The recorded host terminal result decides the child outcome. A parent
+      // Stop may arrive after a provider already completed this child.
+      cancellationRequested: terminal.status === "stopped",
+      resultSource: "transport" as const,
+      turnId: terminal.answerTurnId ?? null
+    };
   };
 
-  /**
-   * Several subscriptions on one brief, at once.
-   *
-   * Each lane is an `askOnce` — read-only, no workspace, no tools — so three of
-   * them may work one piece of work without the session rules that exist to stop
-   * two of them corrupting a folder. Each answer lands as a turn attributed to
-   * the subscription that gave it, which is what makes comparing them afterwards
-   * mean anything.
-   */
-  installDispatchRun({
+  /** Explicit Compare is a reviewed parent with serial host-owned children. */
+  reviewedDispatch = installReviewedDispatchRun({
     assertTrusted: options.assertTrusted,
-    providers: async () => {
-      const found = await host.providers();
-      return found.map((provider) => ({
-        id: provider.id,
-        label: provider.label,
-        usable: provider.state === "detected"
-      }));
-    },
-    askProvider: async ({ providerId, caseId, brief, sourceTurnIds, signal, onActivity }) => {
-      const db = options.book();
-      const chosen = new Set(sourceTurnIds);
-      const sources = turnsFor(db, caseId)
-        .filter((turn) => chosen.has(turn.id))
-        .map((turn) => ({ id: turn.id, label: turn.seat, text: turn.body }));
-      const context = buildWorkstationContext({ prompt: brief, sources });
-      const cwd = await askScratch();
-      const answer = await host.askOnce({
-        providerId: providerId as WorkstationProviderId,
-        prompt: context.packet,
-        cwd,
-        signal,
-        // Built by assignment below rather than spread, so an absent listener
-        // is absent rather than present-and-undefined.
-        ...(onActivity === undefined ? {} : { onActivity })
+    ownerFor,
+    persistParent: async (record) => saveCompareParent(options.book(), record),
+    persistChild: async (caseId, record) => saveCompareChild(options.book(), caseId, record),
+    recover: async (runId) => recoveredCompareBoard(options.book(), runId),
+    prepareLane: ({ caseId, providerId, modelId, brief, sourceTurnIds, owner }) =>
+      prepareReviewedChild({ caseId, providerId, modelId, prompt: brief, sourceTurnIds, owner }),
+    runLane: runReviewedChild
+  });
+
+  /** A recovered answer is read from the same-case Book turn, never a receipt summary. */
+  const recoveredAnswer = (recovered: RecoveredReviewedParent): string | undefined => {
+    const child = [...recovered.children].reverse().find((one) => one.state === "answered" && one.answerTurnId !== null);
+    if (!child?.answerTurnId) return undefined;
+    return turnsFor(options.book(), recovered.caseId)
+      .find((turn) => turn.id === child.answerTurnId && (turn.kind === "verbatim" || turn.kind === "finding"))?.body;
+  };
+
+  const bundledAgentDefinitions = () => listHermesSkills().map((skill) => ({
+    id: skill.id,
+    markdown: (() => {
+      try { return readHermesSkill(skill.id).content; }
+      catch { return ""; }
+    })()
+  })).filter((entry) => entry.markdown.length > 0);
+
+  reviewedAgent = installReviewedAgentStream({
+    assertTrusted: options.assertTrusted,
+    ownerFor,
+    resolveSavedAgent: (input) => loadStoredAgentContract({
+      agentsFolder: () => path.join(options.userData(), "workstation", "agents"),
+      bundled: bundledAgentDefinitions
+    }, { ...input, maxPromptLength: WORKSTATION_AGENT_GOAL_LIMIT }),
+    prepareChild: prepareReviewedChild,
+    runChild: runReviewedChild,
+    persistParent: async (record) => {
+      saveReviewedParent(options.book(), {
+        event: "parent", kind: "agent", runId: record.runId, caseId: record.caseId,
+        request: record.prompt, at: record.at,
+        ...(record.agentContract ? { agentContract: record.agentContract } : {}),
+        children: record.children.map((child, index) => ({
+          id: String(index), label: child.label, providerId: child.providerId,
+          modelId: child.modelId, contextSnapshotId: child.contextSnapshotId,
+          sourceHash: child.sourceHash
+        }))
       });
-      const label =
-        (await host.providers()).find((provider) => provider.id === providerId)?.label ?? providerId;
-      let turnId = "";
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        turnId = appendTurn(db, caseId, {
-          seat: `Workstation \u00b7 ${label}`,
-          kind: "verbatim",
-          body: answer.text
-        });
-        db.exec("COMMIT");
-      } catch (problem) {
-        db.exec("ROLLBACK");
-        throw problem;
-      }
-      return { text: answer.text, turnId };
+    },
+    persistChild: async (caseId, record) => {
+      saveReviewedChild(options.book(), caseId, {
+        event: "child", kind: "agent", runId: record.runId, childId: String(record.index),
+        state: record.state, at: record.at, line: record.line,
+        answerTurnId: record.answerTurnId, draftTurnId: record.draftTurnId, chars: record.chars,
+        ...(record.attempt ? { attempt: record.attempt } : {})
+      });
+    },
+    recover: async (runId): Promise<WorkstationAgentPollResult | null> => {
+      const recovered = recoverReviewedParent(options.book(), "agent", runId);
+      if (recovered === null) return null;
+      const answer = recoveredAnswer(recovered);
+      return {
+        state: recovered.status, steps: [],
+        ...(answer === undefined ? {} : { answer }),
+        ...(recovered.status === "done" ? {} : { failure: recovered.headline })
+      };
     }
   });
 
-  /**
-   * The step-by-step agent, against a real model this time.
-   *
-   * Its two tools cannot change anything: list the sources this piece of work
-   * already has, and read one of them. A tool that writes belongs behind the
-   * per-call approval the ordinary session flow has, and this loop does not have
-   * that yet, so the capability is absent rather than unguarded.
-   */
-  installAgentStream({
+  reviewedCrew = installReviewedCrewRun({
     assertTrusted: options.assertTrusted,
-    startRun: async ({ caseId, goal, sourceTurnIds, onStep, signal }) => {
-      const db = options.book();
-      const chosen = new Set(sourceTurnIds);
-      const sources = turnsFor(db, caseId)
-        .filter((turn) => turn.kind === "verbatim")
-        .filter((turn) => chosen.size === 0 || chosen.has(turn.id));
-
-      const tools: readonly HermesToolDefinition[] = [
-        {
-          name: "rellane_list_sources",
-          description: "List the files and notes already chosen for this piece of work.",
-          parameters: { type: "object", properties: {} }
-        },
-        {
-          name: "rellane_read_source",
-          description: "Read one of those sources in full, by its id.",
-          parameters: {
-            type: "object",
-            properties: { sourceId: { type: "string", description: "The id of the source to read." } },
-            required: ["sourceId"]
-          }
-        }
-      ];
-
-      const cwd = await askScratch();
-      const provider = (await host.providers()).find((one) => one.state === "detected");
-      if (provider === undefined) throw new Error("No subscription is available on this Mac right now.");
-
-      let index = 0;
-      let startedAt = Date.now();
-      const result = await runHermesLoop(
-        goal,
-        tools,
-        async (prompt: string) => {
-          startedAt = Date.now();
-          const answer = await host.askOnce({ providerId: provider.id, prompt, cwd, signal });
-          return answer.text;
-        },
-        async (call) => {
-          index += 1;
-          const at = startedAt;
-          let text: string;
-          let failed = false;
-          if (call.name === "rellane_list_sources") {
-            text = sources.map((turn) => `${turn.id}: ${turn.seat}`).join("\n") || "No sources are attached.";
-          } else if (call.name === "rellane_read_source") {
-            const wanted = String((call.arguments as Record<string, unknown>)["sourceId"] ?? "");
-            const found = sources.find((turn) => turn.id === wanted);
-            text = found?.body ?? "That source is not attached to this piece of work.";
-            failed = found === undefined;
-          } else {
-            text = "That tool is not available.";
-            failed = true;
-          }
-          onStep({
-            index,
-            thought: "",
-            toolName: call.name,
-            toolArgs: JSON.stringify(call.arguments ?? {}),
-            toolResult: text,
-            toolFailed: failed,
-            answer: "",
-            startedAt: at,
-            endedAt: Date.now()
-          });
-          return { callId: call.id, name: call.name, result: text, isError: failed };
-        },
-        { maxSteps: 6, stepTimeoutMs: 120_000 }
-      );
-
-      if (result.finalAnswer.trim().length > 0) {
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          appendTurn(db, caseId, {
-            seat: `Workstation \u00b7 ${provider.label}`,
-            kind: "verbatim",
-            body: result.finalAnswer
-          });
-          db.exec("COMMIT");
-        } catch (problem) {
-          db.exec("ROLLBACK");
-          throw problem;
-        }
-      }
-      return result.finishReason === "completed"
-        ? { answer: result.finalAnswer }
-        : { answer: result.finalAnswer, failure: `The agent stopped early (${result.finishReason}).` };
-    }
-  });
-
-  /**
-   * Several bots on one request, each taking a part.
-   *
-   * The same `askOnce` a dispatch lane uses — read-only, no workspace, no tools
-   * — so several may work one piece of work at once without the session rules
-   * that exist to stop two of them corrupting a folder. Each answer lands as a
-   * turn attributed to the bot that gave it, which is what makes the comparison
-   * afterwards mean anything.
-   */
-  installCrewRun({
-    assertTrusted: options.assertTrusted,
-    ask: async ({ seatId, prompt, signal, onActivity }) => {
-      const cwd = await askScratch();
-      const answer = await host.askOnce({
-        providerId: seatId as WorkstationProviderId,
-        prompt,
-        cwd,
-        signal,
-        ...(onActivity === undefined ? {} : { onActivity })
+    ownerFor,
+    prepareChild: prepareReviewedChild,
+    runChild: runReviewedChild,
+    persistParent: async (record) => {
+      saveReviewedParent(options.book(), {
+        event: "parent", kind: "crew", runId: record.runId, caseId: record.caseId,
+        request: record.request, at: record.at,
+        ...(record.integrationOwner === undefined ? {} : { integrationOwner: record.integrationOwner }),
+        children: record.children.map((child) => ({
+          id: child.partId, label: child.label, providerId: child.providerId,
+          modelId: child.modelId, contextSnapshotId: child.contextSnapshotId,
+          sourceHash: child.sourceHash, dependsOn: [...child.dependsOn],
+          title: child.title,
+          ...(child.role === undefined ? {} : { role: child.role }),
+          ...(child.contextRoleId === undefined ? {} : { contextRoleId: child.contextRoleId }),
+          work: child.work,
+          ...(child.expectedOutput === undefined ? {} : { expectedOutput: child.expectedOutput })
+        }))
       });
-      return { text: answer.text };
     },
-    record: async ({ caseId, seatLabel, body }) => {
-      const db = options.book();
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const turnId = appendTurn(db, caseId, {
-          seat: `Workstation \u00b7 ${seatLabel}`,
-          kind: "verbatim",
-          body
-        });
-        db.exec("COMMIT");
-        return turnId;
-      } catch (problem) {
-        db.exec("ROLLBACK");
-        throw problem;
-      }
+    persistChild: async (caseId, record) => {
+      saveReviewedChild(options.book(), caseId, {
+        event: "child", kind: "crew", runId: record.runId, childId: record.partId,
+        state: record.state, at: record.at, line: record.line,
+        answerTurnId: record.answerTurnId, draftTurnId: record.draftTurnId, chars: record.chars,
+        ...(record.attempt ? { attempt: record.attempt } : {})
+      });
+    },
+    readDependency: async ({ caseId, turnId }) => {
+      const turn = turnsFor(options.book(), caseId)
+        .find((one) => one.id === turnId && (one.kind === "verbatim" || one.kind === "finding"));
+      return turn === undefined ? null : { text: turn.body, seatLabel: turn.seat };
+    },
+    recover: async (runId): Promise<CrewRunView | null> => {
+      const recovered = recoverReviewedParent(options.book(), "crew", runId);
+      if (recovered === null) return null;
+      return {
+        runId, caseId: recovered.caseId, request: recovered.request,
+        round: recovered.status, headline: recovered.headline, canStop: false,
+        parts: recovered.children.map((child) => ({
+          id: child.id, title: child.title ?? child.label, seatLabel: child.label,
+          state: child.state === "answered" ? "done" as const : child.state,
+          line: child.line, elapsed: "—", answerTurnId: child.answerTurnId,
+          draftTurnId: child.draftTurnId, outcome: null, refinedFrom: [], canStop: false
+        }))
+      };
     }
   });
 
@@ -1146,87 +1395,67 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
   installAgentStore({
     assertTrusted: options.assertTrusted,
     agentsFolder: () => path.join(options.userData(), "workstation", "agents"),
-    bundled: () =>
-      listHermesSkills().map((skill) => ({
-        id: skill.id,
-        markdown: (() => {
-          try {
-            return readHermesSkill(skill.id).content;
-          } catch {
-            // A skill this build cannot read is simply not offered, rather than
-            // failing the whole shelf.
-            return "";
-          }
-        })()
-      })).filter((entry) => entry.markdown.length > 0)
+    bundled: bundledAgentDefinitions
   });
 
-  /**
-   * Going and reading, rather than answering from what a model happens to
-   * remember.
-   *
-   * Every page goes out through the same guards the owner's own web read uses:
-   * the address is validated, private and loopback hosts are refused, every
-   * redirect hop is re-checked, and the read is capped. Following a link is the
-   * part that makes this worth having and also the part that could wander, so a
-   * discovered link is only queued when its parent actually yielded notes, and
-   * only within the hosts he started from.
-   */
-  installResearch({
+  /** Research uses the same exact host review and durable child receipts. */
+  reviewedResearch = installReviewedResearchRun({
     assertTrusted: options.assertTrusted,
-    fetchPage: async (url: string, signal: AbortSignal) => {
+    ownerFor,
+    fetchPage: async (url, signal) => {
       const fetched = await readPageSource(url, signal);
-      if (fetched.status === "refused") {
-        return null;
-      }
-      return { html: fetched.source, finalUrl: fetched.finalUrl };
+      return fetched.status === "refused" ? null : { html: fetched.source, finalUrl: fetched.finalUrl };
     },
-    files: async (caseId: string) => {
+    files: async (caseId) => {
       const folder = await caseFolder(caseId);
-      if (folder === null) {
-        return [];
-      }
+      if (folder === null) return [];
       const listing = await listWorkspace(folder);
       const out: { readonly id: string; readonly label: string; readonly text: string }[] = [];
       for (const entry of listing.entries) {
-        // Reading is what research does; ten files is what it can hold at once.
-        if (entry.kind !== "file" || !entry.textual || out.length >= 10) {
-          continue;
-        }
+        if (entry.kind !== "file" || !entry.textual || out.length >= 10) continue;
         const preview = await previewFile(folder, entry.relativePath);
-        if (preview.status === "text") {
-          out.push({ id: entry.relativePath, label: entry.name, text: preview.text });
-        }
+        if (preview.status === "text") out.push({ id: entry.relativePath, label: entry.name, text: preview.text });
       }
       return out;
     },
-    ask: async ({ prompt, signal }) => {
-      const cwd = await askScratch();
-      // Whichever subscription this Mac actually has. Asked fresh each step so
-      // that a run started before a sign-in expired does not keep asking a
-      // subscription that has since stopped answering.
-      const provider = (await host.providers()).find((one) => one.state === "detected");
-      if (provider === undefined) {
-        throw new Error("No subscription is available on this Mac right now.");
-      }
-      const answer = await host.askOnce({ providerId: provider.id, prompt, cwd, signal });
-      return answer.text;
+    prepareChild: ({ owner, ...input }) => {
+      if (typeof owner !== "object" || owner === null) throw new Error("A window owner is required.");
+      return prepareReviewedChild({ ...input, owner });
     },
-    record: async ({ caseId, body }) => {
-      const db = options.book();
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const turnId = appendTurn(db, caseId, {
-          seat: "Workstation \u00b7 Research",
-          kind: "verbatim",
-          body
-        });
-        db.exec("COMMIT");
-        return turnId;
-      } catch (problem) {
-        db.exec("ROLLBACK");
-        throw problem;
-      }
+    runChild: ({ owner, ...input }) => {
+      if (typeof owner !== "object" || owner === null) throw new Error("A window owner is required.");
+      return runReviewedChild({ ...input, owner });
+    },
+    persistParent: async (record) => {
+      saveReviewedParent(options.book(), {
+        event: "parent", kind: "research", runId: record.runId, caseId: record.caseId,
+        request: record.prompt, at: record.at,
+        children: record.children.map((child, index) => ({
+          id: String(index), label: child.label, providerId: child.providerId,
+          modelId: child.modelId, contextSnapshotId: child.contextSnapshotId,
+          sourceHash: child.sourceHash
+        }))
+      });
+    },
+    persistChild: async (caseId, record) => {
+      saveReviewedChild(options.book(), caseId, {
+        event: "child", kind: "research", runId: record.runId, childId: String(record.index),
+        state: record.state, at: record.at, line: record.line,
+        answerTurnId: record.answerTurnId, draftTurnId: record.draftTurnId, chars: record.chars,
+        ...(record.attempt ? { attempt: record.attempt } : {})
+      });
+    },
+    recover: async (runId): Promise<ResearchRunView | null> => {
+      const recovered = recoverReviewedParent(options.book(), "research", runId);
+      if (recovered === null) return null;
+      return {
+        runId, caseId: recovered.caseId, question: recovered.request,
+        state: recovered.status, steps: [], sourcesRead: 0, notesKept: 0,
+        headline: `${recovered.headline} Live source counts are unavailable after restart.`,
+        answer: recoveredAnswer(recovered) ?? null, nativeOutcomes: [],
+        unanswered: recovered.status === "done" ? [] : [recovered.request],
+        canStop: false
+      };
     }
   });
 
@@ -1238,7 +1467,28 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
    */
   installProjectMemory({
     assertTrusted: options.assertTrusted,
-    folder: () => memoryFolder
+    folder: () => memoryFolder,
+    book: options.book,
+    principalFor: (event) => {
+      options.assertTrusted(event);
+      return "local-owner";
+    },
+    beforeMutation: (projectId) => {
+      host.assertProjectIdle(projectId);
+      host.invalidateProjectReviews(projectId);
+    }
+  });
+  installProjectMemoryConflicts({
+    assertTrusted: options.assertTrusted,
+    book: options.book,
+    principalFor: (event) => {
+      options.assertTrusted(event);
+      return "local-owner";
+    },
+    beforeMutation: (projectId) => {
+      host.assertProjectIdle(projectId);
+      host.invalidateProjectReviews(projectId);
+    }
   });
 
   /**
@@ -1251,18 +1501,23 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
    */
   installFileHistory({
     assertTrusted: options.assertTrusted,
-    folderFor: caseFolder,
+    folderFor: async (caseId) => {
+      const folder = await caseFolder(caseId);
+      if (folder === null) return null;
+      try { return await realpath(folder); }
+      catch { return null; }
+    },
     snapshot: async (folder: string) => snapshotFolder(folder),
     before: async (caseId: string, operationId: string) =>
       readBefore(changeHistoryFolder, caseId, operationId),
     contentBefore: async (caseId: string, operationId: string, relativePath: string) =>
       readContentBefore(changeHistoryFolder, caseId, operationId, relativePath),
+    withAdmissionLease: (caseId, folder, owner, action) =>
+      host.withFileRestoreLease(caseId, folder, owner, action),
+    savePreimage: (caseId, operationId, folder) =>
+      saveBefore(changeHistoryFolder, caseId, operationId, folder),
     restore: async (folder: string, relativePath: string, contents: string) => {
-      // The installer has already refused anything that resolves outside the
-      // folder; this only writes where it is told.
-      const target = path.join(folder, relativePath);
-      await mkdir(path.dirname(target), { recursive: true });
-      await writeFile(target, contents, "utf8");
+      await safeRestoreFile(folder, relativePath, contents);
     }
   });
 
@@ -1298,6 +1553,16 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
       return rows.map((row) => ({ body: String(row["body"]), at: Number(row["at"]) }));
     },
     known: async () => (await host.providers()).map((one) => ({ id: one.id, label: one.label }))
+  });
+  installModelOutcomeEvidence({
+    assertTrusted: options.assertTrusted,
+    book: options.book
+  });
+  installModelPreferencesIpc({ assertTrusted: options.assertTrusted, book: options.book });
+  installModelAdviceIpc({
+    assertTrusted: options.assertTrusted,
+    book: options.book,
+    providers: () => host.providers()
   });
 
   const watching = installWatch({
@@ -1428,6 +1693,7 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
    * the same door every other message uses.
    */
   const announced = new AnnouncedCalls();
+  const announcing = new Set<string>();
   const tellHimWhatIsWaiting = async (): Promise<void> => {
     const send = options.telegramSend;
     const chats = options.telegramContacts;
@@ -1436,14 +1702,43 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
     }
     const waiting = waitingCalls(host.liveSnapshots());
     announced.keepOnly(waiting);
+    const liveKeys = new Set(waiting.map((call) => `${call.operationId}:${call.permissionId}`));
+    for (const [key, pending] of phoneApprovals) {
+      const current = waiting.find((call) => `${call.operationId}:${call.permissionId}` === key);
+      if (!liveKeys.has(key) || current === undefined || current.title !== pending.title || current.detail !== pending.detail || Date.now() > pending.expiresAt) {
+        phoneApprovals.delete(key);
+        if (current !== undefined) announced.forget(current);
+      }
+    }
     const fresh = announced.fresh(waiting);
     if (fresh.length === 0) {
       return;
     }
     const owners = await chats();
+    const ownerChat = lastKnownOwnerChat;
+    if (ownerChat === null || !owners.includes(ownerChat)) return;
     for (const call of fresh) {
-      for (const chatId of owners) {
-        await send(chatId, describeCall(call));
+      const key = `${call.operationId}:${call.permissionId}`;
+      if (announcing.has(key)) continue;
+      announcing.add(key);
+      try {
+      let displayCode: string;
+      do {
+        displayCode = (randomBytes(4).readUInt32BE(0) % 1_000_000).toString().padStart(6, "0");
+      } while ([...phoneApprovals.values()].some((one) => one.code === displayCode));
+      const message = describeCall(call, displayCode);
+      if (message.length > 3500 || sanitiseReply(message, [ownerChat], 3500) !== message) continue;
+      await send(ownerChat, message);
+      const stillWaiting = waitingCalls(host.liveSnapshots()).some((one) => one.operationId === call.operationId &&
+        one.permissionId === call.permissionId && one.title === call.title && one.detail === call.detail);
+      if (stillWaiting && lastKnownOwnerChat === ownerChat) {
+        phoneApprovals.set(key, { code: displayCode, operationId: call.operationId,
+          permissionId: call.permissionId, title: call.title, detail: call.detail,
+          expiresAt: Date.now() + 5 * 60_000 });
+        announced.markDelivered(call);
+      }
+      } finally {
+        announcing.delete(key);
       }
     }
   };
@@ -1454,14 +1749,97 @@ export function installWorkstationIpc(options: WorkstationIpcOptions): Workstati
   }, 4_000);
   if (typeof approvalTimer.unref === "function") approvalTimer.unref();
 
+  // Book opens lazily. The immediate pass recovers orphan claims before any
+  // queue admission; if Book is not ready, the app-alive interval retries.
+  schedulePump.start();
   return {
+    localBriefHistory: (event) => {
+      options.assertTrusted(event);
+      return host.localBriefHistory();
+    },
+    forgetLocalBriefHistory: (event, reviewSha256) => {
+      options.assertTrusted(event);
+      return host.forgetLocalBriefHistory(reviewSha256);
+    },
+    runLocalBrief: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localBriefScope.recover(options.book());
+      const owner = ownerFor(event);
+      return host.runLocalBrief({ ...input, owner, assertOwner: () => {
+        options.assertTrusted(event);
+        if (ownerFor(event) !== owner) throw new Error("This window changed before the brief completed.");
+        input.assertOwner();
+      } });
+    },
     assertIdle: (caseId: string) => {
       host.assertIdle(caseId);
+    },
+    runLocalCase: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      // A malformed Case receipt is a hard admission failure. The ordinary
+      // lazy recovery probe above may defer when Book has not opened yet.
+      localCaseScope.recover(options.book());
+      return host.runLocalCase({ ...input, owner: ownerFor(event) });
+    },
+    localCaseState: (event, caseId) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localCaseScope.recover(options.book());
+      return host.localCaseState(caseId, ownerFor(event));
+    },
+    stopLocalCase: (event, caseId, operationId) => {
+      options.assertTrusted(event);
+      return host.stopLocalCase(caseId, operationId, ownerFor(event));
+    },
+    runLocalAgent: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localCaseScope.recover(options.book());
+      return host.runLocalAgent({ ...input, owner: ownerFor(event) });
+    },
+    stopLocalAgent: (event, agentId) => {
+      options.assertTrusted(event);
+      return host.stopLocalAgent(agentId, ownerFor(event));
+    },
+    runLocalSuggestion: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localCaseScope.recover(options.book());
+      return host.runLocalSuggestion({ ...input, owner: ownerFor(event) });
+    },
+    prepareGraphNode: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localCaseScope.recover(options.book());
+      return host.prepareGraphNode(AutomationPendingHostReviewInputSchema.parse(input), ownerFor(event));
+    },
+    startGraphNode: (event, input) => {
+      options.assertTrusted(event);
+      recoverOnce();
+      localCaseScope.recover(options.book());
+      return host.startGraphNode(WorkstationStartInputSchema.parse(input), ownerFor(event));
+    },
+    stopGraphNode: (event, caseId, operationId) => {
+      options.assertTrusted(event);
+      return host.stopGraphNode(caseId, operationId, ownerFor(event));
+    },
+    reconcileGraphHostRuns: (event) => {
+      if (event !== undefined) options.assertTrusted(event);
+      return host.reconcileGraphHostRuns();
     },
     answerPhone: (chatId: string, text: string, from?: string) => phone.answerPhone(chatId, text, from),
     shutdown: async () => {
       clearInterval(approvalTimer);
+      schedulePump.dispose();
       watching.stop();
+      await pairing.shutdown();
+      await reviewedDispatch?.shutdown();
+      await reviewedAgent?.shutdown();
+      await reviewedCrew?.shutdown();
+      await reviewedResearch?.shutdown();
+      scheduled?.shutdown();
       await host.shutdown();
     }
   };

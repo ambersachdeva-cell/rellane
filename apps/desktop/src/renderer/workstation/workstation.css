@@ -138,6 +138,13 @@
 .ws-titlebar { height: 59px; flex-shrink: 0; padding: 0 25px; display: flex; align-items: center; justify-content: space-between; gap: 20px; -webkit-app-region: drag; }
 .ws-breadcrumb { display: flex; align-items: center; gap: 9px; min-width: 0; color: var(--ws-muted); font-size: 11px; }.ws-breadcrumb > span:first-of-type { white-space: nowrap; }.ws-breadcrumb strong { font-weight: 500; color: var(--ws-ink); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }.ws-breadcrumb-slash { color: var(--ws-soft); }
 .ws-title-actions { display: flex; gap: 8px; align-items: center; -webkit-app-region: no-drag; }
+.ws-title-more { position: relative; }
+.ws-root .ws-title-more > summary { list-style: none; cursor: pointer; -webkit-app-region: no-drag; }
+.ws-title-more > summary::-webkit-details-marker { display: none; }
+.ws-title-more[open] > summary { background: var(--ws-ground); }
+.ws-title-more-menu { position: absolute; top: calc(100% + 8px); right: 0; z-index: 12; width: 185px; max-height: min(65vh, 420px); overflow-y: auto; display: grid; gap: 2px; padding: 6px; border: 1px solid var(--ws-line); border-radius: 9px; background: var(--ws-paper); box-shadow: var(--ws-shadow); }
+.ws-root .ws-title-more-menu button { width: 100%; padding: 8px 10px; border-radius: 5px; text-align: left; color: var(--ws-ink); font-size: 11px; }
+.ws-root .ws-title-more-menu button:hover:not(:disabled), .ws-root .ws-title-more-menu button:focus-visible { background: var(--ws-hover); }
 .ws-root .ws-icon-button { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 7px; color: var(--ws-muted); flex-shrink: 0; transition: transform 120ms var(--ws-ease), background 150ms ease; }
 .ws-root .ws-icon-button:hover:not(:disabled) { background: var(--ws-hover); color: var(--ws-ink); }
 .ws-work-area { display: flex; min-width: 0; min-height: 0; flex: 1; }

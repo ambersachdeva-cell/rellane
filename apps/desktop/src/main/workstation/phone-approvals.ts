@@ -53,12 +53,12 @@ export function waitingCalls(runs: readonly LiveRun[]): readonly WaitingCall[] {
  * is a second description of an action he is about to authorise, and if the two
  * ever disagree he approved the wrong one.
  */
-export function describeCall(call: WaitingCall): string {
+export function describeCall(call: WaitingCall, code?: string): string {
   const detail = call.detail.trim();
   const body = detail.length > 0 && detail !== call.title.trim()
     ? `${call.title.trim()}\n${detail}`
     : call.title.trim();
-  return `Your Mac is waiting to do this:\n\n${body}\n\nReply yes to allow it once, or no to decline.`;
+  return `Your Mac is waiting to do this:\n\n${body}\n\n${code === undefined ? "Reply yes to allow it once, or no to decline." : `Reply yes ${code} to allow it once, or no ${code} to decline. This code expires in five minutes.`}`;
 }
 
 export type Decision = "allow" | "deny";
@@ -94,7 +94,7 @@ export function readDecision(text: string): Decision | null {
 export class AnnouncedCalls {
   private readonly told = new Set<string>();
 
-  /** The calls in this batch that have not been announced yet. */
+  /** The calls in this batch that have not been successfully delivered yet. */
   fresh(calls: readonly WaitingCall[]): readonly WaitingCall[] {
     const out: WaitingCall[] = [];
     for (const call of calls) {
@@ -102,10 +102,19 @@ export class AnnouncedCalls {
       if (this.told.has(key)) {
         continue;
       }
-      this.told.add(key);
       out.push(call);
     }
     return out;
+  }
+
+  /** A send failure must leave the call eligible for the next poll. */
+  markDelivered(call: WaitingCall): void {
+    this.told.add(`${call.operationId}:${call.permissionId}`);
+  }
+
+  /** Expired challenges need a new code even while the action stays waiting. */
+  forget(call: WaitingCall): void {
+    this.told.delete(`${call.operationId}:${call.permissionId}`);
   }
 
   /**

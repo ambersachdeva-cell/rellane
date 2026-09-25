@@ -9,6 +9,8 @@
  * answering the moment anything it was bound to changes.
  */
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import type { ContextSnapshot } from "./context-snapshot-store.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { WorkstationProvider, WorkstationRoutine } from "@cadrane/contracts";
 import type {
@@ -75,7 +77,7 @@ const CLAUDE: WorkstationProvider = {
   family: "claude",
   state: "detected",
   detail: "Installed.",
-  models: [],
+  models: [{ id: "sonnet", label: "Sonnet" }],
   canResume: true,
   canApproveTools: true
 };
@@ -98,6 +100,7 @@ function harness(options?: { readonly withTools?: boolean }) {
   const workers: FakeWorker[] = [];
   const sessions: FakeToolSession[] = [];
   const receipts: WorkstationSessionReceipt[] = [];
+  const contextSnapshots = new Map<string, ContextSnapshot>();
   const state = {
     room: { id: "case-1", title: "Brackets", closedAt: null } as WorkstationCaseRow | null,
     clock: 1_000_000,
@@ -105,7 +108,9 @@ function harness(options?: { readonly withTools?: boolean }) {
     launches: [
       { provider: CODEX, executable: "/usr/local/bin/codex" },
       { provider: CLAUDE, executable: "/usr/local/bin/claude" }
-    ] as NativeProviderLaunch[]
+    ] as NativeProviderLaunch[],
+    projectId: null as string | null,
+    memoryEpoch: 0
   };
   let tokens = 0;
   let ids = 0;
@@ -156,6 +161,25 @@ function harness(options?: { readonly withTools?: boolean }) {
       sha256: "context-hash",
       omitted: []
     }),
+    memory: {
+      projectForCase: () => state.projectId,
+      epoch: () => state.memoryEpoch,
+      constraints: () => [],
+      findings: () => [],
+      saveSnapshot: (_db, input, at) => {
+        const saved: ContextSnapshot = {
+          ...input,
+          packetHash: createHash("sha256").update(input.packet).digest("hex"),
+          createdAt: at,
+          dispatchAttemptedAt: null,
+          redactedAt: null
+        };
+        contextSnapshots.set(input.id, saved);
+        return saved;
+      },
+      readSnapshot: (_db, id) => contextSnapshots.get(id) ?? null,
+      markDispatchAttempt: () => {}
+    },
     createWorker: (_providerId, workerOptions) => {
       const worker = fakeWorker(workerOptions);
       workers.push(worker);
@@ -172,6 +196,8 @@ function harness(options?: { readonly withTools?: boolean }) {
       label: "This case's own folder",
       path: `/data/workstation/workspaces/${caseId}`
     }),
+    canonicalWorkspacePath: async (workspacePath) => workspacePath,
+    onRunStart: async () => true,
     extractArtifacts: () => [],
     now: () => state.clock,
     token: () => {
@@ -190,10 +216,11 @@ function harness(options?: { readonly withTools?: boolean }) {
   const request = {
     caseId: "case-1",
     providerId: "codex" as const,
+    modelId: "gpt-5-codex",
     prompt: "Draft the quotation reply.",
     sourceTurnIds: [SOURCE_A, SOURCE_B]
   };
-  return { host, owner, request, turns, workers, sessions, receipts, state };
+  return { host, owner, request, turns, workers, sessions, receipts, state, contextSnapshots };
 }
 
 async function until(predicate: () => boolean, label: string): Promise<void> {
@@ -244,15 +271,20 @@ describe("workstation host: the reviewed tool scope", () => {
 
   it("starts a new session rather than continuing a saved one", async () => {
     const kit = harness();
+    const seed = await kit.host.prepare(kit.request, kit.owner);
+    const prior = kit.contextSnapshots.get(seed.contextSnapshotId!)!;
+    kit.contextSnapshots.set(seed.contextSnapshotId!, { ...prior, dispatchAttemptedAt: 1 });
     kit.state.stored = {
       version: 1,
       event: "finish",
       workspacePath: "/data/workstation/workspaces/case-1",
+      contextSnapshotId: seed.contextSnapshotId!,
+      projectId: null,
       snapshot: {
         caseId: "case-1",
         operationId: "old-op",
         providerId: "codex",
-        modelId: null,
+        modelId: "gpt-5-codex",
         sessionId: "saved-session",
         status: "completed",
         startedAt: 1,
@@ -296,7 +328,7 @@ describe("workstation host: the reviewed tool scope", () => {
   it("refuses a provider that cannot review each call, and mints no token", async () => {
     const kit = harness();
     await expect(
-      kit.host.prepare({ ...kit.request, providerId: "claude", enableTools: true }, kit.owner)
+      kit.host.prepare({ ...kit.request, providerId: "claude", modelId: "sonnet", enableTools: true }, kit.owner)
     ).rejects.toThrow(/only available with Codex/);
 
     // Nothing was staged, so nothing can be sent.
@@ -342,6 +374,18 @@ describe("workstation host: the reviewed tool scope", () => {
 
     expect(kit.sessions[0]!.built.isActive()).toBe(true);
     kit.turns[1] = { id: SOURCE_B, seat: "owner", kind: "verbatim", body: "Actually, do not mention price." };
+    expect(kit.sessions[0]!.built.isActive()).toBe(false);
+  });
+
+  it("closes the tool disclosure scope when project memory is superseded", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    kit.state.memoryEpoch = 4;
+    const review = await kit.host.prepare({ ...kit.request, enableTools: true }, kit.owner);
+    await kit.host.start({ token: review.token }, kit.owner);
+    await until(() => kit.sessions.length === 1, "the scope");
+    expect(kit.sessions[0]!.built.isActive()).toBe(true);
+    kit.state.memoryEpoch = 5;
     expect(kit.sessions[0]!.built.isActive()).toBe(false);
   });
 
@@ -478,7 +522,7 @@ describe("workstation host: the reviewed tool scope", () => {
     // Different work, different folder, different subscription. Nothing about
     // this can collide with the first, and the old rule refused it anyway.
     const second = await kit.host.prepare(
-      { ...kit.request, caseId: "case-2", providerId: "claude" },
+      { ...kit.request, caseId: "case-2", providerId: "claude", modelId: "sonnet" },
       kit.owner
     );
     await kit.host.start({ token: second.token }, kit.owner);

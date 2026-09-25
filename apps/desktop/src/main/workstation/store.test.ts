@@ -11,6 +11,7 @@ import {
   saveSessionReceipt,
   validateReceipt,
   WORKSTATION_SESSION_SEAT,
+  type WorkstationGraphAttemptBinding,
   type WorkstationSessionReceipt,
   type WorkstationSnapshot
 } from "./store.js";
@@ -62,6 +63,17 @@ function makeReceipt(
 }
 
 describe("native reported models", () => {
+  it("retains the reviewed context reference and project scope in a durable receipt", () => {
+    const caseId = openCase(db, { title: "Context reference", question: "Synthetic" });
+    saveSessionReceipt(db, caseId, makeReceipt({
+      event: "finish", contextSnapshotId: "snapshot-1", projectId: "project-1"
+    }, { caseId, status: "completed" }));
+    expect(latestSessionReceipt(db, caseId)).toMatchObject({
+      contextSnapshotId: "snapshot-1", projectId: "project-1"
+    });
+    expect(validateReceipt(makeReceipt({ contextSnapshotId: "" }))).toBeNull();
+  });
+
   it("persists an observed model separately and keeps old receipts compatible", () => {
     const caseId = openCase(db, { title: "Model identity", question: "Synthetic" });
     const receipt = makeReceipt({ event: "finish" }, { caseId, providerId: "claude", modelId: "opus", reportedModelId: "claude-opus-5", status: "completed" });
@@ -409,5 +421,311 @@ describe("workstation store — validator and active status helpers", () => {
     expect(validateReceipt({ ...valid, snapshot: { ...valid.snapshot, providerId: "unknown" } })).toBeNull();
     expect(validateReceipt({ ...valid, snapshot: { ...valid.snapshot, status: "unknown" } })).toBeNull();
     expect(validateReceipt({ ...valid, snapshot: { ...valid.snapshot, startedAt: Number.NaN } })).toBeNull();
+  });
+});
+
+describe("workstation store — graph attempt binding", () => {
+  function makeValidBinding(
+    caseId: string,
+    overrides?: Partial<WorkstationGraphAttemptBinding>
+  ): WorkstationGraphAttemptBinding {
+    return {
+      caseId,
+      graphRunId: "00000000-0000-4000-8000-000000000001",
+      nodeId: "00000000-0000-4000-8000-000000000002",
+      attemptId: "00000000-0000-4000-8000-000000000003",
+      correlation: "00000000-0000-4000-8000-000000000004",
+      descriptorSha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      ...overrides
+    };
+  }
+
+  it("round trips exact graph attempt binding across all event types with host operationId", () => {
+    const caseId = openCase(db, { title: "Graph round trip", question: "Synthetic" });
+    const binding = makeValidBinding(caseId);
+
+    // Start event
+    saveSessionReceipt(
+      db,
+      caseId,
+      makeReceipt(
+        { event: "start", graph: binding },
+        { operationId: "op-graph-1", caseId, providerId: "codex", status: "starting" }
+      )
+    );
+    const startLatest = latestSessionReceipt(db, caseId, "codex");
+    expect(startLatest?.event).toBe("start");
+    expect(startLatest?.snapshot.operationId).toBe("op-graph-1");
+    expect(startLatest?.graph).toEqual(binding);
+
+    // Checkpoint event
+    saveSessionReceipt(
+      db,
+      caseId,
+      makeReceipt(
+        { event: "checkpoint", graph: binding },
+        { operationId: "op-graph-1", caseId, providerId: "codex", status: "running" }
+      )
+    );
+    const checkpointLatest = latestSessionReceipt(db, caseId, "codex");
+    expect(checkpointLatest?.event).toBe("checkpoint");
+    expect(checkpointLatest?.graph).toEqual(binding);
+
+    // Finish event
+    saveSessionReceipt(
+      db,
+      caseId,
+      makeReceipt(
+        { event: "finish", graph: binding },
+        { operationId: "op-graph-1", caseId, providerId: "codex", status: "completed" }
+      )
+    );
+    const finishLatest = latestSessionReceipt(db, caseId, "codex");
+    expect(finishLatest?.event).toBe("finish");
+    expect(finishLatest?.snapshot.status).toBe("completed");
+    expect(finishLatest?.graph).toEqual(binding);
+    expect(finishLatest?.graph?.descriptorSha256).toBe(
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    );
+  });
+
+  it("keeps legacy receipts completely free of any graph field", () => {
+    const caseId = openCase(db, { title: "Legacy receipt check", question: "Synthetic" });
+    const legacyReceipt = makeReceipt(
+      { event: "checkpoint" },
+      { operationId: "op-legacy-1", caseId, providerId: "claude", status: "running" }
+    );
+    saveSessionReceipt(db, caseId, legacyReceipt);
+
+    const retrieved = latestSessionReceipt(db, caseId, "claude");
+    expect(retrieved).not.toBeNull();
+    expect("graph" in (retrieved ?? {})).toBe(false);
+    expect(retrieved?.graph).toBeUndefined();
+
+    const turn = turnsFor(db, caseId)[0];
+    const parsedBody = JSON.parse(turn?.body ?? "{}");
+    expect("graph" in parsedBody).toBe(false);
+
+    const validated = validateReceipt(legacyReceipt);
+    expect(validated).not.toBeNull();
+    expect("graph" in (validated ?? {})).toBe(false);
+  });
+
+  it("refuses malformed optional binding instead of silently deleting it", () => {
+    const caseId = openCase(db, { title: "Malformed binding check", question: "Synthetic" });
+    const validBinding = makeValidBinding(caseId);
+
+    // null graph rejected
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: null })).toBeNull();
+    // explicit undefined graph rejected
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: undefined })).toBeNull();
+    // non-object graph rejected
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: "string-binding" })).toBeNull();
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: 42 })).toBeNull();
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: [] })).toBeNull();
+
+    // missing fields rejected
+    const { attemptId: _omit, ...missingAttemptId } = validBinding;
+    expect(validateReceipt({ ...makeReceipt({}, { caseId }), graph: missingAttemptId })).toBeNull();
+
+    // non-UUID fields rejected
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, graphRunId: "not-a-uuid" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, nodeId: "12345-bad-node" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, attemptId: "attempt-xyz" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, caseId: "case-not-uuid" }
+      })
+    ).toBeNull();
+
+    // invalid SHA-256 rejected
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, descriptorSha256: "too-short-sha" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, descriptorSha256: "g".repeat(64) }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, descriptorSha256: "a".repeat(63) }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, descriptorSha256: "a".repeat(65) }
+      })
+    ).toBeNull();
+
+    // invalid correlation rejected
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "   " }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "not-a-uuid" }
+      })
+    ).toBeNull();
+
+    // invalid variant / all-zero UUID rejected
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "00000000-0000-0000-0000-000000000000" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "00000000-0000-4000-0000-000000000001" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, correlation: "00000000-0000-4000-c000-000000000001" }
+      })
+    ).toBeNull();
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, graphRunId: "00000000-0000-4000-c000-000000000001" }
+      })
+    ).toBeNull();
+
+    // unexpected extra property rejected
+    expect(
+      validateReceipt({
+        ...makeReceipt({}, { caseId }),
+        graph: { ...validBinding, extraUnrecognizedField: "malicious" }
+      })
+    ).toBeNull();
+  });
+
+  it("refuses cross-Case binding and rejects saving mismatched case IDs", () => {
+    const caseA = openCase(db, { title: "Case A", question: "Synthetic" });
+    const caseB = openCase(db, { title: "Case B", question: "Synthetic" });
+
+    // graph caseId belongs to caseB, but snapshot is for caseA
+    const crossCaseReceipt = makeReceipt(
+      { graph: makeValidBinding(caseB) },
+      { caseId: caseA }
+    );
+
+    expect(validateReceipt(crossCaseReceipt)).toBeNull();
+    expect(() => saveSessionReceipt(db, caseA, crossCaseReceipt)).toThrow(
+      /malformed receipt shape/iu
+    );
+  });
+
+  it("preserves exact graph binding on restart recovery without inventing or dropping fields", () => {
+    const caseId = openCase(db, { title: "Recovery binding check", question: "Synthetic" });
+    const binding = makeValidBinding(caseId);
+
+    // Save active running session with graph binding
+    saveSessionReceipt(
+      db,
+      caseId,
+      makeReceipt(
+        { event: "checkpoint", graph: binding },
+        {
+          operationId: "op-restart-active",
+          caseId,
+          providerId: "gemini1",
+          status: "running",
+          sessionId: "sess-restart-1"
+        }
+      )
+    );
+
+    // Save active running session without graph binding in second case
+    const caseLegacy = openCase(db, { title: "Legacy recovery check", question: "Synthetic" });
+    saveSessionReceipt(
+      db,
+      caseLegacy,
+      makeReceipt(
+        { event: "checkpoint" },
+        {
+          operationId: "op-legacy-active",
+          caseId: caseLegacy,
+          providerId: "gemini1",
+          status: "running",
+          sessionId: "sess-legacy-1"
+        }
+      )
+    );
+
+    const recoveredCount = recoverInterruptedSessions(db, 8888);
+    expect(recoveredCount).toBe(2);
+
+    // Active session with graph binding has exact binding preserved
+    const recoveredWithGraph = latestSessionReceipt(db, caseId, "gemini1");
+    expect(recoveredWithGraph?.event).toBe("interrupted");
+    expect(recoveredWithGraph?.snapshot.status).toBe("interrupted");
+    expect(recoveredWithGraph?.snapshot.sessionId).toBe("sess-restart-1");
+    expect(recoveredWithGraph?.graph).toEqual(binding);
+
+    // Active legacy session without graph binding still has no graph field
+    const recoveredLegacy = latestSessionReceipt(db, caseLegacy, "gemini1");
+    expect(recoveredLegacy?.event).toBe("interrupted");
+    expect(recoveredLegacy?.snapshot.status).toBe("interrupted");
+    expect("graph" in (recoveredLegacy ?? {})).toBe(false);
+    expect(recoveredLegacy?.graph).toBeUndefined();
+  });
+
+  it("does not treat session status itself as proof of graph completion", () => {
+    const caseId = openCase(db, { title: "Completion isolation", question: "Synthetic" });
+    const binding = makeValidBinding(caseId);
+
+    saveSessionReceipt(
+      db,
+      caseId,
+      makeReceipt(
+        { event: "finish", graph: binding },
+        {
+          operationId: "op-completed-1",
+          caseId,
+          providerId: "codex",
+          status: "completed"
+        }
+      )
+    );
+
+    const receipt = latestSessionReceipt(db, caseId, "codex");
+    expect(receipt?.snapshot.status).toBe("completed");
+    expect(receipt?.graph).toEqual(binding);
   });
 });

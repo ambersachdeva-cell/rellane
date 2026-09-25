@@ -5,7 +5,8 @@ export type AgentRunState =
   | "stopping"
   | "done"
   | "stopped"
-  | "failed";
+  | "failed"
+  | "interrupted";
 
 export interface AgentStepView {
   readonly index: number;
@@ -406,6 +407,8 @@ function buildHeadline(
       }
       return "Could not finish: an unexpected problem occurred.";
     }
+    case "interrupted":
+      return "Interrupted. Check the saved session before retrying.";
   }
 }
 

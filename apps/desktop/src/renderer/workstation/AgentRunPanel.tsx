@@ -7,7 +7,8 @@ export type AgentRunState =
   | "stopping"
   | "done"
   | "stopped"
-  | "failed";
+  | "failed"
+  | "interrupted";
 
 export interface AgentStepView {
   readonly index: number;
@@ -46,6 +47,9 @@ export interface AgentPlanShape {
 export interface AgentRunPanelProps {
   readonly plan?: AgentPlanShape;
   readonly view: AgentRunView;
+  readonly savedAgentLabel?: string | null;
+  readonly expectedOutput?: string;
+  readonly onExpectedOutputChange?: (value: string) => void;
   readonly onStart: () => void;
   readonly onStop: () => void;
   readonly onCancel: () => void;
@@ -70,6 +74,8 @@ function formatState(state: AgentRunState): string {
       return "Stopped";
     case "failed":
       return "Failed";
+    case "interrupted":
+      return "Interrupted";
   }
 }
 
@@ -104,6 +110,8 @@ function defaultHeadline(state: AgentRunState): string {
       return "The run was stopped.";
     case "failed":
       return "The run failed.";
+    case "interrupted":
+      return "The run was interrupted; check its saved session before retrying.";
   }
 }
 
@@ -191,6 +199,9 @@ function renderStep(step: AgentStepView, isLive: boolean): ReactNode {
 export function AgentRunPanel({
   view,
   plan,
+  savedAgentLabel,
+  expectedOutput,
+  onExpectedOutputChange,
   onStart,
   onStop,
   onCancel,
@@ -223,6 +234,17 @@ export function AgentRunPanel({
       {view.state === "awaiting-approval" ? (
         <section className="ws-agent-plan" aria-label="Proposed plan">
           <h3 className="ws-agent-plan-heading">Before it starts</h3>
+          {savedAgentLabel ? (
+            <label className="ws-agent-plan-note">
+              Saved agent: {savedAgentLabel}. What should it produce?
+              <input
+                type="text"
+                value={expectedOutput ?? ""}
+                maxLength={2000}
+                onChange={(event) => onExpectedOutputChange?.(event.target.value)}
+              />
+            </label>
+          ) : null}
           {plan === undefined ? (
             <p className="ws-agent-plan-note">Working out what it would do.</p>
           ) : plan.refusedBecause !== null ? (

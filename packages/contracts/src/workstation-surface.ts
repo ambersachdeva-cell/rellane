@@ -11,6 +11,11 @@
  * shape of the request, because that is what the renderer may send and what the
  * host must validate.
  */
+import type {
+  GovernedProjectMemoryCommand, GovernedProjectMemoryView,
+  GovernedProjectMemoryConflictCommand, GovernedProjectMemoryConflictView
+} from "./project-memory.js";
+import type { WorkstationProviderId, WorkstationReview } from "./workstation.js";
 
 /** One thing the app can do on this Mac. Described before it is ever run. */
 export type MacActionInput =
@@ -224,12 +229,13 @@ export interface ResearchRunView {
   readonly runId: string;
   readonly caseId: string;
   readonly question: string;
-  readonly state: "planning" | "working" | "writing" | "done" | "stopped" | "failed";
+  readonly state: "planning" | "working" | "writing" | "done" | "stopped" | "failed" | "interrupted";
   readonly steps: readonly ResearchStepView[];
   readonly sourcesRead: number;
   readonly notesKept: number;
   readonly headline: string;
   readonly answer: string | null;
+  readonly nativeOutcomes?: readonly NativeAskOutcomeView[];
   /** The parts of the question it could not settle, said plainly. */
   readonly unanswered: readonly string[];
   readonly canStop: boolean;
@@ -321,7 +327,244 @@ export interface WatchVerdictView {
   readonly detail: readonly string[];
 }
 
+export interface ScheduleDefinitionView {
+  readonly version: 1;
+  readonly event: "definition";
+  readonly scheduleId: string;
+  readonly revision: number;
+  readonly caseId: string;
+  readonly projectId: string | null;
+  readonly instruction: string;
+  readonly instructionHash: string;
+  readonly expression: string;
+  readonly timezone: string;
+  readonly providerId: WorkstationProviderId;
+  readonly modelId: string;
+  readonly maxLatenessMs: number;
+  readonly at: number;
+}
+
+export interface ScheduleGrantView {
+  readonly version: 1;
+  readonly event: "grant";
+  readonly scheduleId: string;
+  readonly revision: number;
+  readonly grantId: string;
+  readonly ownerActionId: string;
+  readonly approvedBy: "local-owner";
+  readonly scope: "queue-only";
+  readonly instructionHash: string;
+  readonly expiresAt: number;
+  readonly at: number;
+}
+
+export interface ScheduleSavedView {
+  readonly definition: ScheduleDefinitionView;
+  readonly grant: ScheduleGrantView | null;
+  readonly grantRevoked: boolean;
+}
+
+export interface ScheduleGrantReviewView {
+  readonly token: string;
+  readonly reviewExpiresAt: number;
+  readonly grantExpiresAt: number;
+  readonly definition: ScheduleDefinitionView;
+  readonly nextDueAt: readonly number[];
+  readonly scope: "queue-only";
+}
+
+export interface ScheduleOccurrenceView {
+  readonly occurrenceId: string;
+  readonly scheduleId: string;
+  readonly definitionRevision: number;
+  readonly caseId: string;
+  readonly projectId: string | null;
+  readonly dueAt: number;
+  readonly status: "queued" | "claimed" | "completed" | "stopped" | "failed" | "uncertain" | "cancelled";
+}
+
+export interface ScheduleRunView {
+  readonly runId: string;
+  readonly occurrenceId: string;
+  readonly status: "working" | "completed" | "stopped" | "failed" | "uncertain" | "rejected";
+  readonly detail: string;
+  readonly operationId: string | null;
+}
+
+export interface ModelOutcomeEvidenceView {
+  readonly operationId: string;
+  readonly caseId: string;
+  readonly projectId: string | null;
+  readonly providerId: string;
+  readonly requestedModelId: string | null;
+  readonly reportedModelId: string | null;
+  readonly attemptState: "admitted" | "attempted" | "unknown";
+  readonly terminalState: "completed" | "stopped" | "failed" | "interrupted" | "denied" | "unknown";
+  readonly observedCompleted: boolean;
+  readonly durationMs: number | null;
+  readonly startedAt: number | null;
+  readonly endedAt: number | null;
+  readonly reasons: readonly string[];
+}
+
+/** Owner policy; a tombstone keeps only an empty value and its next revision. */
+export interface ModelProjectPreferencesView {
+  readonly projectId?: string | null;
+  readonly exclusions?: readonly { readonly providerId: WorkstationProviderId; readonly modelId?: string }[];
+  readonly providerWeights?: Readonly<Record<string, number>>;
+  readonly modelWeights?: Readonly<Record<string, number>>;
+  readonly providerModelWeights?: Readonly<Record<string, Readonly<Record<string, number>>>>;
+  readonly capabilityWeights?: Readonly<Record<string, number>>;
+}
+
+export interface StoredModelProjectPreferencesView {
+  readonly projectId: string;
+  readonly revision: number;
+  readonly preferences: ModelProjectPreferencesView;
+  readonly updatedAt: number;
+  readonly deletedAt: number | null;
+}
+
+/** Immutable, unaccepted proposal based only on measured completion and current owner policy. */
+export interface ModelAdaptationProposalView {
+  readonly id: string;
+  readonly projectId: string;
+  readonly baseRevision: number;
+  readonly catalogSha256: string;
+  readonly catalog: readonly {
+    readonly providerId: WorkstationProviderId;
+    readonly state: "detected" | "unavailable" | "blocked";
+    readonly modelIds: readonly string[];
+  }[];
+  readonly evidenceSha256: string;
+  readonly evidenceOperations: number;
+  readonly evidenceReceiptCount: number;
+  readonly delta: {
+    readonly kind: "model_weight";
+    readonly providerId: WorkstationProviderId;
+    readonly modelId: string;
+    readonly from: number;
+    readonly to: number;
+  };
+  readonly reasons: readonly string[];
+  readonly unknowns: readonly string[];
+  readonly createdAt: number;
+  readonly proposalSha256: string;
+}
+
+export interface SoloModelAdviceView {
+  readonly projectId: string | null;
+  readonly preferencesRevision: number | null;
+  readonly advice: {
+    readonly isPinned: boolean;
+    readonly pinStatus: "none" | "active" | "unavailable" | "blocked";
+    readonly selected: ModelRankedCandidateView | null;
+    readonly rankedCandidates: readonly ModelRankedCandidateView[];
+    readonly reasons: readonly string[];
+  };
+  readonly evidenceOperations: number;
+  readonly providerCatalog: readonly {
+    readonly providerId: WorkstationProviderId;
+    /** Detected means a local binary exists; it does not prove account readiness. */
+    readonly state: "detected" | "unavailable" | "blocked";
+    readonly modelIds: readonly string[];
+  }[];
+  readonly readiness: "unverified";
+  readonly basis: string;
+}
+
+export interface TeamModelAdviceView {
+  readonly projectId: string | null;
+  readonly preferencesRevision: number | null;
+  readonly advice: {
+    readonly mode: "complementary_roles";
+    readonly isComparison: false;
+    readonly assignments: readonly {
+      readonly roleId: string;
+      readonly roleName: string;
+      readonly ownership: string;
+      readonly inputs: readonly string[];
+      readonly outputs: readonly string[];
+      readonly dependencies: readonly string[];
+      readonly assignedCandidate: ModelRankedCandidateView["candidate"];
+      readonly modelSpecificWork: string;
+      readonly assignedPrompt: string;
+      readonly score: number;
+      readonly reasons: readonly string[];
+    }[];
+    readonly unassignedRoles: readonly {
+      readonly roleId: string;
+      readonly roleName: string;
+      readonly requiredCapabilities: readonly string[];
+    }[];
+    readonly reviewRequiredPackages: readonly {
+      readonly roleId: string;
+      readonly roleName: string;
+      readonly ownership: string;
+      readonly inputs: readonly string[];
+      readonly outputs: readonly string[];
+      readonly dependencies: readonly string[];
+      readonly requiredCapabilities: readonly string[];
+      readonly modelSpecificWork: string;
+      readonly draftPrompt: string;
+      readonly reason: string;
+    }[];
+    readonly reasons: readonly string[];
+  };
+  readonly evidenceOperations: number;
+  readonly providerCatalog: SoloModelAdviceView["providerCatalog"];
+  readonly readiness: "unverified";
+  readonly basis: string;
+}
+
+export interface ModelRankedCandidateView {
+  readonly candidate: {
+    readonly providerId: WorkstationProviderId;
+    readonly modelId: string;
+    readonly capabilities: readonly string[];
+    readonly displayName?: string;
+    readonly contextTokens?: number;
+  };
+  readonly score: number;
+  readonly capabilityScore: number;
+  readonly preferenceScore: number;
+  readonly reliabilityScore: number;
+  readonly reliabilitySignal: {
+    readonly status: "measured" | "insufficient_sample" | "unknown";
+    readonly observedCompletedCount: number;
+    readonly totalAttemptedCount: number;
+    readonly completionRatio: number | null;
+    readonly summary: string;
+  };
+  readonly reasons: readonly string[];
+}
+
 export interface WorkstationSurfaceBridge {
+  // Explicit owner-reviewed schedules. Save, Queue and Prepare never run a model.
+  scheduleList(input: { readonly caseId: string }): Promise<readonly ScheduleSavedView[]>;
+  scheduleSave(input: Omit<ScheduleDefinitionView, "version" | "event" | "revision" | "instructionHash" | "at"> &
+    { readonly expectedRevision: number }): Promise<ScheduleSavedView>;
+  schedulePreview(input: { readonly scheduleId: string }): Promise<{
+    readonly definition: ScheduleDefinitionView;
+    readonly grant: ScheduleGrantView | null;
+    readonly grantRevoked: boolean;
+    readonly next: readonly { readonly utcMs: number; readonly utcIso: string; readonly localKey: string; readonly tz: string }[];
+  }>;
+  scheduleGrantReview(input: { readonly scheduleId: string; readonly expectedRevision: number;
+    readonly expiresAt: number }): Promise<ScheduleGrantReviewView>;
+  scheduleGrantConfirm(input: { readonly token: string }): Promise<ScheduleSavedView>;
+  scheduleRevoke(input: { readonly scheduleId: string; readonly grantId: string }): Promise<ScheduleSavedView | null>;
+  scheduleQueue(input: { readonly scheduleId: string }): Promise<{
+    readonly status: "inactive" | "not-due" | "queued" | "already-queued" | "already-recorded";
+    readonly occurrence: ScheduleOccurrenceView | null;
+  }>;
+  schedulePrepare(input: { readonly scheduleId: string; readonly occurrenceId: string }): Promise<
+    WorkstationReview & { readonly scheduleId: string; readonly occurrenceId: string;
+      readonly dueAt: number; readonly grantExpiresAt: number }
+  >;
+  scheduleStart(input: { readonly token: string }): Promise<ScheduleRunView>;
+  schedulePoll(input: { readonly runId: string }): Promise<ScheduleRunView>;
+  scheduleStop(input: { readonly runId: string }): Promise<ScheduleRunView>;
   describeMacAction(input: MacActionInput): Promise<MacActionDescription>;
   runMacAction(input: MacActionInput): Promise<MacActionResult>;
   readWebPage(input: { readonly url: string }): Promise<WebReadResult>;
@@ -348,13 +591,9 @@ export interface WorkstationSurfaceBridge {
   analysePaste(input: { readonly text: string }): Promise<PasteAnalysisView>;
 
   // Going and reading, rather than answering from memory. Start, watch, stop.
-  researchStart(input: {
-    readonly caseId: string;
-    readonly question: string;
-    /** Addresses he named himself. Anything else is found by following links. */
-    readonly urls?: readonly string[];
-    readonly depth: "quick" | "thorough";
-  }): Promise<{ readonly runId: string }>;
+  researchPrepare(input: unknown): Promise<{ readonly token: string; readonly expiresAt: number;
+    readonly review: Omit<WorkstationReview, "token"> }>;
+  researchStart(input: { readonly token: string }): Promise<{ readonly runId: string }>;
   researchPoll(input: { readonly runId: string }): Promise<ResearchRunView>;
   researchStop(input: { readonly runId: string }): Promise<ResearchRunView>;
 
@@ -379,6 +618,8 @@ export interface WorkstationSurfaceBridge {
     readonly hidden?: boolean;
   }): Promise<ProjectMemoryView>;
   memoryForget(input: { readonly projectId: string; readonly id: string }): Promise<ProjectMemoryView>;
+  memoryGoverned(input: GovernedProjectMemoryCommand): Promise<GovernedProjectMemoryView>;
+  memoryConflicts(input: GovernedProjectMemoryConflictCommand): Promise<GovernedProjectMemoryConflictView>;
 
   // What a session changed in a folder, and putting one file back.
   changesList(input: { readonly caseId: string; readonly operationId: string }): Promise<WorkstationChangesView>;
@@ -407,6 +648,28 @@ export interface WorkstationSurfaceBridge {
    * not imply it knows what a vendor will charge.
    */
   usage(input: { readonly window: "today" | "week" | "month" }): Promise<UsageReceiptsView>;
+  /** Measured local run states only; no quality, quota, cost, or preference claim. */
+  modelOutcomeEvidence(input: {
+    readonly projectId?: string | null;
+    readonly caseId?: string;
+    readonly maxReceipts?: number;
+  }): Promise<readonly ModelOutcomeEvidenceView[]>;
+  modelPreferencesRead(input: { readonly projectId: string }): Promise<StoredModelProjectPreferencesView | null>;
+  modelPreferencesSave(input: { readonly projectId: string; readonly expectedRevision: number;
+    readonly preferences: ModelProjectPreferencesView }): Promise<StoredModelProjectPreferencesView>;
+  modelPreferencesForget(input: { readonly projectId: string; readonly expectedRevision: number }): Promise<StoredModelProjectPreferencesView>;
+  /** Read-only advice. It cannot select, prepare, or start a Solo run. */
+  soloModelAdvice(input: { readonly projectId: string | null; readonly explicitChoice?: {
+    readonly providerId: WorkstationProviderId; readonly modelId: string
+  } | null }): Promise<SoloModelAdviceView>;
+  /** Read-only complementary role plan. Unknown capability requires manual model review. */
+  teamModelAdvice(input: { readonly projectId: string | null;
+    readonly overallPrompt: string }): Promise<TeamModelAdviceView>;
+  /** Creates no policy change and starts no work; null means measured evidence is insufficient. */
+  modelAdaptationPropose(input: { readonly projectId: string }): Promise<ModelAdaptationProposalView | null>;
+  /** An explicit owner review echo; only future advice weights change after fresh checks. */
+  modelAdaptationAccept(input: { readonly projectId: string; readonly proposalId: string;
+    readonly expectedProposalSha256: string; readonly confirmed: true }): Promise<StoredModelProjectPreferencesView>;
 
   /**
    * Who has messaged the bot and is not obeyed, and saying one of them is him.
@@ -431,17 +694,21 @@ export interface WorkstationSurfaceBridge {
   }): Promise<{ readonly paired: boolean; readonly said: string }>;
 
   // Watching one agent work, step by step. Start, look, stop.
-  agentStart(input: { readonly caseId: string; readonly goal: string; readonly sourceTurnIds?: readonly string[] }): Promise<{ readonly runId: string }>;
+  agentPrepare(input: unknown): Promise<{ readonly token: string; readonly expiresAt: number;
+    readonly reviews: readonly Omit<WorkstationReview, "token">[] }>;
+  agentStart(input: { readonly token: string }): Promise<{ readonly runId: string }>;
   agentPoll(input: { readonly runId: string }): Promise<AgentPollView>;
   agentStop(input: { readonly runId: string }): Promise<{ readonly state: AgentRunStateView }>;
 
-  // Several subscriptions on one brief, at once.
-  dispatchStart(input: {
+  // Explicit Compare: review every chosen call before the one-use parent starts.
+  dispatchPrepare(input: {
     readonly caseId: string;
     readonly brief: string;
-    readonly providerIds: readonly string[];
+    readonly selections: readonly { readonly providerId: string; readonly modelId: string }[];
     readonly sourceTurnIds?: readonly string[];
-  }): Promise<{ readonly runId: string }>;
+  }): Promise<{ readonly token: string; readonly expiresAt: number;
+    readonly reviews: readonly Omit<WorkstationReview, "token">[] }>;
+  dispatchStart(input: { readonly token: string }): Promise<{ readonly runId: string }>;
   dispatchPoll(input: { readonly runId: string }): Promise<DispatchBoardView>;
   dispatchStop(input: { readonly runId: string; readonly providerId?: string }): Promise<DispatchBoardView>;
 
@@ -449,6 +716,17 @@ export interface WorkstationSurfaceBridge {
   pairingStatus(): Promise<PairingStatusView>;
   pairingStart(input: { readonly reachable: "this-mac" | "wifi" }): Promise<PairingStatusView>;
   pairingStop(): Promise<PairingStatusView>;
+  pairingHandoverCandidates(): Promise<{ readonly principals: readonly string[];
+    readonly runs: readonly { readonly principalId: string; readonly caseId: string;
+      readonly operationId: string }[] }>;
+  pairingHandoverPrepare(input: { readonly caseId: string; readonly operationId: string;
+    readonly oldPrincipalId: string; readonly newPrincipalId: string }): Promise<{
+      readonly token: string; readonly expiresAt: number; readonly generation: number;
+      readonly caseId: string; readonly operationId: string;
+      readonly oldPrincipalId: string; readonly newPrincipalId: string }>;
+  pairingHandoverApprove(input: { readonly token: string }): Promise<{
+    readonly caseId: string; readonly operationId: string;
+    readonly oldPrincipalId: string; readonly newPrincipalId: string }>;
 
   // Speaking instead of typing. Nothing recorded leaves this Mac.
   dictationStatus(): Promise<{ readonly ready: boolean; readonly detail: string }>;
@@ -471,12 +749,17 @@ export interface WorkstationSurfaceBridge {
   publishWrite(input: { readonly caseId: string; readonly format: PublishFormatView }): Promise<PublishPreviewView>;
 
   // Several bots, one request, each taking a part.
-  crewStart(input: {
-    readonly caseId: string;
-    readonly request: string;
-    readonly parts: readonly CrewPartInput[];
-    readonly sourceTurnIds?: readonly string[];
-  }): Promise<{ readonly runId: string }>;
+  crewPrepare(input: unknown): Promise<{ readonly token: string; readonly expiresAt: number;
+    readonly reviews: readonly (Omit<WorkstationReview, "token"> & {
+      readonly partId: string;
+      readonly title: string;
+      readonly role?: string;
+      readonly work: string;
+      readonly expectedOutput?: string;
+      readonly integrationOwner?: string;
+      readonly dependsOn: readonly string[];
+    })[] }>;
+  crewStart(input: { readonly token: string }): Promise<{ readonly runId: string }>;
   crewPoll(input: { readonly runId: string }): Promise<CrewRunPollView>;
   crewStop(input: { readonly runId: string; readonly partId?: string }): Promise<CrewRunPollView>;
 
@@ -494,12 +777,13 @@ export interface WorkstationSurfaceBridge {
   agentsList(): Promise<{
     readonly agents: readonly {
       readonly id: string;
-      readonly origin: "bundled" | "mine";
+      readonly origin: "bundled" | "user";
       readonly markdown: string;
       readonly updatedAt: number;
+      readonly revision: string;
     }[];
   }>;
-  agentSave(input: { readonly id: string; readonly markdown: string }): Promise<{ readonly id: string; readonly updatedAt: number }>;
+  agentSave(input: { readonly id: string; readonly markdown: string }): Promise<{ readonly id: string; readonly updatedAt: number; readonly revision: string }>;
   agentDelete(input: { readonly id: string }): Promise<{ readonly deleted: boolean }>;
 }
 
@@ -515,7 +799,20 @@ export interface CrewPartInput {
 }
 
 export type CrewPartStateView =
-  | "waiting" | "claimed" | "working" | "answered" | "refining" | "done" | "failed" | "stopped";
+  | "waiting" | "claimed" | "working" | "answered" | "refining" | "done" | "failed" | "stopped" | "interrupted";
+
+/** Native result or marked transport failure, with cancellation tracked separately. */
+export interface NativeAskOutcomeView {
+  readonly text: string;
+  readonly sessionId: string | null;
+  readonly finishReason: "completed" | "denied" | "stopped" | "failed";
+  readonly requestedModelId: string | null;
+  readonly cancellationRequested: boolean;
+  readonly resultSource: "worker" | "transport";
+  readonly modelId?: string;
+  readonly reportedModelId?: string;
+  readonly detail?: string;
+}
 
 export interface CrewPartPollView {
   readonly id: string;
@@ -525,6 +822,8 @@ export interface CrewPartPollView {
   readonly line: string;
   readonly elapsed: string;
   readonly answerTurnId: string | null;
+  readonly draftTurnId?: string | null;
+  readonly outcome?: NativeAskOutcomeView | null;
   readonly refinedFrom: readonly string[];
   readonly canStop: boolean;
 }
@@ -534,13 +833,13 @@ export interface CrewRunPollView {
   readonly caseId: string;
   readonly request: string;
   readonly parts: readonly CrewPartPollView[];
-  readonly round: "splitting" | "working" | "reading-each-other" | "done" | "stopped" | "failed";
+  readonly round: "splitting" | "working" | "reading-each-other" | "done" | "stopped" | "failed" | "interrupted";
   readonly headline: string;
   readonly canStop: boolean;
 }
 
 export type AgentRunStateView =
-  | "planning" | "awaiting-approval" | "running" | "stopping" | "done" | "stopped" | "failed";
+  | "planning" | "awaiting-approval" | "running" | "stopping" | "done" | "stopped" | "failed" | "interrupted";
 
 /** What the main process observed. The renderer decides how it reads. */
 export interface AgentStepViewShape {
@@ -560,10 +859,11 @@ export interface AgentPollView {
   readonly steps: readonly AgentStepViewShape[];
   readonly answer?: string;
   readonly failure?: string;
+  readonly nativeOutcomes?: readonly NativeAskOutcomeView[];
 }
 
 export type LaneStateView =
-  | "queued" | "awaiting-approval" | "working" | "answered" | "stopped" | "failed" | "unavailable";
+  | "queued" | "awaiting-approval" | "working" | "answered" | "stopped" | "failed" | "interrupted" | "unavailable";
 
 export interface DispatchLaneView {
   readonly providerId: string;
@@ -572,6 +872,8 @@ export interface DispatchLaneView {
   readonly line: string;
   readonly elapsed: string;
   readonly answerTurnId: string | null;
+  readonly draftTurnId?: string | null;
+  readonly outcome?: NativeAskOutcomeView | null;
   readonly chars: number;
   readonly canStop: boolean;
 }
@@ -633,4 +935,3 @@ export interface PublishPreviewView {
   readonly files: readonly { readonly relativePath: string; readonly bytes: number }[];
   readonly writtenTo?: string;
 }
-

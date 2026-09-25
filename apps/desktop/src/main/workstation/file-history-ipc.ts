@@ -1,10 +1,13 @@
 import type { IpcMainInvokeEvent } from "electron";
 import { ipcMain } from "electron";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
+
+export type AgentSourceOwner = ReturnType<ReturnType<typeof createAgentSourceOwners>>;
 
 export interface WorkstationChange {
   readonly relativePath: string;
@@ -27,6 +30,9 @@ export interface WorkstationChangeContentsResult {
 
 export interface WorkstationChangeRestoreResult {
   readonly restored: boolean;
+  readonly restoreOperationId?: string;
+  readonly preimageOperationId?: string;
+  readonly uncertain?: boolean;
 }
 
 export const WorkstationChangesListInputSchema = z.object({
@@ -80,6 +86,19 @@ export interface InstallFileHistoryOptions {
     relativePath: string
   ) => Promise<string | null>;
   readonly restore: (folder: string, relativePath: string, contents: string) => Promise<void>;
+  /** Shared host restore admission lease wrapping the entire mutation critical section. */
+  readonly withAdmissionLease: <T>(
+    caseId: string,
+    folder: string,
+    owner: AgentSourceOwner,
+    action: () => Promise<T>
+  ) => Promise<T>;
+  /** Durable preimage save for the exact folder before restore. */
+  readonly savePreimage: (
+    caseId: string,
+    restoreOperationId: string,
+    folder: string
+  ) => Promise<boolean>;
 }
 
 // An unrecognised or traversing path must not reach the disk or reveal host file structure.
@@ -327,40 +346,137 @@ export function installFileHistory(options: InstallFileHistoryOptions): void {
         return { restored: false };
       }
 
-      const contents = await options.contentBefore(
-        request.caseId,
-        request.operationId,
-        request.relativePath
-      );
-      options.assertTrusted(event);
-      if (ownerFor(event) !== owner) {
-        throw new Error("This window changed while restoring the file.");
-      }
-
-      if (contents === null) {
+      if (
+        typeof options.withAdmissionLease !== "function" ||
+        typeof options.savePreimage !== "function"
+      ) {
         return { restored: false };
       }
 
       activeFolders.add(folder);
+      let mutationResult: WorkstationChangeRestoreResult | null = null;
       try {
-        // A restore is itself a change; taking a snapshot first ensures the undo can be undone.
-        const controller = new AbortController();
-        await options.snapshot(folder, controller.signal);
-        options.assertTrusted(event);
-        if (ownerFor(event) !== owner) {
-          throw new Error("This window changed while restoring the file.");
+        let executionCount = 0;
+
+        const leaseResult = await options.withAdmissionLease(
+          request.caseId,
+          folder,
+          owner,
+          async (): Promise<WorkstationChangeRestoreResult> => {
+            executionCount++;
+            if (executionCount > 1 || mutationResult !== null) {
+              return mutationResult ?? { restored: false };
+            }
+
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner) {
+              return { restored: false };
+            }
+            const currentFolder1 = await options.folderFor(request.caseId);
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner || currentFolder1 !== folder) {
+              return { restored: false };
+            }
+
+            const contents = await options.contentBefore(
+              request.caseId,
+              request.operationId,
+              request.relativePath
+            );
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner) {
+              return { restored: false };
+            }
+            const currentFolder2 = await options.folderFor(request.caseId);
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner || currentFolder2 !== folder) {
+              return { restored: false };
+            }
+
+            if (contents === null) {
+              return { restored: false };
+            }
+
+            let restoreOperationId = randomUUID();
+            while (restoreOperationId === request.operationId) {
+              restoreOperationId = randomUUID();
+            }
+
+            let preimagePersisted = false;
+            try {
+              preimagePersisted = await options.savePreimage(
+                request.caseId,
+                restoreOperationId,
+                folder
+              );
+            } catch {
+              preimagePersisted = false;
+            }
+
+            if (!preimagePersisted) {
+              return { restored: false };
+            }
+
+            const failureReceipt: WorkstationChangeRestoreResult = {
+              restored: false,
+              restoreOperationId,
+              preimageOperationId: restoreOperationId
+            };
+
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner) {
+              return failureReceipt;
+            }
+            const currentFolder3 = await options.folderFor(request.caseId);
+            options.assertTrusted(event);
+            if (ownerFor(event) !== owner || currentFolder3 !== folder) {
+              return failureReceipt;
+            }
+
+            try {
+              await options.restore(folder, request.relativePath, contents);
+            } catch {
+              mutationResult = {
+                restored: false,
+                uncertain: true,
+                restoreOperationId,
+                preimageOperationId: restoreOperationId
+              };
+              return mutationResult;
+            }
+
+            mutationResult = {
+              restored: true,
+              restoreOperationId,
+              preimageOperationId: restoreOperationId
+            };
+            return mutationResult;
+          }
+        );
+
+        if (mutationResult !== null) {
+          return mutationResult;
         }
 
-        await options.restore(folder, request.relativePath, contents);
-        options.assertTrusted(event);
-        if (ownerFor(event) !== owner) {
-          throw new Error("This window changed while restoring the file.");
+        if (executionCount !== 1) {
+          return { restored: false };
         }
 
-        return { restored: true };
+        if (
+          leaseResult &&
+          typeof leaseResult === "object" &&
+          typeof leaseResult.restored === "boolean"
+        ) {
+          return leaseResult;
+        }
+
+        return { restored: false };
       } catch (error) {
         if (error instanceof Error && error.message.startsWith("This window changed")) {
           throw error;
+        }
+        if (mutationResult !== null) {
+          return mutationResult;
         }
         return { restored: false };
       } finally {

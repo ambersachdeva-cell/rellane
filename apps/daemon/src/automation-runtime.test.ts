@@ -30,6 +30,8 @@ const FOURTH_ID = "66666666-6666-4666-8666-666666666666";
 const SOURCE_ID = "99999999-9999-4999-8999-999999999999";
 const MEMORY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const OWNER_RULE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CASE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const TURN_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
 describe("automation runtime product journeys", () => {
   it("validates a fan-out DAG and rejects duplicate, missing and cyclic dependencies", () => {
@@ -358,6 +360,183 @@ describe("automation runtime product journeys", () => {
     envelope.ciphertextSha256 = createHash("sha256").update(changed).digest("hex");
     await writeFile(file, JSON.stringify(envelope), "utf8");
     await expect(repository.load()).rejects.toThrow(/authenticate/u);
+  });
+});
+
+describe("opt-in review-bound automation graph state", () => {
+  it.each([
+    ["manual", { kind: "manual" } as const],
+    ["interval", { kind: "interval", everyMinutes: 5, runOnceIfOverdue: true } as const],
+    ["folder", { kind: "folder", root: "/synthetic/inbox" } as const]
+  ])("persists the first dependency-ready model attempt for %s without daemon chat", async (kind, trigger) => {
+    const repository = new MemoryRepository();
+    const chat = new FakeChatRuntime();
+    let now = new Date("2026-08-12T00:00:00.000Z");
+    const automations = new AutomationRuntime({
+      dataDirectory: "/tmp/cadrane-automation-test",
+      repository,
+      runtime: chat,
+      now: () => now,
+      enableScheduleTimer: false
+    });
+    await automations.saveAgent(agent());
+    const saved = await automations.saveReviewBoundWorkflow({
+      workflow: workflow({ trigger }),
+      caseId: CASE_ID,
+      sourceTurnIds: [TURN_ID]
+    });
+    expect(saved.schemaVersion).toBe(2);
+    if (kind === "manual") await automations.start({ workflowId: WORKFLOW_ID });
+    if (kind === "interval") {
+      now = new Date("2026-08-12T00:06:00.000Z");
+      await automations.tickSchedules();
+      await automations.tickSchedules();
+    }
+    if (kind === "folder") {
+      await automations.folderChanged("/synthetic/inbox");
+      await automations.folderChanged("/synthetic/inbox");
+    }
+    const snapshot = await automations.snapshot();
+    expect(snapshot.runs).toHaveLength(1);
+    const run = snapshot.runs[0]!;
+    expect(run).toMatchObject({
+      schemaVersion: 2,
+      state: "waiting",
+      triggerKind: kind,
+      activeNodeId: FIRST_ID,
+      reviewBinding: { caseId: CASE_ID, sourceTurnIds: [TURN_ID], reviewRequired: true }
+    });
+    expect(run.steps.map(step => [step.state, step.attempt])).toEqual([
+      ["awaiting-review", 1], ["pending", 0]
+    ]);
+    expect("attemptId" in run.steps[0]! && run.steps[0]!.attemptId).toEqual(expect.any(String));
+    expect(snapshot.leases.filter(lease => lease.runId === run.id && lease.state === "active"))
+      .toHaveLength(1);
+    expect(chat.requests).toHaveLength(0);
+    const lostRepository = new MemoryRepository({ ...snapshot, leases: [] });
+    const leaseLost = createRuntime(lostRepository, chat);
+    const recovered = (await leaseLost.snapshot()).runs[0]!;
+    expect(recovered).toMatchObject({ state: "interrupted", activeNodeId: null });
+    expect(recovered.steps[0]).toMatchObject({
+      state: "interrupted",
+      attempt: 1,
+      attemptId: "attemptId" in run.steps[0]! ? run.steps[0]!.attemptId : null
+    });
+    expect((await leaseLost.snapshot()).leases.filter(lease =>
+      lease.runId === run.id && lease.state === "active")).toHaveLength(1);
+    await expect(leaseLost.action({ runId: run.id, action: "retry", nodeId: FIRST_ID }))
+      .rejects.toThrow("cannot retry");
+    await leaseLost.shutdown();
+    const afterRecoveryRestart = createRuntime(lostRepository, chat);
+    expect((await afterRecoveryRestart.snapshot()).runs[0]).toEqual(recovered);
+    await afterRecoveryRestart.action({ runId: run.id, action: "cancel" });
+    expect((await afterRecoveryRestart.snapshot()).leases.some(lease =>
+      lease.runId === run.id && lease.state === "active")).toBe(false);
+    await afterRecoveryRestart.shutdown();
+    expect(chat.requests).toHaveLength(0);
+    await automations.shutdown();
+    const restarted = createRuntime(repository, chat);
+    const reloaded = (await restarted.snapshot()).runs[0]!;
+    expect(reloaded).toEqual(run);
+    expect(chat.requests).toHaveLength(0);
+    await expect(restarted.action({ runId: run.id, action: "retry", nodeId: FIRST_ID }))
+      .rejects.toThrow("cannot retry");
+    await expect(restarted.action({ runId: run.id, action: "pause" }))
+      .rejects.toThrow("cannot pause");
+    expect((await restarted.snapshot()).runs[0]).toEqual(run);
+    const cancelled = await restarted.action({ runId: run.id, action: "cancel" });
+    expect(cancelled.state).toBe("cancelled");
+    expect(cancelled.steps.map(step => step.state)).toEqual(["cancelled", "cancelled"]);
+    expect((await restarted.snapshot()).leases.some(lease =>
+      lease.runId === run.id && lease.state === "active")).toBe(false);
+    expect(chat.requests).toHaveLength(0);
+    await restarted.shutdown();
+  });
+
+  it("keeps legacy v1 record shapes and refuses an uncertain bound retry or revision drift", async () => {
+    const repository = new MemoryRepository();
+    const chat = new FakeChatRuntime();
+    const automations = createRuntime(repository, chat);
+    await automations.saveAgent(agent());
+    const legacy = await automations.saveWorkflow(workflow({ id: SECOND_ID }));
+    expect(JSON.stringify(legacy)).not.toContain("reviewBinding");
+    const v1Run = await automations.start({ workflowId: SECOND_ID });
+    await waitForRun(automations, v1Run.id, "completed");
+    expect(JSON.stringify((await automations.snapshot()).runs[0])).not.toContain("attemptId");
+    expect(chat.requests).toHaveLength(2);
+
+    await automations.saveReviewBoundWorkflow({
+      workflow: workflow(), caseId: CASE_ID, sourceTurnIds: [TURN_ID]
+    });
+    const bound = await automations.start({ workflowId: WORKFLOW_ID });
+    expect(chat.requests).toHaveLength(2);
+    await expect(automations.saveWorkflow(workflow())).rejects.toThrow("cannot be replaced");
+    await expect(automations.exportPack(WORKFLOW_ID)).rejects.toThrow("cannot be exported");
+    const legacyPack = await automations.exportPack(SECOND_ID);
+    await expect(automations.importPack({
+      ...legacyPack,
+      workflow: { ...legacyPack.workflow, id: WORKFLOW_ID }
+    })).rejects.toThrow("cannot replace");
+    expect((await automations.snapshot()).agents[0]?.revision).toBe(1);
+    const uncertain = await automations.snapshot();
+    const run = uncertain.runs.find(item => item.id === bound.id)!;
+    run.state = "interrupted";
+    run.activeNodeId = null;
+    run.steps[0]!.state = "interrupted";
+    const restarted = createRuntime(new MemoryRepository(uncertain), chat);
+    await expect(restarted.action({ runId: bound.id, action: "resume" }))
+      .rejects.toThrow("cannot resume");
+    await expect(restarted.action({ runId: bound.id, action: "retry", nodeId: FIRST_ID }))
+      .rejects.toThrow("cannot retry");
+    expect(chat.requests).toHaveLength(2);
+    await restarted.shutdown();
+    await automations.shutdown();
+
+    const changed = createRuntime(new MemoryRepository(), new FakeChatRuntime());
+    await changed.saveAgent(agent());
+    await changed.saveReviewBoundWorkflow({
+      workflow: workflow(), caseId: CASE_ID, sourceTurnIds: [TURN_ID]
+    });
+    await changed.saveAgent({ ...agent(), name: "Changed agent" });
+    await expect(changed.start({ workflowId: WORKFLOW_ID })).rejects.toThrow("agent changed");
+    expect((await changed.snapshot()).runs).toHaveLength(0);
+    await changed.shutdown();
+  });
+
+  it("refuses a review-bound opt-in with duplicate sources or automatic tool nodes", async () => {
+    const automations = createRuntime(new MemoryRepository(), new FakeChatRuntime());
+    await automations.saveAgent(agent());
+    await expect(automations.saveReviewBoundWorkflow({
+      workflow: workflow(), caseId: CASE_ID, sourceTurnIds: [TURN_ID, TURN_ID]
+    })).rejects.toThrow("unique");
+    await expect(automations.saveReviewBoundWorkflow({
+      workflow: workflow({ nodes: [node(FIRST_ID, [], { kind: "memory.search" })] }),
+      caseId: CASE_ID, sourceTurnIds: [TURN_ID]
+    })).rejects.toThrow("model nodes only");
+    await expect(automations.saveReviewBoundWorkflow({
+      workflow: workflow({ nodes: [node(FIRST_ID, []), node(SECOND_ID, [])] }),
+      caseId: CASE_ID, sourceTurnIds: [TURN_ID]
+    })).rejects.toThrow("exactly one root");
+    expect((await automations.snapshot()).workflows).toHaveLength(0);
+    await automations.shutdown();
+  });
+
+  it("loads an older multi-root v2 record for inspection but refuses to start it", async () => {
+    const chat = new FakeChatRuntime();
+    const authoring = createRuntime(new MemoryRepository(), chat);
+    await authoring.saveAgent(agent());
+    await authoring.saveReviewBoundWorkflow({
+      workflow: workflow(), caseId: CASE_ID, sourceTurnIds: [TURN_ID]
+    });
+    const olderRecord = await authoring.snapshot();
+    olderRecord.workflows[0]!.nodes = [node(FIRST_ID, []), node(SECOND_ID, [])];
+    const loaded = createRuntime(new MemoryRepository(olderRecord), chat);
+    expect((await loaded.snapshot()).workflows[0]?.nodes).toHaveLength(2);
+    await expect(loaded.start({ workflowId: WORKFLOW_ID })).rejects.toThrow("exactly one root");
+    expect((await loaded.snapshot()).runs).toHaveLength(0);
+    expect(chat.requests).toHaveLength(0);
+    await loaded.shutdown();
+    await authoring.shutdown();
   });
 });
 

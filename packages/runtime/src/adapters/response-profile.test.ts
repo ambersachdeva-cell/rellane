@@ -84,6 +84,44 @@ describe("named enquiry response profile", () => {
     expect(calls).toBe(0);
     expect(() => responseProfileOptions({ ...request, runtimeId: "ollama-loopback" }, true)).toThrow("only by the bundled");
   });
+  it("ships graph node with exact temperature and maxTokens, disables thinking, and refuses truncation or external routing", async () => {
+    const graphNode = LocalChatRequestSchema.parse({
+      ...request,
+      responseProfile: "graph-node-v1",
+      temperature: 0.0,
+      maxTokens: 512,
+      response_format: { type: "json_object" },
+      chat_template_kwargs: { enable_thinking: true }
+    });
+    const bodies: unknown[] = [];
+    const adapter = new LmStudioAdapter(async (_url, options) => {
+      bodies.push(options?.body);
+      return { choices: [{ message: { content: "Node output." }, finish_reason: "stop" }] };
+    }, "synthetic-loopback-test-bearer");
+    const result = await adapter.chat(graphNode, new AbortController().signal);
+    expect(result.content).toBe("Node output.");
+    expect(bodies[0]).toMatchObject({
+      temperature: 0.0,
+      max_tokens: 512,
+      chat_template_kwargs: { enable_thinking: false }
+    });
+    expect(bodies[0]).not.toHaveProperty("response_format");
+    expect(graphNode).not.toHaveProperty("response_format");
+    for (const finish_reason of ["length", "tool_calls"]) {
+      const failingAdapter = new LmStudioAdapter(async () => ({
+        choices: [{ message: { content: "partial" }, finish_reason }]
+      }), "synthetic-loopback-test-bearer");
+      await expect(failingAdapter.chat(graphNode, new AbortController().signal)).rejects.toThrow("did not finish");
+      expect(() => requireCompleteProfile(graphNode, finish_reason)).toThrow("did not finish");
+    }
+    let calls = 0;
+    const requester: JsonRequester = async () => { calls++; return {}; };
+    await expect(new LmStudioAdapter(requester).chat(graphNode, new AbortController().signal)).rejects.toThrow("only by the bundled");
+    await expect(new OllamaAdapter(requester).chat(graphNode, new AbortController().signal)).rejects.toThrow("bundled");
+    expect(calls).toBe(0);
+    expect(() => responseProfileOptions(graphNode, false)).toThrow("only by the bundled");
+    expect(() => responseProfileOptions({ ...graphNode, runtimeId: "ollama-loopback" }, true)).toThrow("only by the bundled");
+  });
   it("rejects unknown named profiles at the wire boundary and never forwards arbitrary server schemas", () => {
     expect(LocalChatRequestSchema.safeParse({ ...request, responseProfile: "anything-goes" }).success).toBe(false);
     expect(LocalChatRequestSchema.safeParse({ ...request, runtimeId: "managed-llama" }).success).toBe(false);

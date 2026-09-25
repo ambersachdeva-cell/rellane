@@ -3,6 +3,7 @@ import { ipcMain } from "electron";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
+import type { RemoteOneRunHandoverScope, RemoteOneRunHandoverReview } from "./remote-dispatch-server.js";
 
 export type PairingStatus =
   | {
@@ -31,6 +32,13 @@ export interface InstallRemotePairingOptions {
     readonly pin: string;
     readonly expiresAt: number;
     readonly stop: () => Promise<void>;
+    readonly handover?: {
+      readonly candidates: () => { readonly principals: readonly string[];
+        readonly runs: readonly { readonly principalId: string; readonly caseId: string;
+          readonly operationId: string }[] };
+      readonly prepare: (input: RemoteOneRunHandoverScope) => RemoteOneRunHandoverReview;
+      readonly approve: (token: string) => RemoteOneRunHandoverScope;
+    };
   }>;
   /** The Wi-Fi address of this Mac, or null when there is none. */
   readonly lanAddress: () => string | null;
@@ -41,6 +49,7 @@ interface ActivePairingServer {
   readonly pin: string;
   readonly expiresAt: number;
   readonly stop: () => Promise<void>;
+  readonly handover?: NonNullable<Awaited<ReturnType<InstallRemotePairingOptions["startServer"]>>["handover"]>;
 }
 
 function sanitizeErrorMessage(error: unknown, activePin?: string): string {
@@ -65,12 +74,15 @@ function sanitizeErrorMessage(error: unknown, activePin?: string): string {
   return trimmed.length > 0 ? trimmed : "An unexpected error occurred.";
 }
 
-export function installRemotePairing(options: InstallRemotePairingOptions): void {
+export function installRemotePairing(options: InstallRemotePairingOptions): { readonly shutdown: () => Promise<void> } {
   let activeServer: ActivePairingServer | null = null;
   let activeOwner: unknown = null;
   let startingPromise: Promise<PairingStatus> | null = null;
+  let expiryTimer: ReturnType<typeof setTimeout> | null = null;
 
   const stopActiveServer = async (): Promise<void> => {
+    if (expiryTimer !== null) clearTimeout(expiryTimer);
+    expiryTimer = null;
     const server = activeServer;
     activeServer = null;
     activeOwner = null;
@@ -98,14 +110,7 @@ export function installRemotePairing(options: InstallRemotePairingOptions): void
     }
 
     if (Date.now() >= activeServer.expiresAt) {
-      const expired = activeServer;
-      activeServer = null;
-      activeOwner = null;
-      try {
-        await expired.stop();
-      } catch {
-        // Ignored on expired server shutdown
-      }
+      await stopActiveServer();
       return { state: "off" };
     }
 
@@ -184,6 +189,8 @@ export function installRemotePairing(options: InstallRemotePairingOptions): void
 
           activeServer = server;
           activeOwner = owner;
+          expiryTimer = setTimeout(() => { void stopActiveServer(); }, Math.max(0, server.expiresAt - Date.now()));
+          if (typeof expiryTimer.unref === "function") expiryTimer.unref();
 
           return {
             state: "listening",
@@ -213,21 +220,40 @@ export function installRemotePairing(options: InstallRemotePairingOptions): void
         }
       }
 
-      const server = activeServer;
-      activeServer = null;
-      activeOwner = null;
-
-      if (server !== null) {
-        try {
-          await server.stop();
-        } catch {
-          // Server reference is revoked regardless of stop failure
-        }
-      }
+      await stopActiveServer();
 
       return { state: "off" };
     } catch (error) {
       throw new Error(sanitizeErrorMessage(error));
     }
   });
+
+  const requireHandover = (event: IpcMainInvokeEvent) => {
+    options.assertTrusted(event);
+    if (activeServer === null || activeServer.expiresAt <= Date.now() ||
+        activeOwner !== ownerFor(event) || activeServer.handover === undefined)
+      throw new Error("Start a current pairing from this Mac window before approving a handover.");
+    return activeServer.handover;
+  };
+  ipcMain.handle(IPC_CHANNELS.workstationPairingHandoverCandidates,
+    (event: IpcMainInvokeEvent) => requireHandover(event).candidates());
+  ipcMain.handle(IPC_CHANNELS.workstationPairingHandoverPrepare,
+    (event: IpcMainInvokeEvent, input: unknown) => {
+      const handover = requireHandover(event);
+      const scope = z.strictObject({ caseId: z.string().min(1).max(64), operationId: z.uuid(),
+        oldPrincipalId: z.string().regex(/^prnc_[a-f0-9]{32}$/u),
+        newPrincipalId: z.string().regex(/^prnc_[a-f0-9]{32}$/u) }).parse(input);
+      return handover.prepare(scope);
+    });
+  ipcMain.handle(IPC_CHANNELS.workstationPairingHandoverApprove,
+    (event: IpcMainInvokeEvent, input: unknown) => {
+      const handover = requireHandover(event);
+      const { token } = z.strictObject({ token: z.string().regex(/^[a-f0-9]{64}$/u) }).parse(input);
+      return handover.approve(token);
+    });
+
+  return { shutdown: async () => {
+    if (startingPromise !== null) await startingPromise.catch(() => undefined);
+    await stopActiveServer();
+  } };
 }

@@ -1,9 +1,15 @@
 import { WorkstationContextSuggestionInputSchema } from "@cadrane/contracts";
 import { suggestLocalContext } from "./workstation/local-context.js";
 import { artifactVersions, saveArtifact, acceptArtifact } from "./workroom/artifacts.js";
+import { installArtifactLineage } from "./workroom/artifact-lineage-ipc.js";
+import { installArtifactEditIpc } from "./workroom/artifact-edit-ipc.js";
 import { exportArtifactVersion, exportReceipts, isExporting } from "./workroom/exports.js";
 import { LocalWorkroom, type LocalWorkroomDeps } from "./workroom/local.js";
-import { installWorkstationIpc, type WorkstationIpc } from "./workstation/ipc.js";
+import {
+  AUTOMATION_WORKFLOW_SAVE_REVIEW_BOUND_CHANNEL,
+  installWorkstationIpc,
+  type WorkstationIpc
+} from "./workstation/ipc.js";
 import { WorkroomSourceIntake } from "./workroom/sources.js";
 import { reviewData, saveDataReview, addDataSample } from "./workroom/data-review.js";
 import { saveEnquiryReview } from "./workroom/enquiry.js";
@@ -30,8 +36,17 @@ import {
   AutomationArtifactSchema,
   AutomationConnectorEnsureLocalInputSchema,
   AutomationConnectorSchema,
+  AutomationHostBindOperationInputSchema,
+  AutomationHostBindOperationResultSchema,
+  AutomationHostReconcileTerminalInputSchema,
+  AutomationHostReconcileTerminalResultSchema,
+  AutomationHostReserveAttemptInputSchema,
+  AutomationHostReserveAttemptResultSchema,
+  AutomationHostReviewDescriptorSchema,
   AutomationMemoryDocumentSaveInputSchema,
   AutomationMemoryDocumentSchema,
+  AutomationPendingHostReviewInputSchema,
+  AutomationReviewBoundWorkflowInputSchema,
   AutomationRunActionInputSchema,
   AutomationRunSnapshotSchema,
   AutomationDryRunInputSchema,
@@ -40,6 +55,7 @@ import {
   AutomationSourceDocumentSchema,
   AutomationWorkflowSaveInputSchema,
   AutomationWorkflowSchema,
+  AutomationWorkflowV2Schema,
   AutomationWorkflowPackExportInputSchema,
   AutomationWorkflowPackFileResultSchema,
   AutomationWorkflowPackSchema,
@@ -50,7 +66,6 @@ import {
   HardwareProfileSchema,
   LicenseAcceptanceIntentSchema,
   LicenseAcknowledgementSchema,
-  LocalChatRequestSchema,
   CaseLocalRequestSchema,
   CaseArtifactSaveSchema,
   CaseSourceCommitSchema,
@@ -94,7 +109,6 @@ import { installWorkstationImages } from "./workstation/image-ipc.js";
 import { installWorkstationCreative } from "./workstation/creative-ipc.js";
 import { fromFile as briefFromFile, toFile as briefToFile } from "./agents/share.js";
 import { findAgent, SHIPPED_IDS } from "./agents/roster.js";
-import { draftLocalBrief } from "./agents/draft.js";
 import { createLocalShortcuts } from "./local-shortcuts.js";
 import { BILL_TEXT_LIMIT, LocalShortcutKindSchema, type LocalShortcutKind } from "@cadrane/contracts";
 import type { Ceiling } from "./agents/brief.js";
@@ -704,24 +718,17 @@ export function installIpcHandlers(
     return z.array(RuntimeDescriptorSchema).parse(data);
   });
 
-  ipcMain.handle(IPC_CHANNELS.runtimeChat, async (event, input: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.runtimeChat, async (event) => {
     assertTrustedSender(event, getWindow);
-    const request = LocalChatRequestSchema.parse(input);
-    const data = await requestForRenderer(event, daemon, {
-      type: "runtime.chat",
-      payload: request
-    }, 180_000);
-    return LocalChatResultSchema.parse(data);
+    // An older preload exposed daemon inference without a case, owner or receipt.
+    // Keep the channel closed for old windows while case-scoped local workrooms
+    // continue to use their private main-process daemon dependency below.
+    throw new Error("Direct local model calls are unavailable. Open a case workroom instead.");
   });
 
-  ipcMain.handle(IPC_CHANNELS.runtimeCancel, async (event, input: unknown) => {
+  ipcMain.handle(IPC_CHANNELS.runtimeCancel, async (event) => {
     assertTrustedSender(event, getWindow);
-    const operationId = z.uuid().parse(input);
-    const data = await requestForRenderer(event, daemon, {
-      type: "runtime.cancel",
-      payload: { operationId }
-    }, 5_000);
-    return z.object({ cancelled: z.boolean() }).parse(data);
+    throw new Error("Direct local model cancellation is unavailable. Stop the case workroom instead.");
   });
 
   ipcMain.handle(IPC_CHANNELS.automationSnapshot, async (event, input: unknown) => {
@@ -757,6 +764,20 @@ export function installIpcHandlers(
         payload
       }, 15_000);
       return AutomationWorkflowSchema.parse(data);
+    }
+  );
+
+  ipcMain.handle(
+    AUTOMATION_WORKFLOW_SAVE_REVIEW_BOUND_CHANNEL,
+    async (event, input: unknown) => {
+      assertTrustedSender(event, getWindow);
+      assertFlowsUsable();
+      const payload = AutomationReviewBoundWorkflowInputSchema.parse(input);
+      const data = await requestForRenderer(event, daemon, {
+        type: "automation.workflow.save-review-bound",
+        payload
+      }, 15_000);
+      return AutomationWorkflowV2Schema.parse(data);
     }
   );
 
@@ -1207,8 +1228,19 @@ export function installIpcHandlers(
     // read and change; nothing reaches the roster until they press save. The
     // folders offered are the ones actually granted, read from the host, so a
     // model cannot name its way into somewhere it was not given.
-    return runShortcut(event, handle, "agent-brief", signal =>
-      draftLocalBrief(sentence, skillHost.grantedRoots(), localWorkroomDeps(event), signal));
+    return runShortcut(event, handle, "agent-brief", (signal, check) =>
+      workstation.runLocalBrief(event, { db: theBook(), handle, sentence,
+        folders: skillHost.grantedRoots(), grantedFolders: () => skillHost.grantedRoots(),
+        assertOwner: check, runtime: localWorkroomDeps(event), signal }));
+  });
+
+  ipcMain.handle(IPC_CHANNELS.agentDraftHistory, (event) => workstation.localBriefHistory(event));
+  ipcMain.handle(IPC_CHANNELS.agentDraftForget, (event, input: unknown) => {
+    assertTrustedSender(event, getWindow);
+    const { reviewSha256 } = z.strictObject({
+      reviewSha256: z.string().regex(/^[a-f0-9]{64}$/u), confirmed: z.literal(true)
+    }).parse(input);
+    return workstation.forgetLocalBriefHistory(event, reviewSha256);
   });
 
   ipcMain.handle(IPC_CHANNELS.agentSave, async (event, input: unknown) => {
@@ -1314,23 +1346,23 @@ export function installIpcHandlers(
     const ceiling = await host.currentCeiling();
     const requiredSource = sourceToken === undefined ? undefined
       : consumeAgentSource(agentSourceState, owner, agentId, sourceToken, ceiling, host);
-    return runAgentById(
-      agentId,
-      question,
-      ceiling,
-      undefined,
-      db,
-      // Pushed to the window that asked, so a run can be watched while it
-      // happens. Sent on the same one-way channel as every other push: the
-      // renderer receives a payload and never a sender.
-      (update) => {
-        if (!event.sender.isDestroyed()) {
-          event.sender.send(AGENT_PROGRESS_EVENT, update);
-        }
-      },
-      { ...localWorkroomDeps(event), currentCeiling,
-        ...(requiredSource ? { requiredSource } : {}) }
-    );
+    return workstation.runLocalAgent(event, {
+      db, agentId, stop: () => stopAgent(agentId),
+      work: (hooks) => runAgentById(
+        agentId,
+        question,
+        ceiling,
+        undefined,
+        db,
+        // Pushed only to the window that asked; reload revokes its host owner.
+        (update) => {
+          if (!event.sender.isDestroyed()) event.sender.send(AGENT_PROGRESS_EVENT, update);
+        },
+        { ...localWorkroomDeps(event), currentCeiling,
+          ...(requiredSource ? { requiredSource } : {}) },
+        hooks
+      )
+    });
   });
 
   ipcMain.handle(IPC_CHANNELS.agentExport, async (event, input: unknown) => {
@@ -1415,7 +1447,7 @@ export function installIpcHandlers(
     // Aborts the run's own controller, which every await in the loop already
     // honours — the same path the brief's clock takes, so a stopped run is
     // reported as stopped rather than as a failure.
-    return { stopped: stopAgent(agentId) };
+    return workstation.stopLocalAgent(event, agentId);
   });
 
   ipcMain.handle(IPC_CHANNELS.benchRun, async (event, input: unknown) => {
@@ -1778,9 +1810,115 @@ export function installIpcHandlers(
         return;
       }
       await send(chatId, text);
+    },
+    graph: {
+      describeReview: async (input) => {
+        assertFlowsUsable();
+        const payload = AutomationPendingHostReviewInputSchema.parse(input);
+        const data = await daemon.request(
+          { type: "automation.host-review.describe", payload },
+          15_000
+        );
+        return AutomationHostReviewDescriptorSchema.parse(data);
+      },
+      reserveAttempt: async (input) => {
+        assertFlowsUsable();
+        const payload = AutomationHostReserveAttemptInputSchema.parse(input);
+        const data = await daemon.request(
+          { type: "automation.host-attempt.reserve", payload },
+          15_000
+        );
+        return AutomationHostReserveAttemptResultSchema.parse(data);
+      },
+      bindOperation: async (input) => {
+        assertFlowsUsable();
+        const payload = AutomationHostBindOperationInputSchema.parse(input);
+        const data = await daemon.request(
+          { type: "automation.host-attempt.bind", payload },
+          15_000
+        );
+        return AutomationHostBindOperationResultSchema.parse(data);
+      },
+      reconcileTerminal: async (input) => {
+        assertFlowsUsable();
+        const payload = AutomationHostReconcileTerminalInputSchema.parse(input);
+        const data = await daemon.request(
+          { type: "automation.host-attempt.reconcile", payload },
+          15_000
+        );
+        return AutomationHostReconcileTerminalResultSchema.parse(data);
+      },
+      snapshot: async () => {
+        assertFlowsUsable();
+        const data = await daemon.request(
+          { type: "automation.snapshot", payload: {} },
+          15_000
+        );
+        return AutomationWorkspaceSnapshotSchema.parse(data);
+      },
+      runNode: async (input) => {
+        const deps: LocalWorkroomDeps = {
+          discover: async () =>
+            z.array(RuntimeDescriptorSchema).parse(
+              await daemon.request({ type: "runtime.discover", payload: {} }, 10_000)
+            ),
+          chat: async (payload) =>
+            LocalChatResultSchema.parse(
+              await daemon.request({ type: "runtime.chat", payload }, 180_000)
+            ),
+          cancel: async (operationId) => {
+            await daemon.request(
+              { type: "runtime.cancel", payload: { operationId } },
+              5_000
+            );
+          }
+        };
+        return await localWorkroom.runGraphNode(
+          input.db,
+          {
+            caseId: input.caseId,
+            nodeTitle: input.nodeTitle,
+            instruction: input.instruction,
+            sourceTurnIds: input.sourceTurnIds,
+            request: input.request
+          },
+          deps,
+          input.hooks
+        );
+      },
+      stopNode: async (caseId, operationId) => {
+        const deps: LocalWorkroomDeps = {
+          discover: async () =>
+            z.array(RuntimeDescriptorSchema).parse(
+              await daemon.request({ type: "runtime.discover", payload: {} }, 10_000)
+            ),
+          chat: async (payload) =>
+            LocalChatResultSchema.parse(
+              await daemon.request({ type: "runtime.chat", payload }, 180_000)
+            ),
+          cancel: async (opId) => {
+            await daemon.request(
+              { type: "runtime.cancel", payload: { operationId: opId } },
+              5_000
+            );
+          }
+        };
+        return localWorkroom.stop(caseId, operationId, deps);
+      }
     }
   });
   workstationSessions = workstation;
+  installArtifactLineage({
+    assertTrusted: event => assertTrustedSender(event, getWindow),
+    book: () => theBook()
+  });
+  const artifactEdits = installArtifactEditIpc({
+    assertTrusted: event => assertTrustedSender(event, getWindow),
+    ownerFor: event => event.senderFrame ?? event.sender,
+    book: () => theBook()
+  });
+  getWindow()?.webContents.on("did-start-navigation", () => artifactEdits.cancelAll());
+  getWindow()?.webContents.on("destroyed", () => artifactEdits.cancelAll());
   installWorkstationCreative({
     book: () => theBook(),
     assertTrusted: event => assertTrustedSender(event, getWindow),
@@ -1867,7 +2005,9 @@ export function installIpcHandlers(
     assertAgentWorkroomIdle(request.caseId);
     workstation.assertIdle(request.caseId);
     return runShortcut(event, request.handle, "context-selection", (signal, check) =>
-      suggestLocalContext(theBook(), request, localWorkroomDeps(event), signal, check));
+      workstation.runLocalSuggestion(event, { db: theBook(), request, signal,
+        work: (hooks, hostSignal) => suggestLocalContext(theBook(), request,
+          localWorkroomDeps(event), hostSignal, check, hooks) }));
   });
   ipcMain.handle(IPC_CHANNELS.casesSaveArtifact, async (event, input: unknown) => {
     assertTrustedSender(event, getWindow);
@@ -1919,27 +2059,40 @@ export function installIpcHandlers(
   });
   ipcMain.handle(IPC_CHANNELS.casesLocalState, async (event, input: unknown) => {
     assertTrustedSender(event, getWindow);
-    return localWorkroom.current(CaseIdInput.parse(input).id);
+    return workstation.localCaseState(event, CaseIdInput.parse(input).id);
   });
   ipcMain.handle(IPC_CHANNELS.casesAskLocal, async (event, input: unknown) => {
     assertTrustedSender(event, getWindow);
     const request = CaseLocalRequestSchema.parse(input);
     assertAgentWorkroomIdle(request.id);
     const db = theBook();
-    await localWorkroom.run(db, request, localWorkroomDeps(event));
+    const deps = localWorkroomDeps(event);
+    await workstation.runLocalCase(event, {
+      kind: "case-draft", db, caseId: request.id, operationId: request.operationId,
+      modelId: request.modelId, sourceTurnIds: request.sourceTurnIds,
+      stop: () => localWorkroom.stop(request.id, request.operationId, deps),
+      work: (hooks) => localWorkroom.run(db, request, deps, hooks)
+    });
     return { case: readCase(db, request.id), turns: turnsFor(db, request.id), artifacts: artifactVersions(db, request.id), exports: exportReceipts(db, request.id) };
   });
   ipcMain.handle(IPC_CHANNELS.casesStopLocal, async (event, input: unknown) => {
     assertTrustedSender(event, getWindow);
     const request = z.strictObject({ id: z.string().min(1).max(64), operationId: z.uuid() }).parse(input);
-    return localWorkroom.stop(request.id, request.operationId, localWorkroomDeps(event));
+    return workstation.stopLocalCase(event, request.id, request.operationId);
   });
   ipcMain.handle(IPC_CHANNELS.casesPrepareEnquiry, async (event, input: unknown) => {
     assertTrustedSender(event, getWindow);
     const request = CaseEnquiryRequestSchema.parse(input);
     assertAgentWorkroomIdle(request.id);
     const db = theBook();
-    await localWorkroom.prepareEnquiry(db, request, localWorkroomDeps(event));
+    const deps = localWorkroomDeps(event);
+    await workstation.runLocalCase(event, {
+      kind: "print-enquiry", db, caseId: request.id,
+      operationId: request.operationId, modelId: request.modelId,
+      sourceTurnIds: [request.sourceTurnId],
+      stop: () => localWorkroom.stop(request.id, request.operationId, deps),
+      work: (hooks) => localWorkroom.prepareEnquiry(db, request, deps, hooks)
+    });
     return { case: readCase(db, request.id), turns: turnsFor(db, request.id), artifacts: artifactVersions(db, request.id), exports: exportReceipts(db, request.id) };
   });
   ipcMain.handle(IPC_CHANNELS.casesSaveEnquiryReview, async (event, input: unknown) => {

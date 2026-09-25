@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import { CadraneLocalBaseUrlSchema, LocalChatResultSchema, RuntimeDescriptorSchema,
   WorkstationContextSuggestionInputSchema, type WorkstationContextSuggestion,
-  type WorkstationContextSuggestionInput } from "@cadrane/contracts";
+  type WorkstationContextSuggestionInput, type LocalChatRequest } from "@cadrane/contracts";
 import { CASE_SOURCE_SEAT_PREFIX } from "../../shared/case-sources.js";
 import { readCase, turnsFor } from "../book/cases.js";
 import type { LocalWorkroomDeps } from "../workroom/local.js";
@@ -11,8 +11,14 @@ import { CONTEXT_SUGGESTION_SYSTEM, prepareContextSuggestion, parseContextSugges
 
 const RUNTIME = "cadrane-local-loopback";
 
+export interface LocalContextSuggestionHooks {
+  beforeChat(request: LocalChatRequest, sourceHash: string): void;
+  onFinish(result: WorkstationContextSuggestion): void;
+}
+
 export async function suggestLocalContext(db: DatabaseSync, raw: WorkstationContextSuggestionInput,
-  runtime: LocalWorkroomDeps, signal: AbortSignal, assertCurrent: () => void): Promise<WorkstationContextSuggestion> {
+  runtime: LocalWorkroomDeps, signal: AbortSignal, assertCurrent: () => void,
+  hooks?: LocalContextSuggestionHooks): Promise<WorkstationContextSuggestion> {
   const input = WorkstationContextSuggestionInputSchema.parse(raw);
   const check = () => { signal.throwIfAborted(); assertCurrent(); };
   const sources = () => {
@@ -43,12 +49,15 @@ export async function suggestLocalContext(db: DatabaseSync, raw: WorkstationCont
     check();
     if (prepareContextSuggestion(input.question, sources()).sha256 !== packet.sha256)
       throw new Error("The saved files changed. Ask for a fresh context suggestion.");
-    dispatched = true;
-    const answer = LocalChatResultSchema.parse(await runtime.chat({
+    const request: LocalChatRequest = {
       operationId, runtimeId: RUNTIME, modelId,
       messages: [{ role: "system", content: CONTEXT_SUGGESTION_SYSTEM }, { role: "user", content: packet.prompt }],
       temperature: 0, maxTokens: 256, responseProfile: "local-draft-v1"
-    }));
+    };
+    hooks?.beforeChat(request, packet.sha256);
+    check();
+    dispatched = true;
+    const answer = LocalChatResultSchema.parse(await runtime.chat(request));
     check();
     if (answer.operationId !== operationId || answer.runtimeId !== RUNTIME || answer.modelId !== modelId || !answer.localOnly)
       throw new Error("The local response did not match this request. Your selection is unchanged.");
@@ -57,11 +66,14 @@ export async function suggestLocalContext(db: DatabaseSync, raw: WorkstationCont
     let selected: readonly string[];
     try { selected = parseContextSuggestion(answer.content, packet); }
     catch (cause) { throw new Error("The local model did not return a usable file selection. Choose the files yourself, or try a clearer question. Your selection is unchanged.", { cause }); }
-    return {
+    const result: WorkstationContextSuggestion = {
       sourceTurnIds: selected, consideredIds: [...input.sourceTurnIds],
       omittedIds: packet.omittedIds, excerptedIds: packet.candidates.filter(value => value.excerpted).map(value => value.id),
       modelId, durationMs: Date.now() - startedAt, sourceHash: packet.sha256
     };
+    check();
+    hooks?.onFinish(result);
+    return result;
   } catch (error) {
     if (dispatched) await runtime.cancel(operationId).catch(() => undefined);
     throw error;

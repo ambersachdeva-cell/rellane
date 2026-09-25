@@ -1,76 +1,143 @@
 /** Spatial canvas view displaying workroom context and outputs as an interactive graph. */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CaseTurnView } from "@cadrane/contracts";
 import {
-  createCanvas,
-  addNode,
   updateNode,
-  removeNode,
-  connectNodes,
   panViewport,
   zoomViewport,
   fitToScreen,
   renderCanvasToSvg,
-  type CanvasNode,
-  type CanvasNodeType,
   type InfiniteCanvas
 } from "./canvas-model.js";
-import { Icon, IconButton, Modal } from "./ui.js";
+import {
+  createInitialCanvasFromTurns,
+  getDefaultStorage,
+  loadCanvasDraft,
+  reconcileCanvasWithTurns,
+  saveCanvasDraft,
+  type StorageLike
+} from "./canvas-draft-store.js";
+import { Icon, Modal } from "./ui.js";
 
 export interface WorkroomCanvasProps {
   readonly caseId: string;
   readonly title: string;
   readonly turns: readonly CaseTurnView[];
   readonly onClose: () => void;
+  readonly storage?: StorageLike | null;
 }
 
-export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvasProps) {
+interface ResolvedInitialState {
+  readonly canvas: InfiniteCanvas;
+  readonly warning: string | null;
+  readonly canPersist: boolean;
+}
+
+function resolveInitialState(
+  caseId: string,
+  title: string,
+  turns: readonly CaseTurnView[],
+  storage: StorageLike | null
+): ResolvedInitialState {
+  const result = loadCanvasDraft(caseId, storage);
+  if (result.status === "loaded") {
+    return {
+      canvas: reconcileCanvasWithTurns(result.draft, turns),
+      warning: null,
+      canPersist: true
+    };
+  }
+  const initial = createInitialCanvasFromTurns(caseId, title, turns);
+  if (result.status === "corrupted") {
+    return {
+      canvas: initial,
+      warning:
+        "Saved draft for this case is invalid or corrupted. Stored draft has been preserved for recovery without overwriting.",
+      canPersist: false
+    };
+  }
+  if (result.status === "version_mismatch") {
+    return {
+      canvas: initial,
+      warning:
+        "Saved draft is from an unsupported version. Stored draft has been preserved for recovery without overwriting.",
+      canPersist: false
+    };
+  }
+  if (result.status === "storage_unavailable") {
+    return {
+      canvas: initial,
+      warning: result.error,
+      canPersist: false
+    };
+  }
+  if (result.status === "read_error") {
+    return {
+      canvas: initial,
+      warning: `${result.error}. In-memory work remains usable.`,
+      canPersist: false
+    };
+  }
+  return {
+    canvas: initial,
+    warning: null,
+    canPersist: true
+  };
+}
+
+interface WorkroomCanvasInnerProps {
+  readonly caseId: string;
+  readonly title: string;
+  readonly turns: readonly CaseTurnView[];
+  readonly onClose: () => void;
+  readonly storage: StorageLike | null;
+}
+
+function WorkroomCanvasInner({
+  caseId,
+  title,
+  turns,
+  onClose,
+  storage
+}: WorkroomCanvasInnerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [canvas, setCanvas] = useState<InfiniteCanvas>(() => {
-    let initial = createCanvas(caseId, title);
-    let xOffset = 60;
-    let yOffset = 80;
-    let previousNodeId: string | null = null;
+  const [initialResolved] = useState(() => resolveInitialState(caseId, title, turns, storage));
+  const [canvas, setCanvas] = useState<InfiniteCanvas>(initialResolved.canvas);
+  const [storageWarning, setStorageWarning] = useState<string | null>(initialResolved.warning);
 
-    for (const turn of turns) {
-      if (!turn.body.trim()) continue;
-      const isOwner = turn.seat === "owner";
-      const isSource = turn.kind === "verbatim";
-      const nodeType: CanvasNodeType = isSource ? "source" : isOwner ? "card" : "snippet";
-      const nodeTitle = isSource
-        ? "Source Context"
-        : isOwner
-        ? `Request #${turn.seq}`
-        : `${turn.seat.replace(/^Workstation · /u, "")} #${turn.seq}`;
+  const userEditCountRef = useRef(0);
+  const lastSavedEditCountRef = useRef(0);
 
-      const nodeId = `turn-${turn.id}`;
-      const node: CanvasNode = {
-        id: nodeId,
-        type: nodeType,
-        title: nodeTitle,
-        content: turn.body.length > 280 ? `${turn.body.slice(0, 277)}…` : turn.body,
-        x: xOffset,
-        y: yOffset,
-        width: 260,
-        height: 160,
-        color: isOwner ? "#3b82f6" : isSource ? "#10b981" : "#8b5cf6"
-      };
-
-      initial = addNode(initial, node);
-      if (previousNodeId) {
-        initial = connectNodes(initial, previousNodeId, nodeId, undefined, "arrow");
-      }
-      previousNodeId = nodeId;
-
-      xOffset += 320;
-      if (xOffset > 1000) {
-        xOffset = 60;
-        yOffset += 220;
-      }
+  useEffect(() => {
+    if (userEditCountRef.current === lastSavedEditCountRef.current) {
+      return;
     }
+    lastSavedEditCountRef.current = userEditCountRef.current;
+    if (!initialResolved.canPersist) {
+      return;
+    }
+    const saveResult = saveCanvasDraft(caseId, canvas, storage);
+    if (!saveResult.success) {
+      setStorageWarning(saveResult.error);
+    } else {
+      setStorageWarning((curr) =>
+        curr &&
+        (curr.startsWith("Storage quota") ||
+          curr.startsWith("Storage error") ||
+          curr.startsWith("Local draft storage unavailable"))
+          ? null
+          : curr
+      );
+    }
+  }, [canvas, caseId, storage, initialResolved.canPersist]);
 
-    return initial;
-  });
+  const prevTurnsRef = useRef(turns);
+  useEffect(() => {
+    if (prevTurnsRef.current !== turns) {
+      prevTurnsRef.current = turns;
+      setCanvas((prev) => reconcileCanvasWithTurns(prev, turns));
+    }
+  }, [turns]);
 
   const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -78,19 +145,24 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
   const [panStart, setPanStart] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [notice, setNotice] = useState<string>("");
 
-  const handleZoomIn = useCallback(() => {
-    setCanvas((prev) => zoomViewport(prev, 1.2));
+  const mutateCanvas = useCallback((updater: (prev: InfiniteCanvas) => InfiniteCanvas) => {
+    userEditCountRef.current += 1;
+    setCanvas(updater);
   }, []);
 
+  const handleZoomIn = useCallback(() => {
+    mutateCanvas((prev) => zoomViewport(prev, 1.2));
+  }, [mutateCanvas]);
+
   const handleZoomOut = useCallback(() => {
-    setCanvas((prev) => zoomViewport(prev, 0.8));
-  }, []);
+    mutateCanvas((prev) => zoomViewport(prev, 0.8));
+  }, [mutateCanvas]);
 
   const handleFit = useCallback(() => {
     const width = containerRef.current?.clientWidth ?? 900;
     const height = containerRef.current?.clientHeight ?? 600;
-    setCanvas((prev) => fitToScreen(prev, width, height, 40));
-  }, []);
+    mutateCanvas((prev) => fitToScreen(prev, width, height, 40));
+  }, [mutateCanvas]);
 
   const handleExportSvg = useCallback(() => {
     const svg = renderCanvasToSvg(canvas, { dark: true, padding: 50 });
@@ -109,6 +181,12 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
     event.stopPropagation();
     const node = canvas.nodes.find((n) => n.id === nodeId);
     if (!node) return;
+    if (canvas.selectedNodeIds.length !== 1 || canvas.selectedNodeIds[0] !== nodeId) {
+      mutateCanvas((prev) => ({
+        ...prev,
+        selectedNodeIds: [nodeId]
+      }));
+    }
     setDraggingNodeId(nodeId);
     setDragOffset({
       x: event.clientX - node.x * canvas.viewport.zoom,
@@ -120,6 +198,9 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
     if (event.target === containerRef.current || (event.target as HTMLElement).tagName === "svg") {
       setIsPanning(true);
       setPanStart({ x: event.clientX, y: event.clientY });
+      if (canvas.selectedNodeIds.length > 0) {
+        mutateCanvas((prev) => ({ ...prev, selectedNodeIds: [] }));
+      }
     }
   };
 
@@ -128,12 +209,12 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
       const zoom = Math.max(0.1, canvas.viewport.zoom);
       const newX = Math.round((event.clientX - dragOffset.x) / zoom);
       const newY = Math.round((event.clientY - dragOffset.y) / zoom);
-      setCanvas((prev) => updateNode(prev, draggingNodeId, { x: newX, y: newY }));
+      mutateCanvas((prev) => updateNode(prev, draggingNodeId, { x: newX, y: newY }));
     } else if (isPanning) {
       const dx = event.clientX - panStart.x;
       const dy = event.clientY - panStart.y;
       setPanStart({ x: event.clientX, y: event.clientY });
-      setCanvas((prev) => panViewport(prev, dx, dy));
+      mutateCanvas((prev) => panViewport(prev, dx, dy));
     }
   };
 
@@ -145,7 +226,7 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
   const handleWheel = (event: React.WheelEvent) => {
     event.preventDefault();
     const factor = event.deltaY < 0 ? 1.08 : 0.92;
-    setCanvas((prev) => zoomViewport(prev, factor));
+    mutateCanvas((prev) => zoomViewport(prev, factor));
   };
 
   return (
@@ -173,6 +254,43 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
             </button>
           </div>
         </header>
+
+        {storageWarning ? (
+          <div
+            role="alert"
+            data-testid="canvas-storage-warning"
+            style={{
+              marginTop: "8px",
+              padding: "8px 12px",
+              borderRadius: "6px",
+              backgroundColor: "rgba(239, 68, 68, 0.1)",
+              border: "1px solid rgba(239, 68, 68, 0.3)",
+              color: "#ef4444",
+              fontSize: "12px",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px"
+            }}
+          >
+            <span>{storageWarning}</span>
+            <button
+              type="button"
+              onClick={() => setStorageWarning(null)}
+              style={{
+                background: "none",
+                border: "none",
+                color: "inherit",
+                cursor: "pointer",
+                fontSize: "14px",
+                lineHeight: 1
+              }}
+              aria-label="Dismiss warning"
+            >
+              ×
+            </button>
+          </div>
+        ) : null}
 
         <div
           ref={containerRef}
@@ -238,42 +356,55 @@ export function WorkroomCanvas({ caseId, title, turns, onClose }: WorkroomCanvas
             </svg>
 
             {/* Nodes */}
-            {canvas.nodes.map((node) => (
-              <div
-                key={node.id}
-                onMouseDown={(e) => handleMouseDownNode(node.id, e)}
-                style={{
-                  position: "absolute",
-                  left: `${node.x}px`,
-                  top: `${node.y}px`,
-                  width: `${node.width}px`,
-                  minHeight: `${node.height}px`,
-                  backgroundColor: "var(--ws-paper)",
-                  border: `1px solid ${node.color ?? "var(--ws-line)"}`,
-                  borderRadius: "8px",
-                  padding: "12px",
-                  boxShadow: "var(--ws-shadow, 0 4px 14px rgba(0,0,0,0.08))",
-                  color: "var(--ws-ink)",
-                  userSelect: "none",
-                  cursor: "grab"
-                }}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
-                  <strong style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.04em", color: node.color ?? "var(--ws-blue)" }}>
-                    {node.title}
-                  </strong>
-                  <span style={{ fontSize: "10px", padding: "1px 6px", borderRadius: "4px", backgroundColor: "var(--ws-ground)", color: "var(--ws-muted)", border: "1px solid var(--ws-line)" }}>
-                    {node.type}
-                  </span>
+            {canvas.nodes.map((node) => {
+              const isSelected = canvas.selectedNodeIds.includes(node.id);
+              return (
+                <div
+                  key={node.id}
+                  data-testid={`canvas-node-${node.id}`}
+                  data-selected={isSelected ? "true" : "false"}
+                  onMouseDown={(e) => handleMouseDownNode(node.id, e)}
+                  style={{
+                    position: "absolute",
+                    left: `${node.x}px`,
+                    top: `${node.y}px`,
+                    width: `${node.width}px`,
+                    minHeight: `${node.height}px`,
+                    backgroundColor: "var(--ws-paper)",
+                    border: `1px solid ${node.color ?? "var(--ws-line)"}`,
+                    borderRadius: "8px",
+                    padding: "12px",
+                    boxShadow: isSelected
+                      ? "0 0 0 2px var(--ws-blue, #3b82f6), var(--ws-shadow, 0 4px 14px rgba(0,0,0,0.08))"
+                      : "var(--ws-shadow, 0 4px 14px rgba(0,0,0,0.08))",
+                    color: "var(--ws-ink)",
+                    userSelect: "none",
+                    cursor: "grab"
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "6px" }}>
+                    <strong style={{ fontSize: "12px", textTransform: "uppercase", letterSpacing: "0.04em", color: node.color ?? "var(--ws-blue)" }}>
+                      {node.title}
+                    </strong>
+                    <span style={{ fontSize: "10px", padding: "1px 6px", borderRadius: "4px", backgroundColor: "var(--ws-ground)", color: "var(--ws-muted)", border: "1px solid var(--ws-line)" }}>
+                      {node.type}
+                    </span>
+                  </div>
+                  <p style={{ fontSize: "12px", lineHeight: "1.45", color: "var(--ws-ink)", margin: 0, wordBreak: "break-word" }}>
+                    {node.content}
+                  </p>
                 </div>
-                <p style={{ fontSize: "12px", lineHeight: "1.45", color: "var(--ws-ink)", margin: 0, wordBreak: "break-word" }}>
-                  {node.content}
-                </p>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       </div>
     </Modal>
   );
+}
+
+
+export function WorkroomCanvas(props: WorkroomCanvasProps) {
+  const effectiveStorage = props.storage !== undefined ? props.storage : getDefaultStorage();
+  return <WorkroomCanvasInner key={props.caseId} {...props} storage={effectiveStorage} />;
 }

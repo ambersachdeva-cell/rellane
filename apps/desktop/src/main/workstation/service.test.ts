@@ -14,11 +14,22 @@
  */
 import { describe, expect, it } from "vitest";
 import { createHash } from "node:crypto";
-import type { DatabaseSync } from "node:sqlite";
+import { mkdtemp, mkdir, realpath, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import type { ContextSnapshot } from "./context-snapshot-store.js";
+import { buildWorkstationContext, type AcceptedConstraint, type AcceptedFinding } from "./context.js";
+import { DatabaseSync } from "node:sqlite";
+import { openCase } from "../book/cases.js";
+import { MIGRATIONS } from "../book/schema.js";
+import { LocalCaseRunScope } from "./local-case-run-scope.js";
+import { LocalBriefDraftScope } from "./local-brief-draft-scope.js";
+import type { LocalWorkroomDeps } from "../workroom/local.js";
 import type {
   WorkstationProvider,
   WorkstationRoutine,
-  WorkstationSnapshot
+  WorkstationSnapshot,
+  LocalChatResult
 } from "@cadrane/contracts";
 import type {
   NativeEvent,
@@ -103,6 +114,17 @@ const CODEX: WorkstationProvider = {
   canApproveTools: true
 };
 
+const CLAUDE: WorkstationProvider = {
+  id: "claude",
+  label: "Claude",
+  family: "claude",
+  state: "detected",
+  detail: "Installed.",
+  models: [{ id: "sonnet", label: "Sonnet" }],
+  canResume: true,
+  canApproveTools: true
+};
+
 const ROUTINES: readonly WorkstationRoutine[] = [
   {
     id: "write-reply",
@@ -127,6 +149,7 @@ function harness() {
   const created: string[] = [];
   const state = {
     room: { id: "case-1", title: "Brackets", closedAt: null } as WorkstationCaseRow | null,
+    otherRoom: null as WorkstationCaseRow | null,
     clock: 1_000_000,
     stored: null as WorkstationSessionReceipt | null,
     launches: [{ provider: CODEX, executable: "/usr/local/bin/codex" }] as NativeProviderLaunch[],
@@ -134,14 +157,22 @@ function harness() {
     transactions: 0,
     txDepth: 0,
     omitted: [] as string[],
-    packedIds: null as string[] | null
+    packedIds: null as string[] | null,
+    savePreimage: async (_input: Parameters<WorkstationHostDeps["onRunStart"]>[0]): Promise<boolean> => true,
+    canonicalPath: async (workspacePath: string): Promise<string> => workspacePath,
+    projectId: null as string | null,
+    memoryEpoch: 0,
+    approvedConstraints: [] as AcceptedConstraint[],
+    approvedFindings: [] as AcceptedFinding[]
   };
+  const contextSnapshots = new Map<string, ContextSnapshot>();
   let tokens = 0;
   let ids = 0;
 
   const deps: WorkstationHostDeps = {
     book: () => ({}) as DatabaseSync,
-    readCase: (_db, caseId) => (state.room !== null && state.room.id === caseId ? state.room : null),
+    readCase: (_db, caseId) =>
+      state.room?.id === caseId ? state.room : state.otherRoom?.id === caseId ? state.otherRoom : null,
     turnsFor: () => turns,
     appendTurn: (_db, _caseId, turn) => {
       const id = `turn-${turns.length + 1}`;
@@ -158,15 +189,43 @@ function harness() {
       }
     },
     discoverProviders: async () => state.launches,
-    buildContext: ({ prompt, sources }) => ({
-      packet: JSON.stringify({ request: prompt, sources }),
+    buildContext: ({ prompt, sources, acceptedConstraints, approvedFindings }) => ({
+      packet: JSON.stringify({ request: prompt, sources,
+        ...(acceptedConstraints?.length ? { constraints: acceptedConstraints } : {}),
+        ...(approvedFindings?.length ? { findings: approvedFindings } : {}) }),
       // Deliberately a summary rather than the packet, exactly like the real
       // assembler: the host must not be able to pass this off as the bytes.
       preview: `${prompt} (+${sources.length})`,
       sourceIds: state.packedIds ?? sources.map((source) => source.id),
       sha256: "context-hash",
-      omitted: state.omitted
+      omitted: state.omitted,
+      ...(acceptedConstraints?.length ? { constraintIds: acceptedConstraints.map((item) => item.id) } : {}),
+      ...(approvedFindings ? { findingDecisions: approvedFindings.map((finding) => ({
+        id: finding.id, revision: finding.revision,
+        included: finding.provenance === "verified",
+        reason: finding.provenance === "verified" ? "relevant_approved_finding" as const :
+          finding.provenance === "stale" ? "stale_source" as const : "unattributed" as const
+      })) } : {})
     }),
+    memory: {
+      projectForCase: () => state.projectId,
+      epoch: () => state.memoryEpoch,
+      constraints: () => state.approvedConstraints,
+      findings: () => state.approvedFindings,
+      saveSnapshot: (_db, input, at) => {
+        const saved: ContextSnapshot = {
+          ...input,
+          packetHash: createHash("sha256").update(input.packet).digest("hex"),
+          createdAt: at,
+          dispatchAttemptedAt: null,
+          redactedAt: null
+        };
+        contextSnapshots.set(input.id, saved);
+        return saved;
+      },
+      readSnapshot: (_db, id) => contextSnapshots.get(id) ?? null,
+      markDispatchAttempt: () => {}
+    },
     createWorker: (providerId, options) => {
       created.push(providerId);
       const worker = fakeWorker(options);
@@ -188,6 +247,8 @@ function harness() {
       label: "This case's own folder",
       path: `/data/workstation/workspaces/${caseId}`
     }),
+    canonicalWorkspacePath: (workspacePath) => state.canonicalPath(workspacePath),
+    onRunStart: (input) => state.savePreimage(input),
     extractArtifacts: () => [],
     now: () => state.clock,
     token: () => {
@@ -209,7 +270,7 @@ function harness() {
     prompt: "Draft the quotation reply.",
     sourceTurnIds: ["11111111-1111-4111-8111-111111111111"]
   };
-  return { host, deps, owner, request, turns, receipts, receiptDepths, workers, created, state };
+  return { host, deps, owner, request, turns, receipts, receiptDepths, workers, created, state, contextSnapshots };
 }
 
 async function until(predicate: () => boolean, label: string): Promise<void> {
@@ -222,6 +283,17 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   throw new Error(`Timed out waiting for ${label}.`);
 }
 
+function preimageGate() {
+  let release!: (saved: boolean) => void;
+  let requested = false;
+  const promise = new Promise<boolean>((resolve) => { release = resolve; });
+  return {
+    save: (): Promise<boolean> => { requested = true; return promise; },
+    requested: (): boolean => requested,
+    release: (saved: boolean): void => { release(saved); }
+  };
+}
+
 function drafts(turns: readonly WorkstationTurnRow[]): readonly WorkstationTurnRow[] {
   return turns.filter((turn) => turn.seat.startsWith("Workstation ·"));
 }
@@ -231,6 +303,79 @@ function receiptsWritten(turns: readonly WorkstationTurnRow[]): readonly Worksta
 }
 
 describe("the workstation host", () => {
+  it("keeps remote-visible live and finished snapshots within the exact owner", async () => {
+    const kit = harness();
+    const otherOwner = { window: "two" };
+    kit.state.otherRoom = { id: "case-2", title: "Other work", closedAt: null };
+    kit.state.launches.push({ provider: CLAUDE, executable: "/usr/local/bin/claude" });
+    const otherRequest = { ...kit.request, caseId: "case-2", providerId: "claude" as const, modelId: "sonnet" };
+    const first = await kit.host.prepare(kit.request, kit.owner);
+    const second = await kit.host.prepare(otherRequest, otherOwner);
+    const firstRun = await kit.host.start({ token: first.token }, kit.owner);
+    const secondRun = await kit.host.start({ token: second.token }, otherOwner);
+
+    expect(kit.host.snapshotsForOwner(kit.owner).map((item) => item.operationId)).toEqual([firstRun.operationId]);
+    expect(kit.host.snapshotsForOwner(otherOwner).map((item) => item.operationId)).toEqual([secondRun.operationId]);
+    expect(kit.host.snapshotsForOwner({ window: "one" })).toEqual([]);
+
+    kit.workers[0]!.finish({ text: "First answer", sessionId: null, finishReason: "completed" });
+    await kit.host.awaitTerminal("case-1", firstRun.operationId, kit.owner);
+    expect(kit.host.snapshotsForOwner(kit.owner).map((item) => item.operationId)).toEqual([firstRun.operationId]);
+    expect(kit.host.snapshotsForOwner(otherOwner).map((item) => item.operationId)).toEqual([secondRun.operationId]);
+    await kit.host.stop("case-2", secondRun.operationId, otherOwner);
+    kit.workers[1]!.finish({ text: "", sessionId: null, finishReason: "stopped" });
+    await kit.host.awaitTerminal("case-2", secondRun.operationId, otherOwner);
+  });
+
+  it("returns the complete native ask outcome and keeps a stopped partial result", async () => {
+    const kit = harness();
+    const controller = new AbortController();
+    const pending = kit.host.askOnce({
+      providerId: "codex", prompt: "Draft a response", cwd: "/tmp/ask-test",
+      modelId: "gpt-5-codex", signal: controller.signal
+    });
+    await until(() => kit.workers.length === 1, "ask worker");
+    kit.workers[0]!.finish({
+      text: "Useful partial", sessionId: "native-42", finishReason: "denied",
+      detail: "File access declined.", modelId: "adapter-choice", reportedModelId: "provider-choice"
+    });
+    await expect(pending).resolves.toMatchObject({
+      text: "Useful partial", sessionId: "native-42", finishReason: "denied",
+      detail: "File access declined.", requestedModelId: "gpt-5-codex",
+      modelId: "adapter-choice", reportedModelId: "provider-choice",
+      cancellationRequested: false, resultSource: "worker"
+    });
+
+    const stopped = kit.host.askOnce({ providerId: "codex", prompt: "Second ask", cwd: "/tmp/ask-test", signal: controller.signal });
+    await until(() => kit.workers.length === 2, "second ask worker");
+    controller.abort();
+    kit.workers[1]!.finish({ text: "Stopped draft", sessionId: "native-43", finishReason: "completed", detail: "Provider finished after stop." });
+    await expect(stopped).resolves.toMatchObject({ text: "Stopped draft", sessionId: "native-43", finishReason: "completed", detail: "Provider finished after stop.", cancellationRequested: true, resultSource: "worker", requestedModelId: null });
+
+    const rejected = kit.host.askOnce({ providerId: "codex", prompt: "Third ask", cwd: "/tmp/ask-test", signal: new AbortController().signal });
+    await until(() => kit.workers.length === 3, "third ask worker");
+    kit.workers[2]!.emit({ type: "session", sessionId: "native-44" });
+    kit.workers[2]!.emit({ type: "text", text: "Streamed fragment" });
+    kit.workers[2]!.fail(new Error("Quota exhausted"));
+    await expect(rejected).resolves.toMatchObject({
+      text: "Streamed fragment", sessionId: "native-44", finishReason: "failed",
+      detail: "Quota exhausted", requestedModelId: null,
+      cancellationRequested: false, resultSource: "transport"
+    });
+  });
+
+  it.each(["failed", "denied"] as const)("keeps the provider's %s reason after cancellation", async (finishReason) => {
+    const kit = harness();
+    const controller = new AbortController();
+    const pending = kit.host.askOnce({ providerId: "codex", prompt: "Draft", cwd: "/tmp/ask-test", signal: controller.signal });
+    await until(() => kit.workers.length === 1, "cancelled ask worker");
+    controller.abort();
+    kit.workers[0]!.finish({ text: "Partial bytes", sessionId: "native-race", finishReason, detail: "Provider's own detail." });
+    await expect(pending).resolves.toMatchObject({
+      text: "Partial bytes", sessionId: "native-race", finishReason,
+      detail: "Provider's own detail.", cancellationRequested: true, resultSource: "worker"
+    });
+  });
   it("shows the exact packet, then runs it once the token is spent", async () => {
     const kit = harness();
     const before = kit.turns.length;
@@ -273,6 +418,126 @@ describe("the workstation host", () => {
     expect(kit.receipts.map((receipt) => receipt.event)).toEqual(["start", "finish"]);
     expect(kit.receipts.at(-1)?.workspacePath).toBe("/data/workstation/workspaces/case-1");
     expect(worker.disposed).toBe(1);
+  });
+
+  it("waits for a durable start and saved preimage before creating a worker", async () => {
+    const kit = harness();
+    const gate = preimageGate();
+    kit.state.savePreimage = gate.save;
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const pending = kit.host.start({ token: review.token }, kit.owner);
+    await until(gate.requested, "the preimage request");
+
+    expect(kit.created).toEqual([]);
+    expect(kit.receipts.map((receipt) => receipt.event)).toEqual(["start"]);
+    expect(kit.host.state("case-1")?.status).toBe("starting");
+    expect(() => kit.host.assertIdle("case-1")).toThrow(/Stop the workstation session/u);
+    gate.release(true);
+
+    const started = await pending;
+    expect(started.status).toBe("running");
+    expect(kit.created).toEqual(["codex"]);
+    kit.workers[0]?.finish({ sessionId: null, text: "Done", finishReason: "completed" });
+    await until(() => kit.host.state("case-1")?.status === "completed", "the session to complete");
+  });
+
+  it.each(["false", "rejection"] as const)("blocks launch and releases admission when the preimage returns %s", async (failure) => {
+    const kit = harness();
+    kit.state.savePreimage = failure === "false"
+      ? async () => false
+      : async () => { throw new Error("Snapshot store unavailable."); };
+    const review = await kit.host.prepare(kit.request, kit.owner);
+
+    await expect(kit.host.start({ token: review.token }, kit.owner)).rejects.toThrow(
+      failure === "false" ? /Could not cover this workspace.*Choose a narrower folder/u : /Snapshot store unavailable/u
+    );
+    expect(kit.created).toEqual([]);
+    expect(kit.host.state("case-1")?.status).toBe("failed");
+    expect(kit.receipts.map((receipt) => receipt.event)).toEqual(["start", "interrupted"]);
+    expect(receiptsWritten(kit.turns).at(-1)?.body).toMatch(/failed|Snapshot store unavailable|Could not cover this workspace/iu);
+    expect(() => kit.host.assertIdle("case-1")).not.toThrow();
+
+    kit.state.savePreimage = async () => true;
+    const nextReview = await kit.host.prepare(kit.request, kit.owner);
+    const started = await kit.host.start({ token: nextReview.token }, kit.owner);
+    expect(started.status).toBe("running");
+    expect(kit.created).toEqual(["codex"]);
+    kit.workers[0]?.finish({ sessionId: null, text: "Done", finishReason: "completed" });
+    await until(() => kit.host.state("case-1")?.status === "completed", "the retry to complete");
+  });
+
+  it.each(["stop", "window", "shutdown"] as const)("never launches after %s during the preimage wait", async (ending) => {
+    const kit = harness();
+    const gate = preimageGate();
+    kit.state.savePreimage = gate.save;
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const pending = kit.host.start({ token: review.token }, kit.owner);
+    await until(gate.requested, "the preimage request");
+    const operationId = kit.host.state("case-1")?.operationId;
+    if (operationId === undefined) throw new Error("The pending run is not visible.");
+
+    if (ending === "stop") {
+      expect((await kit.host.stop("case-1", operationId, kit.owner)).status).toBe("stopping");
+    } else if (ending === "window") {
+      kit.host.invalidate(kit.owner);
+    } else {
+      await kit.host.shutdown();
+    }
+    gate.release(true);
+
+    await expect(pending).rejects.toThrow(/Stopped before the provider was asked/u);
+    expect(kit.created).toEqual([]);
+    expect(kit.host.state("case-1")?.status).toBe("stopped");
+    expect(kit.receipts.map((receipt) => receipt.event)).toEqual(["start", "interrupted"]);
+    expect(() => kit.host.assertIdle("case-1")).not.toThrow();
+  });
+
+  it("rechecks the reviewed sources after the preimage wait", async () => {
+    const kit = harness();
+    const gate = preimageGate();
+    kit.state.savePreimage = gate.save;
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const pending = kit.host.start({ token: review.token }, kit.owner);
+    await until(gate.requested, "the preimage request");
+    const source = kit.turns[0];
+    if (source === undefined) throw new Error("The reviewed source is missing.");
+    kit.turns[0] = { ...source, body: "The order changed before dispatch." };
+    gate.release(true);
+
+    await expect(pending).rejects.toThrow(/changed while its folder was being saved/u);
+    expect(kit.created).toEqual([]);
+    expect(kit.host.state("case-1")?.status).toBe("failed");
+    expect(kit.receipts.map((receipt) => receipt.event)).toEqual(["start", "interrupted"]);
+  });
+
+  it.each(["same", "nested"] as const)("reserves a %s canonical workspace while its preimage is pending", async (overlap) => {
+    const kit = harness();
+    kit.state.otherRoom = { id: "case-2", title: "Second case", closedAt: null };
+    kit.state.launches.push({ provider: CLAUDE, executable: "/usr/local/bin/claude" });
+    kit.state.canonicalPath = async (workspacePath) =>
+      workspacePath.endsWith("/case-2")
+        ? `/data/workstation/workspaces/case-1${overlap === "nested" ? "/nested" : ""}`
+        : workspacePath;
+    const gate = preimageGate();
+    kit.state.savePreimage = gate.save;
+    const firstReview = await kit.host.prepare(kit.request, kit.owner);
+    const secondReview = await kit.host.prepare({
+      ...kit.request,
+      caseId: "case-2",
+      providerId: "claude",
+      modelId: "sonnet"
+    }, kit.owner);
+
+    const first = kit.host.start({ token: firstReview.token }, kit.owner);
+    await until(gate.requested, "the first preimage request");
+    expect(kit.created).toEqual([]);
+    await expect(kit.host.start({ token: secondReview.token }, kit.owner)).rejects.toThrow(/case-1/u);
+    expect(kit.created).toEqual([]);
+    gate.release(true);
+    expect((await first).status).toBe("running");
+    expect(kit.created).toEqual(["codex"]);
+    kit.workers[0]?.finish({ sessionId: null, text: "Done", finishReason: "completed" });
+    await until(() => kit.host.state("case-1")?.status === "completed", "the first session to complete");
   });
 
   it("refuses to spend the same review twice", async () => {
@@ -342,6 +607,14 @@ describe("the workstation host", () => {
     ).rejects.toThrow(/does not offer the model/u);
   });
 
+  it("refuses an omitted model before a review or worker is created", async () => {
+    const kit = harness();
+    await expect(kit.host.prepare({ ...kit.request, modelId: "" }, kit.owner))
+      .rejects.toThrow(/Choose a model/u);
+    expect(kit.created).toEqual([]);
+    expect(kit.contextSnapshots.size).toBe(0);
+  });
+
   it("refuses a second session that would collide, and says why", async () => {
     const kit = harness();
     const review = await kit.host.prepare(kit.request, kit.owner);
@@ -394,6 +667,55 @@ describe("the workstation host", () => {
     expect(saved[0]?.body).toContain("Half an answer");
     expect(saved[0]?.body).toContain("This is a partial answer.");
     expect(kit.host.state("case-1")?.text).toBe("Half an answer");
+  });
+
+  it("rebinds only one settled live run while denying stale, foreign and old-owner Stop", async () => {
+    const kit = harness();
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const started = await kit.host.start({ token: review.token }, kit.owner);
+    const secondOwner = { window: "newly paired" };
+    const worker = kit.workers[0]!;
+
+    expect(() => kit.host.handoverActiveRun("case-1", started.operationId, {}, secondOwner))
+      .toThrow(/window changed/u);
+    expect(() => kit.host.handoverActiveRun("wrong-case", started.operationId, kit.owner, secondOwner))
+      .toThrow(/no longer running/u);
+    expect(() => kit.host.handoverActiveRun("case-1", started.operationId, kit.owner, kit.owner))
+      .toThrow(/distinct/u);
+    expect(worker.interrupts).toBe(0);
+
+    expect(kit.host.handoverActiveRun("case-1", started.operationId, kit.owner, secondOwner))
+      .toMatchObject({ operationId: started.operationId, status: "running" });
+    expect(kit.host.snapshotsForOwner(kit.owner)).toEqual([]);
+    expect(kit.host.snapshotsForOwner(secondOwner)).toMatchObject([{ operationId: started.operationId }]);
+    await expect(kit.host.stop("case-1", started.operationId, kit.owner)).rejects.toThrow(/window changed/u);
+    await expect(kit.host.prepare(kit.request, kit.owner)).rejects.toThrow(/authority ended/u);
+    kit.host.invalidate(kit.owner);
+    expect(worker.interrupts).toBe(0);
+    expect(() => kit.host.handoverActiveRun("case-1", started.operationId, kit.owner, {}))
+      .toThrow(/not distinct and current/u);
+    expect((await kit.host.stop("case-1", started.operationId, secondOwner)).status).toBe("stopping");
+    expect(worker.interrupts).toBe(1);
+    worker.finish({ sessionId: null, text: "Partial", finishReason: "stopped" });
+    await until(() => kit.host.state("case-1")?.status === "stopped", "the handover run to stop");
+    expect(() => kit.host.handoverActiveRun("case-1", started.operationId, secondOwner, {}))
+      .toThrow(/no longer running/u);
+  });
+
+  it("refuses handover during a pending permission without transferring decision authority", async () => {
+    const kit = harness();
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const started = await kit.host.start({ token: review.token }, kit.owner);
+    const worker = kit.workers[0]!;
+    worker.emit({ type: "permission", id: "write-1", title: "Write file", detail: "Write a draft" });
+    const newOwner = {};
+    expect(() => kit.host.handoverActiveRun("case-1", started.operationId, kit.owner, newOwner))
+      .toThrow(/awaiting authority/u);
+    expect(kit.host.snapshotsForOwner(newOwner)).toEqual([]);
+    expect(worker.interrupts).toBe(0);
+    await kit.host.stop("case-1", started.operationId, kit.owner);
+    worker.finish({ sessionId: null, text: "", finishReason: "stopped" });
+    await until(() => kit.host.state("case-1")?.status === "stopped", "the permission run to stop");
   });
 
   it("answers one waiting approval, for the operation that asked", async () => {
@@ -533,6 +855,11 @@ describe("the workstation host", () => {
 
   it("resumes only into the same provider and the same folder", async () => {
     const kit = harness();
+    kit.state.projectId = "project-1";
+    kit.state.memoryEpoch = 3;
+    const seed = await kit.host.prepare(kit.request, kit.owner);
+    const priorContext = kit.contextSnapshots.get(seed.contextSnapshotId!)!;
+    kit.contextSnapshots.set(seed.contextSnapshotId!, { ...priorContext, dispatchAttemptedAt: 1 });
     const snapshot: WorkstationSnapshot = {
       operationId: "00000000-0000-4000-8000-00000000000f",
       caseId: "case-1",
@@ -551,19 +878,48 @@ describe("the workstation host", () => {
       version: 1,
       event: "finish",
       snapshot,
+      contextSnapshotId: seed.contextSnapshotId!,
+      projectId: "project-1",
       workspacePath: "/data/workstation/workspaces/case-1"
     };
     const resumed = await kit.host.prepare(kit.request, kit.owner);
     expect(resumed.resumeSessionId).toBe("thread-7");
 
+    // A coordinator's narrower child must not inherit hidden conversation or
+    // source context from the same case/model's earlier Solo session.
+    const narrower = { ...kit.request, sourceTurnIds: [] };
+    expect((await kit.host.prepare(narrower, kit.owner)).resumeSessionId).toBe("thread-7");
+    const independentChild = await kit.host.prepare(narrower, kit.owner, { freshSession: true });
+    expect(independentChild.resumeSessionId).toBeNull();
+    const childRun = await kit.host.start({ token: independentChild.token }, kit.owner);
+    await until(() => kit.workers.length === 1, "fresh coordinator worker");
+    expect(kit.workers[0]?.options.resumeId).toBeUndefined();
+    kit.workers[0]?.finish({ sessionId: "new-thread", text: "Independent answer", finishReason: "completed" });
+    await until(() => kit.host.state(childRun.caseId)?.status === "completed", "fresh coordinator result");
+
     kit.state.stored = {
       version: 1,
       event: "finish",
       snapshot,
+      contextSnapshotId: seed.contextSnapshotId!,
+      projectId: "project-1",
       workspacePath: "/somewhere/else"
     };
     const fresh = await kit.host.prepare(kit.request, kit.owner);
     expect(fresh.resumeSessionId).toBeNull();
+
+    kit.state.stored = { ...kit.state.stored!, workspacePath: "/data/workstation/workspaces/case-1" };
+    kit.state.memoryEpoch = 4;
+    expect((await kit.host.prepare(kit.request, kit.owner)).resumeSessionId).toBeNull();
+    kit.state.memoryEpoch = 3;
+    kit.state.projectId = null;
+    expect((await kit.host.prepare(kit.request, kit.owner)).resumeSessionId).toBeNull();
+    kit.state.projectId = "project-1";
+    kit.contextSnapshots.set(seed.contextSnapshotId!, { ...priorContext, packet: null, manifest: null, redactedAt: 10 });
+    expect((await kit.host.prepare(kit.request, kit.owner)).resumeSessionId).toBeNull();
+    kit.contextSnapshots.set(seed.contextSnapshotId!, { ...priorContext, dispatchAttemptedAt: 1 });
+    kit.state.stored = { ...kit.state.stored!, snapshot: { ...snapshot, modelId: "different-selected-model" } };
+    expect((await kit.host.prepare(kit.request, kit.owner)).resumeSessionId).toBeNull();
   });
 
   it("drops a window's reviews when it navigates away", async () => {
@@ -689,7 +1045,221 @@ describe("the workstation host", () => {
   });
 });
 
+describe("canonical project memory in reviewed sessions", () => {
+  const accepted: AcceptedConstraint = {
+    id: "memory-1", revision: 2, kind: "exclusion",
+    text: "Never send the customer's secret phrase 🐤.\nKeep this line verbatim.",
+    approvedBy: "local-owner", approvedAt: "2026-09-24T00:00:00.000Z"
+  };
+
+  it("pins explicit context role in the exact packet and selects findings without narrowing authority", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    kit.state.memoryEpoch = 12;
+    kit.state.approvedConstraints = [accepted];
+    const sourceRefs = [{
+      caseId: "case-1", turnId: kit.request.sourceTurnIds[0]!, sha256: "a".repeat(64)
+    }];
+    const finding = (id: string, roleTags: readonly string[]): AcceptedFinding => ({
+      id, revision: 2, text: "The quotation reply needs source evidence.",
+      approvedBy: "local-owner", approvedAt: "2026-09-24T00:00:00.000Z",
+      sourceRefs, provenance: "verified", roleTags
+    });
+    kit.state.approvedFindings = [
+      finding("design-finding", ["design"]),
+      finding("finance-finding", ["finance"]),
+      finding("general-finding", [])
+    ];
+    const host = new WorkstationHost({ ...kit.deps, buildContext: buildWorkstationContext });
+    const design = await host.prepare({ ...kit.request, contextRoleId: "design" }, kit.owner, { freshSession: true });
+    const finance = await host.prepare({ ...kit.request, contextRoleId: "finance" }, kit.owner, { freshSession: true });
+    const solo = await host.prepare(kit.request, kit.owner, { freshSession: true });
+    const read = (packet: string) => JSON.parse(packet) as {
+      policy: { contextRoleId?: string };
+      constraints: { id: string; kind: string }[];
+      findings: { id: string; inclusionReason: string }[];
+      sources: { id: string }[];
+    };
+    expect(read(design.contextPreview).policy.contextRoleId).toBe("design");
+    expect(read(finance.contextPreview).policy.contextRoleId).toBe("finance");
+    expect(read(solo.contextPreview).policy.contextRoleId).toBeUndefined();
+    expect(read(design.contextPreview).constraints).toMatchObject([{ id: accepted.id, kind: "exclusion" }]);
+    expect(read(finance.contextPreview).constraints).toMatchObject([{ id: accepted.id, kind: "exclusion" }]);
+    expect(read(design.contextPreview).findings.map((one) => one.id))
+      .toEqual(["design-finding", "general-finding"]);
+    expect(read(finance.contextPreview).findings.map((one) => one.id))
+      .toEqual(["finance-finding", "general-finding"]);
+    expect(read(solo.contextPreview).findings.map((one) => one.id))
+      .toEqual(["design-finding", "finance-finding", "general-finding"]);
+    expect(read(design.contextPreview).sources.map((one) => one.id)).toEqual(kit.request.sourceTurnIds);
+    expect(design.sourceHash).not.toBe(finance.sourceHash);
+    expect(kit.contextSnapshots.get(design.contextSnapshotId!)?.packet).toBe(design.contextPreview);
+    kit.state.memoryEpoch += 1;
+    await expect(host.start({ token: design.token }, kit.owner)).rejects.toThrow(/Project memory changed/u);
+    expect(kit.created).toEqual([]);
+  });
+
+  it("rejects noncanonical context roles before creating a review", async () => {
+    const kit = harness();
+    await expect(kit.host.prepare({ ...kit.request, contextRoleId: "Lead Analyst" }, kit.owner))
+      .rejects.toThrow();
+    expect(kit.contextSnapshots.size).toBe(0);
+    expect(kit.created).toEqual([]);
+  });
+
+  it("refuses a scoped review if a context builder drops the selected role", async () => {
+    const kit = harness();
+    await expect(kit.host.prepare({ ...kit.request, contextRoleId: "design" }, kit.owner))
+      .rejects.toThrow(/did not bind the selected role/u);
+    expect(kit.contextSnapshots.size).toBe(0);
+    expect(kit.created).toEqual([]);
+  });
+
+  it("reviews attributed findings as evidence and rechecks their source before Start", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    kit.state.memoryEpoch = 3;
+    const finding: AcceptedFinding = {
+      id: "finding-1", revision: 2,
+      text: "The quotation reply should mention ten brackets.",
+      approvedBy: "local-owner", approvedAt: "2026-09-24T00:00:00.000Z",
+      sourceRefs: [{ caseId: "case-1", turnId: kit.request.sourceTurnIds[0]!, sha256: "a".repeat(64) }],
+      provenance: "verified"
+    };
+    kit.state.approvedFindings = [finding];
+    const host = new WorkstationHost({ ...kit.deps, buildContext: buildWorkstationContext });
+    const review = await host.prepare(kit.request, kit.owner);
+    const packet = JSON.parse(review.contextPreview) as {
+      findings: { id: string; evidenceRole: string; sourceRefs: unknown[] }[];
+      sources: { id: string }[];
+    };
+    expect(packet.findings).toMatchObject([{
+      id: finding.id, evidenceRole: "attributed_evidence",
+      sourceRefs: finding.sourceRefs
+    }]);
+    expect(packet.sources.map((source) => source.id)).toEqual(kit.request.sourceTurnIds);
+    kit.state.approvedFindings = [{ ...finding, provenance: "stale" }];
+    await expect(host.start({ token: review.token }, kit.owner))
+      .rejects.toThrow(/approved finding's source changed/u);
+    expect(kit.created).toEqual([]);
+  });
+
+  it("pins exact approved bytes, provenance, epoch and snapshot receipt", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    kit.state.memoryEpoch = 7;
+    kit.state.approvedConstraints = [accepted];
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    expect(review).toMatchObject({ projectId: "project-1", memoryEpoch: 7 });
+    const packet = JSON.parse(review.contextPreview) as { constraints: readonly AcceptedConstraint[] };
+    expect(packet.constraints[0]?.text).toBe(accepted.text);
+    expect(packet.constraints[0]?.approvedBy).toBe(accepted.approvedBy);
+    const saved = kit.contextSnapshots.get(review.contextSnapshotId!);
+    expect(saved?.packet).toBe(review.contextPreview);
+    expect(saved?.manifest?.constraints).toEqual([{ id: "memory-1", revision: 2 }]);
+    await kit.host.start({ token: review.token }, kit.owner);
+    expect(kit.receipts[0]?.contextSnapshotId).toBe(review.contextSnapshotId);
+    expect(kit.workers[0]?.prompts[0]).toBe(review.contextPreview);
+    expect(() => kit.host.assertProjectIdle("project-1")).toThrow(/Stop this project's workstation session/u);
+  });
+
+  it("invalidates pending reviews and blocks project or epoch drift before launch", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    kit.host.invalidateProjectReviews("project-1");
+    await expect(kit.host.start({ token: review.token }, kit.owner)).rejects.toThrow(/no longer valid/u);
+    const second = await kit.host.prepare(kit.request, kit.owner);
+    kit.state.memoryEpoch += 1;
+    await expect(kit.host.start({ token: second.token }, kit.owner)).rejects.toThrow(/Project memory changed/u);
+    const third = await kit.host.prepare(kit.request, kit.owner);
+    kit.state.projectId = null;
+    await expect(kit.host.start({ token: third.token }, kit.owner)).rejects.toThrow(/changed projects/u);
+    expect(kit.created).toEqual([]);
+  });
+
+  it("rechecks the memory epoch after the deferred preimage and never launches stale context", async () => {
+    const kit = harness();
+    kit.state.projectId = "project-1";
+    let release!: (saved: boolean) => void;
+    kit.state.savePreimage = () => new Promise<boolean>((resolve) => { release = resolve; });
+    const review = await kit.host.prepare(kit.request, kit.owner);
+    const starting = kit.host.start({ token: review.token }, kit.owner);
+    expect(kit.created).toEqual([]);
+    kit.state.memoryEpoch += 1;
+    release(true);
+    await expect(starting).rejects.toThrow(/Project memory changed/u);
+    expect(kit.created).toEqual([]);
+    expect(kit.host.state("case-1")?.status).toBe("failed");
+  });
+});
+
 describe("the folder a session works in", () => {
+  it("canonicalizes symlinked restore roots before cross-case overlap admission", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "rellane-restore-lease-"));
+    try {
+      const actual = path.join(root, "actual");
+      const alias = path.join(root, "alias");
+      await mkdir(actual);
+      await symlink(actual, alias);
+      const kit = harness();
+      kit.state.otherRoom = { id: "case-2", title: "Second", closedAt: null };
+      kit.state.canonicalPath = realpath;
+      let release!: () => void;
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      let reserved = false;
+      const first = kit.host.withFileRestoreLease("case-1", actual, kit.owner,
+        async () => { reserved = true; await hold; });
+      await until(() => reserved, "canonical restore lease");
+      await expect(kit.host.withFileRestoreLease("case-2", alias, kit.owner,
+        async () => true)).rejects.toThrow(/folder|session/u);
+      release();
+      await first;
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("holds restore admission through preimage and blocks native start in the same canonical folder", async () => {
+    const kit = harness();
+    const reviewed = await kit.host.prepare(kit.request, kit.owner);
+    let release!: () => void;
+    const preimage = new Promise<void>((resolve) => { release = resolve; });
+    let reserved = false;
+    kit.state.canonicalPath = async (folder) => folder === "/alias/case-1"
+      ? "/data/workstation/workspaces/case-1" : folder;
+    const restoring = kit.host.withFileRestoreLease(
+      "case-1", "/alias/case-1", kit.owner,
+      async () => { reserved = true; await preimage; return true; }
+    );
+    await until(() => reserved, "restore lease");
+    expect(() => kit.host.assertIdle("case-1")).toThrow();
+    await expect(kit.host.start({ token: reviewed.token }, kit.owner)).rejects.toThrow(/folder|session/u);
+    expect(kit.created).toEqual([]);
+    release();
+    await expect(restoring).resolves.toBe(true);
+    await expect(kit.host.prepare(kit.request, kit.owner)).resolves.toBeDefined();
+  });
+
+  it("blocks cross-case parent and child restores while a native session is starting", async () => {
+    const kit = harness();
+    kit.state.otherRoom = { id: "case-2", title: "Second", closedAt: null };
+    const gate = preimageGate();
+    kit.state.savePreimage = gate.save;
+    const reviewed = await kit.host.prepare(kit.request, kit.owner);
+    const starting = kit.host.start({ token: reviewed.token }, kit.owner);
+    await until(gate.requested, "native preimage");
+    await expect(kit.host.withFileRestoreLease(
+      "case-2", "/data/workstation/workspaces", kit.owner, async () => true
+    )).rejects.toThrow(/folder|session/u);
+    await expect(kit.host.withFileRestoreLease(
+      "case-2", "/data/workstation/workspaces/case-1/nested", kit.owner, async () => true
+    )).rejects.toThrow(/folder|session/u);
+    gate.release(false);
+    await expect(starting).rejects.toThrow();
+    expect(kit.created).toEqual([]);
+  });
+
   it("reveals only the current window's chosen folder and drops that choice on reload", async () => {
     const kit = harness();
     const chosen = await kit.host.chooseWorkspace(kit.owner, async () => "/data/client-work");
@@ -715,5 +1285,144 @@ describe("the folder a session works in", () => {
     );
     expect(workspaceFolderName("../../etc/passwd")).toBe("etc-passwd");
     expect(() => workspaceFolderName("../..")).toThrow(/private workspace folder/u);
+  });
+
+  it("holds bundled Case drafts in the same workspace admission lane as file restore", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys=ON");
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    const caseId = openCase(db, { title: "Bundled", question: "Draft" });
+    const kit = harness();
+    const scope = new LocalCaseRunScope();
+    const host = new WorkstationHost({ ...kit.deps, localCaseScope: scope });
+    const folder = `/data/workstation/workspaces/${caseId}`;
+    let release!: () => void;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    try {
+      const local = host.runLocalCase({
+        kind: "case-draft", db, caseId, operationId: "11111111-1111-4111-8111-111111111111",
+        modelId: "qwen", sourceTurnIds: [], owner: kit.owner,
+        stop: async () => { release(); return { stopped: true }; },
+        work: () => hold
+      });
+      await until(() => scope.sessions().length === 1, "local admission");
+      await expect(host.withFileRestoreLease("case-1", folder, kit.owner, async () => true))
+        .rejects.toThrow(/session|folder/u);
+      expect(() => host.assertIdle(caseId)).toThrow(/local/u);
+      await host.stopLocalCase(caseId, "11111111-1111-4111-8111-111111111111", kit.owner);
+      await local;
+      expect(scope.sessions()).toHaveLength(0);
+
+      let freeRestore!: () => void;
+      const restoreHold = new Promise<void>((resolve) => { freeRestore = resolve; });
+      const restoring = host.withFileRestoreLease("case-1", folder, kit.owner, () => restoreHold);
+      await Promise.resolve();
+      await expect(host.runLocalCase({
+        kind: "case-draft", db, caseId, operationId: "22222222-2222-4222-8222-222222222222",
+        modelId: "qwen", sourceTurnIds: [], owner: kit.owner,
+        stop: async () => ({ stopped: false }), work: async () => undefined
+      })).rejects.toThrow(/session|folder/u);
+      freeRestore();
+      await restoring;
+    } finally {
+      release();
+      db.close();
+    }
+  });
+
+  it("cannot admit a local draft after its window is invalidated during workspace resolution", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys=ON");
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    const caseId = openCase(db, { title: "Bundled", question: "Draft" });
+    const kit = harness();
+    const scope = new LocalCaseRunScope();
+    let release!: (path: string) => void;
+    let resolving = false;
+    const canonical = new Promise<string>((resolve) => { release = resolve; });
+    kit.state.canonicalPath = async () => { resolving = true; return canonical; };
+    const host = new WorkstationHost({ ...kit.deps, localCaseScope: scope });
+    try {
+      const attempt = host.runLocalCase({
+        kind: "case-draft", db, caseId, operationId: "33333333-3333-4333-8333-333333333333",
+        modelId: "qwen", sourceTurnIds: [], owner: kit.owner,
+        stop: async () => ({ stopped: false }),
+        work: async () => { throw new Error("The daemon must not be reached."); }
+      });
+      await until(() => resolving, "local workspace resolution");
+      host.invalidate(kit.owner);
+      release(`/data/workstation/workspaces/${caseId}`);
+      await expect(attempt).rejects.toThrow(/window changed/u);
+      expect(scope.sessions()).toHaveLength(0);
+    } finally {
+      release(`/data/workstation/workspaces/${caseId}`);
+      db.close();
+    }
+  });
+
+  it("shares local admission and global Stop with the projectless brief draft", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys=ON");
+    for (const migration of MIGRATIONS) db.exec(migration.sql);
+    const scope = new LocalBriefDraftScope();
+    scope.recover(db);
+    const kit = harness();
+    const host = new WorkstationHost({ ...kit.deps, book: () => db,
+      localBriefScope: scope, localCaseScope: new LocalCaseRunScope() });
+    let rejectChat!: (error: Error) => void;
+    let calls = 0;
+    const runtime: LocalWorkroomDeps = {
+      discover: async () => [{ id: "cadrane-local-loopback", name: "Bundled", kind: "lm-studio",
+        baseUrl: "http://127.0.0.1:12340", state: "available", version: null,
+        detail: "Synthetic", checkedAt: "2026-09-24T00:00:00Z",
+        models: [{ id: "local-model", displayName: "Local", loaded: true, sizeBytes: 100 }] }],
+      chat: async () => { calls += 1; return new Promise<LocalChatResult>((_resolve, reject) => { rejectChat = reject; }); },
+      cancel: async () => { rejectChat(new Error("Synthetic runtime cancellation")); }
+    };
+    try {
+      const pending = host.runLocalBrief({ db, handle: "44444444-4444-4444-8444-444444444444",
+        sentence: "Make a file reader", folders: [], owner: kit.owner,
+        assertOwner: () => undefined, grantedFolders: () => [], runtime });
+      const stopped = expect(pending).rejects.toThrow(/Stopped/);
+      await until(() => calls === 1, "brief dispatch");
+      await expect(host.runLocalCase({ db, kind: "case-draft", caseId: "case-1",
+        operationId: "55555555-5555-4555-8555-555555555555", modelId: "local-model",
+        sourceTurnIds: [], owner: kit.owner, stop: async () => ({ stopped: false }),
+        work: async () => { throw new Error("Concurrent local work must not dispatch"); }
+      })).rejects.toThrow(/Bundled-local/);
+      expect((await host.stopAllFromPhone()).sessions).toBe(1);
+      await stopped;
+      expect(scope.sessions()).toHaveLength(0);
+      expect(db.prepare("SELECT event FROM workstation_local_brief_receipt ORDER BY sequence DESC LIMIT 1").get())
+        .toEqual({ event: "interrupted" });
+      const history = host.localBriefHistory();
+      expect(history.count).toBe(1);
+      expect(host.forgetLocalBriefHistory(history.reviewSha256)).toEqual({ removed: 1 });
+      expect(db.prepare("SELECT COUNT(*) AS count FROM work_case").get()).toEqual({ count: 0 });
+    } finally { await host.shutdown(); db.close(); }
+  });
+
+  it("global Host Stop reaches the active bundled Agent child", async () => {
+    const kit = harness();
+    const scope = new LocalCaseRunScope();
+    const host = new WorkstationHost({ ...kit.deps, localCaseScope: scope });
+    let release!: () => void;
+    let stops = 0;
+    const hold = new Promise<void>((resolve) => { release = resolve; });
+    const pending = host.runLocalAgent({
+      db: {} as DatabaseSync, agentId: "reader", owner: kit.owner,
+      stop: () => { stops += 1; release(); return true; },
+      work: async () => {
+        await hold;
+        return { id: "", agentId: "reader", agentName: "Reader", outcome: "stopped",
+          summary: "Stop requested", answer: "", problem: "Stop requested",
+          substituted: null, ranOnLabel: null, read: [], elapsedMs: 0, approxTokens: 0 };
+      }
+    });
+    await until(() => scope.sessions().length === 1, "Agent admission");
+    expect((await host.stopAllFromPhone()).sessions).toBe(1);
+    expect(stops).toBe(1);
+    expect((await pending).outcome).toBe("stopped");
+    expect(scope.sessions()).toHaveLength(0);
   });
 });

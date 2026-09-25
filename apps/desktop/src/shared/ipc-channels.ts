@@ -14,6 +14,7 @@ export const IPC_CHANNELS = Object.freeze({
   automationSnapshot: `${IPC_PREFIX}:automation-snapshot`,
   automationAgentSave: `${IPC_PREFIX}:automation-agent-save`,
   automationWorkflowSave: `${IPC_PREFIX}:automation-workflow-save`,
+  automationWorkflowSaveReviewBound: `${IPC_PREFIX}:automation-workflow-save-review-bound`,
   automationMemorySave: `${IPC_PREFIX}:automation-memory-save`,
   automationSourceImport: `${IPC_PREFIX}:automation-source-import`,
   automationArtifactReview: `${IPC_PREFIX}:automation-artifact-review`,
@@ -118,6 +119,9 @@ export const IPC_CHANNELS = Object.freeze({
   casesList: `${IPC_PREFIX}:cases-list`,
   casesOpen: `${IPC_PREFIX}:cases-open`,
   casesRead: `${IPC_PREFIX}:cases-read`,
+  casesArtifactLineage: `${IPC_PREFIX}:cases-artifact-lineage`,
+  casesPreviewArtifactEdit: `${IPC_PREFIX}:cases-preview-artifact-edit`,
+  casesApplyArtifactEdit: `${IPC_PREFIX}:cases-apply-artifact-edit`,
   casesPreviewSource: `${IPC_PREFIX}:cases-preview-source`,
   casesAddSource: `${IPC_PREFIX}:cases-add-source`,
   casesReviewData: `${IPC_PREFIX}:cases-review-data`,
@@ -173,13 +177,24 @@ export const IPC_CHANNELS = Object.freeze({
   workstationStart: `${IPC_PREFIX}:workstation-start`,
   workstationState: `${IPC_PREFIX}:workstation-state`,
   workstationRunning: `${IPC_PREFIX}:workstation-running`,
+  // Reviewed 2026-09-25. Automation graph v2 nodes run through the single
+  // shared WorkstationHost: prepare validates the Case, sources, agent revision
+  // and pinned local model without calling any model; start consumes a one-use
+  // owner review token; stop cancels the bound operation; reconcile settles
+  // interrupted attempts against durable Book evidence without replay.
+  workstationGraphPrepare: `${IPC_PREFIX}:workstation-graph-prepare`,
+  workstationGraphStart: `${IPC_PREFIX}:workstation-graph-start`,
+  workstationGraphStop: `${IPC_PREFIX}:workstation-graph-stop`,
+  workstationGraphReconcile: `${IPC_PREFIX}:workstation-graph-reconcile`,
   // The step-by-step agent: start it, watch it, stop it. Three channels rather
   // than one long call, because a run the owner cannot see is a run he cannot
   // judge — and one he cannot stop is not one he authorised.
+  workstationAgentPrepare: `${IPC_PREFIX}:workstation-agent-prepare`,
   workstationAgentStart: `${IPC_PREFIX}:workstation-agent-start`,
   workstationAgentPoll: `${IPC_PREFIX}:workstation-agent-poll`,
   workstationAgentStop: `${IPC_PREFIX}:workstation-agent-stop`,
   // Several subscriptions on one brief at once.
+  workstationDispatchPrepare: `${IPC_PREFIX}:workstation-dispatch-prepare`,
   workstationDispatchStart: `${IPC_PREFIX}:workstation-dispatch-start`,
   workstationDispatchPoll: `${IPC_PREFIX}:workstation-dispatch-poll`,
   workstationDispatchStop: `${IPC_PREFIX}:workstation-dispatch-stop`,
@@ -188,6 +203,9 @@ export const IPC_CHANNELS = Object.freeze({
   workstationPairingStatus: `${IPC_PREFIX}:workstation-pairing-status`,
   workstationPairingStart: `${IPC_PREFIX}:workstation-pairing-start`,
   workstationPairingStop: `${IPC_PREFIX}:workstation-pairing-stop`,
+  workstationPairingHandoverCandidates: `${IPC_PREFIX}:workstation-pairing-handover-candidates`,
+  workstationPairingHandoverPrepare: `${IPC_PREFIX}:workstation-pairing-handover-prepare`,
+  workstationPairingHandoverApprove: `${IPC_PREFIX}:workstation-pairing-handover-approve`,
   // Speaking instead of typing. The transcript lands in the composer and is
   // reviewed like anything else; this channel never sends it anywhere.
   workstationDictationStatus: `${IPC_PREFIX}:workstation-dictation-status`,
@@ -209,6 +227,7 @@ export const IPC_CHANNELS = Object.freeze({
   // Several bots on one request, each taking a part. Start, watch, stop — the
   // same three the single-bot agent has, because they are the same question
   // asked of one thing or of four.
+  workstationCrewPrepare: `${IPC_PREFIX}:workstation-crew-prepare`,
   workstationCrewStart: `${IPC_PREFIX}:workstation-crew-start`,
   workstationCrewPoll: `${IPC_PREFIX}:workstation-crew-poll`,
   workstationCrewStop: `${IPC_PREFIX}:workstation-crew-stop`,
@@ -223,11 +242,20 @@ export const IPC_CHANNELS = Object.freeze({
   // What he has actually asked of each subscription. Counted from receipts this
   // app wrote; it cannot see a provider's own quota and does not pretend to.
   workstationUsage: `${IPC_PREFIX}:workstation-usage`,
+  workstationModelOutcomeEvidence: `${IPC_PREFIX}:workstation-model-outcome-evidence`,
+  workstationModelPreferencesRead: `${IPC_PREFIX}:workstation-model-preferences-read`,
+  workstationModelPreferencesSave: `${IPC_PREFIX}:workstation-model-preferences-save`,
+  workstationModelPreferencesForget: `${IPC_PREFIX}:workstation-model-preferences-forget`,
+  workstationSoloModelAdvice: `${IPC_PREFIX}:workstation-solo-model-advice`,
+  workstationTeamModelAdvice: `${IPC_PREFIX}:workstation-team-model-advice`,
+  workstationModelAdaptationPropose: `${IPC_PREFIX}:workstation-model-adaptation-propose`,
+  workstationModelAdaptationAccept: `${IPC_PREFIX}:workstation-model-adaptation-accept`,
   // Everything probed at once, so a screen can say what is working. A probe
   // that fails reports its fact as unknown, never as a pass.
   workstationSelfCheck: `${IPC_PREFIX}:workstation-self-check`,
   // Going and reading, rather than answering from memory. Start, watch, stop —
   // the same three every long-running thing here has.
+  workstationResearchPrepare: `${IPC_PREFIX}:workstation-research-prepare`,
   workstationResearchStart: `${IPC_PREFIX}:workstation-research-start`,
   workstationResearchPoll: `${IPC_PREFIX}:workstation-research-poll`,
   workstationResearchStop: `${IPC_PREFIX}:workstation-research-stop`,
@@ -238,6 +266,8 @@ export const IPC_CHANNELS = Object.freeze({
   workstationMemoryLearn: `${IPC_PREFIX}:workstation-memory-learn`,
   workstationMemorySet: `${IPC_PREFIX}:workstation-memory-set`,
   workstationMemoryForget: `${IPC_PREFIX}:workstation-memory-forget`,
+  workstationMemoryGoverned: `${IPC_PREFIX}:workstation:memory:governed`,
+  workstationMemoryConflicts: `${IPC_PREFIX}:workstation:memory:conflicts`,
   // Who has messaged the bot and is not yet obeyed, and saying that one is him.
   // Without these the contact list can never gain its first entry: a fresh
   // install obeys nobody, and nothing told him what his own chat id was.
@@ -249,6 +279,17 @@ export const IPC_CHANNELS = Object.freeze({
   workstationWatchSave: `${IPC_PREFIX}:workstation-watch-save`,
   workstationWatchRemove: `${IPC_PREFIX}:workstation-watch-remove`,
   workstationWatchNow: `${IPC_PREFIX}:workstation-watch-now`,
+  workstationScheduleList: `${IPC_PREFIX}:workstation-schedule-list`,
+  workstationScheduleSave: `${IPC_PREFIX}:workstation-schedule-save`,
+  workstationSchedulePreview: `${IPC_PREFIX}:workstation-schedule-preview`,
+  workstationScheduleGrantReview: `${IPC_PREFIX}:workstation-schedule-grant-review`,
+  workstationScheduleGrantConfirm: `${IPC_PREFIX}:workstation-schedule-grant-confirm`,
+  workstationScheduleRevoke: `${IPC_PREFIX}:workstation-schedule-revoke`,
+  workstationScheduleQueue: `${IPC_PREFIX}:workstation-schedule-queue`,
+  workstationSchedulePrepare: `${IPC_PREFIX}:workstation-schedule-prepare`,
+  workstationScheduleStart: `${IPC_PREFIX}:workstation-schedule-start`,
+  workstationSchedulePoll: `${IPC_PREFIX}:workstation-schedule-poll`,
+  workstationScheduleStop: `${IPC_PREFIX}:workstation-schedule-stop`,
   // What a session changed on his Mac, and putting it back. Matters more now
   // that a phone can start one.
   workstationChangesList: `${IPC_PREFIX}:workstation-changes-list`,
@@ -273,10 +314,14 @@ export const IPC_CHANNELS = Object.freeze({
   workstationBookSearch: `${IPC_PREFIX}:workstation-book-search`,
   workstationAuditExport: `${IPC_PREFIX}:workstation-audit-export`,
   workstationDeliveryPack: `${IPC_PREFIX}:workstation-delivery-pack`,
+  workstationPortableWorkspace: `${IPC_PREFIX}:workstation-portable-workspace`,
+  workstationRecovery: `${IPC_PREFIX}:workstation-recovery`,
   workstationCaptureList: `${IPC_PREFIX}:workstation-capture-list`,
   workstationCaptureTake: `${IPC_PREFIX}:workstation-capture-take`,
   workstationPasteAnalyse: `${IPC_PREFIX}:workstation-paste-analyse`,
   agentDraft: `${IPC_PREFIX}:agent-draft`,
+  agentDraftHistory: `${IPC_PREFIX}:agent-draft-history`,
+  agentDraftForget: `${IPC_PREFIX}:agent-draft-forget`,
   localShortcutBegin: `${IPC_PREFIX}:local-shortcut-begin`,
   localShortcutStop: `${IPC_PREFIX}:local-shortcut-stop`,
   agentSave: `${IPC_PREFIX}:agent-save`,

@@ -25,6 +25,22 @@ export const MAX_PARTS = 6;
 const MIN_REQUEST_LENGTH = 3;
 const MAX_REQUEST_LENGTH = 10000;
 
+/** A final owner must be a sink so every other part can feed into it without a cycle. */
+export function eligibleCrewIntegrationOwners(parts: readonly CrewPart[]): readonly string[] {
+  const prerequisiteIds = new Set(parts.flatMap((part) => part.dependsOn));
+  return parts.filter((part) => !prerequisiteIds.has(part.id)).map((part) => part.id);
+}
+
+/** Make the reviewed final owner explicitly depend on every contributing package. */
+export function withCrewIntegrationOwner(parts: readonly CrewPart[], ownerId: string): readonly CrewPart[] {
+  if (!eligibleCrewIntegrationOwners(parts).includes(ownerId)) {
+    throw new Error("Choose a final-result owner that no other part depends on.");
+  }
+  return parts.map((part) => part.id === ownerId
+    ? { ...part, dependsOn: [...new Set([...part.dependsOn, ...parts.filter((other) => other.id !== ownerId).map((other) => other.id)])] }
+    : part);
+}
+
 // Flags ordering markers between sequential task phases.
 const DEPENDENCY_REGEX =
   /^(?:(?:and\s+)?then|after\s+that|afterwards|once\s+you\s+have)\b|\b(?:from\s+(?:that|this|it|those)|based\s+on\s+(?:that|this|it|those|the\s+above)|using\s+(?:that|this|it|the\s+(?:output|results?)))\b/i;

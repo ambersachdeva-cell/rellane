@@ -15,3 +15,4 @@ export * from "./workstation-context.js";
 export * from "./workstation-creative.js";
 export * from "./workstation-citations.js";
 export * from "./workstation-surface.js";
+export * from "./project-memory.js";

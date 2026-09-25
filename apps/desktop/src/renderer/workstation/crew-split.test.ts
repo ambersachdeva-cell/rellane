@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { splitForCrew } from "./crew-split.js";
+import { eligibleCrewIntegrationOwners, splitForCrew, withCrewIntegrationOwner } from "./crew-split.js";
 import type { CrewSplitInput } from "./crew-split.js";
 
 const TWO_SEATS = [
@@ -12,6 +12,31 @@ const THREE_SEATS = [
   { id: "codex", label: "Codex" },
   { id: "gemini", label: "Gemini" }
 ] as const;
+
+describe("Crew integration ownership", () => {
+  it("joins parallel packages under the reviewed final owner without changing their work", () => {
+    const split = splitForCrew({
+      request: "Part A: research the sources. Part B: check the claims. Part C: write the result.",
+      seats: THREE_SEATS,
+      sourceIds: []
+    });
+    expect(eligibleCrewIntegrationOwners(split.parts)).toEqual(["part-1", "part-2", "part-3"]);
+    const integrated = withCrewIntegrationOwner(split.parts, "part-3");
+    expect(integrated[2]?.dependsOn).toEqual(["part-1", "part-2"]);
+    expect(integrated[0]?.prompt).toBe(split.parts[0]?.prompt);
+    expect(integrated[1]?.prompt).toBe(split.parts[1]?.prompt);
+  });
+
+  it("rejects an upstream owner that would create a dependency cycle", () => {
+    const split = splitForCrew({
+      request: "Research the sources and then write the summary",
+      seats: TWO_SEATS,
+      sourceIds: []
+    });
+    expect(eligibleCrewIntegrationOwners(split.parts)).toEqual(["part-2"]);
+    expect(() => withCrewIntegrationOwner(split.parts, "part-1")).toThrow(/final-result owner/);
+  });
+});
 
 describe("splitForCrew", () => {
   it("splits explicit Part A and Part B labels across seats without dependencies", () => {

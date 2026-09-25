@@ -5,13 +5,13 @@ import { RuntimeBoundaryError } from "../errors.js";
 export function responseProfileOptions(request: LocalChatRequest, bundled: boolean) {
   if (request.responseProfile === undefined) return {};
   if (!bundled || request.runtimeId !== "cadrane-local-loopback" ||
-      !["print-enquiry-v1", "local-draft-v1", "bill-excerpts-v1"].includes(request.responseProfile))
+      !["print-enquiry-v1", "local-draft-v1", "bill-excerpts-v1", "graph-node-v1"].includes(request.responseProfile))
     throw new RuntimeBoundaryError({ code: "BAD_REQUEST",
       message: "This response profile is supported only by the bundled local model.",
       retryable: false });
   // Short interactive drafts need a final answer within their existing budget.
   // This is a named host policy, never an arbitrary renderer template override.
-  if (request.responseProfile === "local-draft-v1")
+  if (request.responseProfile === "local-draft-v1" || request.responseProfile === "graph-node-v1")
     return { chat_template_kwargs: { enable_thinking: false } };
   const quote = { anyOf: [{ type: "string", minLength: 1, maxLength: 400 }, { type: "null" }] };
   const bill = request.responseProfile === "bill-excerpts-v1";

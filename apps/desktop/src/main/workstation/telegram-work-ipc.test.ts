@@ -1,10 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { IpcMainInvokeEvent } from "electron";
+import type { WorkstationReview } from "@cadrane/contracts";
 import { ipcMain } from "electron";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import {
   createTelegramWorkBridge,
+  exactPhoneReview,
   installTelegramWork,
   sanitiseReply,
   type InstallTelegramWorkOptions
@@ -129,10 +131,10 @@ describe("telegram-work-ipc", () => {
 
     const result = await bridge.handleInbound(fakeEvent, {
       chatId: "owner-42",
-      text: "yes"
+      text: "yes 123456"
     });
 
-    expect(options.decidePending).toHaveBeenCalledWith(true);
+    expect(options.decidePending).toHaveBeenCalledWith(true, "123456");
     expect(options.startWork).not.toHaveBeenCalled();
     expect(result.replied).toBe("Allowed once: Write notes.md.");
   });
@@ -143,11 +145,56 @@ describe("telegram-work-ipc", () => {
     });
     const bridge = createTelegramWorkBridge(options);
 
-    const result = await bridge.handleInbound(fakeEvent, { chatId: "owner-42", text: "no" });
+    const result = await bridge.handleInbound(fakeEvent, { chatId: "owner-42", text: "no 123456" });
 
-    expect(options.decidePending).toHaveBeenCalledWith(false);
+    expect(options.decidePending).toHaveBeenCalledWith(false, "123456");
     expect(options.startWork).not.toHaveBeenCalled();
     expect(result.replied).toBe("Declined: Write notes.md.");
+  });
+
+  it("accepts uppercase action-bound decisions", async () => {
+    const options = createMockOptions();
+    const bridge = createTelegramWorkBridge(options);
+    await bridge.handleInbound(fakeEvent, { chatId: "owner-42", text: "YES 123456" });
+    await bridge.handleInbound(fakeEvent, { chatId: "owner-42", text: "NO 123456" });
+    expect(options.decidePending).toHaveBeenNthCalledWith(1, true, "123456");
+    expect(options.decidePending).toHaveBeenNthCalledWith(2, false, "123456");
+    expect(options.startWork).not.toHaveBeenCalled();
+  });
+
+  it("delivers a meaningful exact phone packet or refuses it without truncating", () => {
+    const prompt = "Describe the implementation constraints. ".repeat(35);
+    const review: WorkstationReview = {
+      token: "secret", caseId: "case-1", providerId: "gemini2", providerLabel: "Gemini profile 2",
+      modelId: "gemini-3.8-flash-high", prompt, contextPreview: JSON.stringify({ prompt }),
+      sourceIds: [], sourceHash: "hash", workspace: { id: "ws", label: "New work", path: "/private/tmp/new-work" },
+      expiresAt: Date.now() + 300_000, resumeSessionId: null
+    };
+    const message = exactPhoneReview(review, "123456", "owner-42");
+    expect(message).toContain(review.contextPreview);
+    expect(message).toContain("send 123456");
+    expect(message).not.toContain("secret");
+    expect(message).not.toContain(review.workspace.path);
+    expect(exactPhoneReview({ ...review, contextPreview: "x".repeat(4000) }, "123456", "owner-42")).toBeNull();
+    expect(exactPhoneReview({ ...review, contextPreview: "/private/tmp/secret.txt" }, "123456", "owner-42")).toBeNull();
+  });
+
+  it("refuses a bare approval and parses an explicit phone model choice", async () => {
+    const options = createMockOptions();
+    const bridge = createTelegramWorkBridge(options);
+    const bare = await bridge.handleInbound(fakeEvent, { chatId: "owner-42", text: "yes" });
+    expect(bare.replied).toContain("six-digit code");
+    expect(options.decidePending).not.toHaveBeenCalled();
+    expect(options.startWork).not.toHaveBeenCalled();
+
+    await bridge.handleInbound(fakeEvent, {
+      chatId: "owner-42", text: "/ask gemini2/gemini-3.8-flash-high: Summarise the brief"
+    });
+    expect(options.startWork).toHaveBeenCalledWith({
+      request: "Summarise the brief",
+      seats: expect.any(Array),
+      selection: { providerId: "gemini2", modelId: "gemini-3.8-flash-high" }
+    });
   });
 
   /**

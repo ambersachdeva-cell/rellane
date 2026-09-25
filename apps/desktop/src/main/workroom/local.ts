@@ -12,14 +12,38 @@ import type {
   LocalChatResult,
   RuntimeDescriptor
 } from "@cadrane/contracts";
-import { CaseEnquiryRequestSchema, ENQUIRY_PROPOSAL_SEAT } from "@cadrane/contracts";
+import {
+  CaseEnquiryRequestSchema,
+  ENQUIRY_PROPOSAL_SEAT,
+  LocalChatRequestSchema
+} from "@cadrane/contracts";
 import { appendTurn, readCase, turnsFor } from "../book/cases.js";
 import { enquirySource, ENQUIRY_TASK, ENQUIRY_SYSTEM, makeEnquiryProposal } from "./enquiry.js";
+
+export const GRAPH_HOST_ANSWER_SEAT = "graph-host-answer" as const;
 
 export interface LocalWorkroomDeps {
   discover(): Promise<readonly RuntimeDescriptor[]>;
   chat(input: LocalChatRequest): Promise<LocalChatResult>;
   cancel(operationId: string): Promise<void>;
+}
+
+/** The host owns this lifecycle; the workroom still owns the local prompt and answer. */
+export interface LocalCaseRunHooks {
+  beforeStart(request: LocalChatRequest): void;
+  onStart(): void;
+  beforeChat(): void;
+  onFinish(answerTurnId: string): void;
+  onFailure(interrupted: boolean, detail: string): void;
+  isStopped(): boolean;
+}
+
+export interface LocalGraphNodeInput {
+  readonly caseId: string;
+  readonly nodeTitle: string;
+  readonly instruction: string;
+  readonly sourceTurnIds: readonly string[];
+  readonly request: LocalChatRequest;
 }
 
 const LOCAL_RUNTIME = "cadrane-local-loopback";
@@ -73,17 +97,27 @@ export class LocalWorkroom {
   async run(
     db: DatabaseSync,
     input: CaseLocalRequest,
-    deps: LocalWorkroomDeps
+    deps: LocalWorkroomDeps,
+    hooks?: LocalCaseRunHooks
   ): Promise<void> {
-    return runLocalWorkroom(this.state, db, input, deps);
+    return runLocalWorkroom(this.state, db, input, deps, undefined, hooks);
   }
-  async prepareEnquiry(db: DatabaseSync, raw: CaseEnquiryRequest, deps: LocalWorkroomDeps): Promise<void> {
+  async prepareEnquiry(db: DatabaseSync, raw: CaseEnquiryRequest, deps: LocalWorkroomDeps,
+    hooks?: LocalCaseRunHooks): Promise<void> {
     const input = CaseEnquiryRequestSchema.parse(raw);
     enquirySource(db, input.id, input.sourceTurnId);
     return runLocalWorkroom(this.state, db, {
       id: input.id, modelId: input.modelId, operationId: input.operationId,
       question: ENQUIRY_TASK, sourceTurnIds: [input.sourceTurnId]
-    }, deps, "print-enquiry-v1");
+    }, deps, "print-enquiry-v1", hooks);
+  }
+  async runGraphNode(
+    db: DatabaseSync,
+    input: LocalGraphNodeInput,
+    deps: LocalWorkroomDeps,
+    hooks?: LocalCaseRunHooks
+  ): Promise<{ readonly answerTurnId: string; readonly output: string }> {
+    return runLocalGraphNode(this.state, db, input, deps, hooks);
   }
 }
 
@@ -93,7 +127,8 @@ export async function runLocalWorkroom(
   db: DatabaseSync,
   input: CaseLocalRequest,
   deps: LocalWorkroomDeps,
-  profile?: "print-enquiry-v1"
+  profile?: "print-enquiry-v1",
+  hooks?: LocalCaseRunHooks
 ): Promise<void> {
   if (state.active)
     throw new Error(
@@ -146,6 +181,23 @@ export async function runLocalWorkroom(
         "The bundled model is not available. Check Models, then refresh this workroom. No subscription was contacted."
       );
     }
+    const request: LocalChatRequest = {
+      operationId: input.operationId,
+      runtimeId: LOCAL_RUNTIME,
+      modelId: input.modelId,
+      messages: [
+        { role: "system", content: profile ? ENQUIRY_SYSTEM : SYSTEM },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.2,
+      maxTokens: profile ? 2_048 : 1_024,
+      responseProfile: profile ?? "local-draft-v1"
+    };
+    // A failed snapshot prevents dispatch. It is never reconstructed from a
+    // shortened activity line after the daemon has already seen the packet.
+    hooks?.beforeStart(request);
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped before the local model was asked.");
     // A local question needs the same readable history as a subscription turn.
     // Keep it and its start receipt atomic before inference. Internal enquiry
     // instructions are a different workflow and are not the owner's words.
@@ -157,23 +209,16 @@ export async function runLocalWorkroom(
         kind: "receipt",
         body: `${prefix} started with ${input.modelId}.\nSelected sources: ${input.sourceTurnIds.join(", ") || "none"}.\nRequest: ${input.question}\nA start is not a completed answer. Without a matching outcome below, this request was interrupted and will not restart automatically.`
       });
+      hooks?.onStart();
       db.exec("COMMIT");
     } catch (error) { db.exec("ROLLBACK"); throw error; }
     started = true;
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped before the local model was asked.");
+    hooks?.beforeChat();
     active.dispatched = true;
-    const answer = await deps.chat({
-      operationId: input.operationId,
-      runtimeId: LOCAL_RUNTIME,
-      modelId: input.modelId,
-      messages: [
-        { role: "system", content: profile ? ENQUIRY_SYSTEM : SYSTEM },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.2,
-      maxTokens: profile ? 2_048 : 1_024,
-      responseProfile: profile ?? "local-draft-v1"
-    });
-    if (active.stopped)
+    const answer = await deps.chat(request);
+    if (active.stopped || hooks?.isStopped())
       throw new Error("Stopped. Any late answer was discarded.");
     if (
       answer.operationId !== input.operationId ||
@@ -205,6 +250,7 @@ export async function runLocalWorkroom(
           ? `${prefix} completed. Enquiry suggestion: ${turnId}. Model: ${input.modelId}. Original source: ${proposal.sourceTurnId}. Source SHA-256: ${proposal.sourceSha256}. Review the fields in Sources. This suggestion is not reusable evidence until you explicitly review and save it.`
           : `${prefix} completed. Saved answer: ${turnId}. Model: ${input.modelId}. Review the draft before using it.`
       });
+      hooks?.onFinish(turnId);
       db.exec("COMMIT");
     } catch (error) {
       db.exec("ROLLBACK");
@@ -216,11 +262,162 @@ export async function runLocalWorkroom(
     if (active.dispatched)
       await deps.cancel(input.operationId).catch(() => undefined);
     if (started && readCase(db, input.id)?.closedAt === null) {
-      appendTurn(db, input.id, {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        appendTurn(db, input.id, {
+          seat: "workroom", kind: "receipt",
+          body: `${prefix} ${active.stopped || hooks?.isStopped() ? "stop requested; did not complete" : "did not complete"}. No answer was accepted. Retry is a new explicit request.`
+        });
+        hooks?.onFailure(active.dispatched || active.stopped || hooks?.isStopped() === true,
+          error instanceof Error ? error.message : "The local request did not complete.");
+        db.exec("COMMIT");
+      } catch (writeError) { db.exec("ROLLBACK"); throw writeError; }
+    }
+    throw error;
+  } finally {
+    state.active = null;
+  }
+}
+
+export async function runLocalGraphNode(
+  state: WorkroomState,
+  db: DatabaseSync,
+  input: LocalGraphNodeInput,
+  deps: LocalWorkroomDeps,
+  hooks?: LocalCaseRunHooks
+): Promise<{ readonly answerTurnId: string; readonly output: string }> {
+  if (state.active)
+    throw new Error(
+      "One local workroom request is already running on this Mac. Stop it or wait for it to finish."
+    );
+  const room = readCase(db, input.caseId);
+  if (!room || room.closedAt !== null)
+    throw new Error("Open work is required for a local request.");
+  const request = LocalChatRequestSchema.parse(input.request);
+  if (
+    request.runtimeId !== LOCAL_RUNTIME ||
+    request.responseProfile !== "graph-node-v1"
+  ) {
+    throw new Error(
+      "Graph node requests require the bundled local runtime and graph-node-v1 response profile."
+    );
+  }
+  const prefix = `Local request ${request.operationId}`;
+  const turns = turnsFor(db, input.caseId);
+  if (
+    turns.some(
+      (turn) => turn.kind === "receipt" && turn.body.startsWith(prefix)
+    )
+  ) {
+    throw new Error(
+      "This request was already recorded. Review its outcome before starting a new request."
+    );
+  }
+  const active = {
+    caseId: input.caseId,
+    operationId: request.operationId,
+    stopped: false,
+    dispatched: false
+  };
+  state.active = active;
+  let started = false;
+  let completionEntered = false;
+  try {
+    const runtimes = await deps.discover();
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped before the local model was asked.");
+    const runtime = runtimes.find(
+      (one) => one.id === LOCAL_RUNTIME && one.state === "available"
+    );
+    if (!runtime?.models.some((model) => model.id === request.modelId)) {
+      throw new Error(
+        "The bundled model is not available. Check Models, then refresh this workroom. No subscription was contacted."
+      );
+    }
+    hooks?.beforeStart(request);
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped before the local model was asked.");
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      appendTurn(db, input.caseId, {
         seat: "workroom",
         kind: "receipt",
-        body: `${prefix} ${active.stopped ? "stopped" : "did not complete"}. No answer was accepted. Retry is a new explicit request.`
+        body: `${prefix} started with ${request.modelId}.\nSelected sources: ${input.sourceTurnIds.join(", ") || "none"}.\nGraph node: ${input.nodeTitle}\nInstruction: ${input.instruction}\nA start is not a completed answer. Without a matching outcome below, this request was interrupted and will not restart automatically.`
       });
+      hooks?.onStart();
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    started = true;
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped before the local model was asked.");
+    hooks?.beforeChat();
+    active.dispatched = true;
+    const answer = await deps.chat(request);
+    if (active.stopped || hooks?.isStopped())
+      throw new Error("Stopped. Any late answer was discarded.");
+    if (
+      answer.operationId !== request.operationId ||
+      answer.runtimeId !== LOCAL_RUNTIME ||
+      answer.modelId !== request.modelId ||
+      answer.localOnly !== true
+    ) {
+      throw new Error(
+        "The local response did not match this request; it was not saved as an answer."
+      );
+    }
+    const body = answer.content.trim();
+    if (!body || body.length > 50_000) {
+      throw new Error(
+        "The local model returned an empty or oversized answer. No draft was saved."
+      );
+    }
+    completionEntered = true;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const turnId = appendTurn(db, input.caseId, {
+        seat: GRAPH_HOST_ANSWER_SEAT,
+        kind: "finding",
+        body
+      });
+      appendTurn(db, input.caseId, {
+        seat: "workroom",
+        kind: "receipt",
+        body: `${prefix} completed. Saved answer: ${turnId}. Model: ${request.modelId}. Review the finding before using it.`
+      });
+      hooks?.onFinish(turnId);
+      db.exec("COMMIT");
+      return { answerTurnId: turnId, output: body };
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  } catch (error) {
+    if (active.dispatched)
+      await deps.cancel(request.operationId).catch(() => undefined);
+    if (started && readCase(db, input.caseId)?.closedAt === null) {
+      const stoppedOrInterrupted =
+        active.stopped || hooks?.isStopped() === true || completionEntered;
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        appendTurn(db, input.caseId, {
+          seat: "workroom",
+          kind: "receipt",
+          body: `${prefix} ${active.stopped || hooks?.isStopped() ? "stop requested; did not complete" : "did not complete"}. No answer was accepted. Retry is a new explicit request.`
+        });
+        hooks?.onFailure(
+          stoppedOrInterrupted,
+          error instanceof Error
+            ? error.message
+            : "The local request did not complete."
+        );
+        db.exec("COMMIT");
+      } catch (writeError) {
+        db.exec("ROLLBACK");
+        throw writeError;
+      }
     }
     throw error;
   } finally {

@@ -20,6 +20,7 @@ import { outstanding, totalOwedPaise } from "../book/records.js";
 import { rupees } from "../book/money.js";
 import { startAgentWorkroom, finishAgentWorkroom, type AgentWorkroom } from "../workroom/agent-runs.js";
 import type { AgentSourceSnapshot } from "./sources.js";
+import type { LocalAgentRunHooks } from "../workstation/local-case-run-scope.js";
 
 /**
  * What an agent is allowed to look at.
@@ -188,7 +189,8 @@ export async function runAgentById(
   localRuntime?: LocalWorkroomDeps & {
     currentCeiling(): Promise<Ceiling>;
     requiredSource?: { snapshot: AgentSourceSnapshot; sandbox: Sandbox; assertCurrent(): Promise<void> };
-  }
+  },
+  hostHooks?: LocalAgentRunHooks
 ): Promise<AgentRunResult> {
   const brief = findAgent(ceiling.grantedFolders, ceiling.storedAgents, agentId);
   if (brief === undefined) {
@@ -216,6 +218,8 @@ export async function runAgentById(
     return refused("An agent is already running on this Mac. Stop it or wait for its result before starting another.");
   if (!localRuntime)
     return refused("The local agent connection is not available. Restart the app and try again. No subscription was contacted.");
+  if (hostHooks?.isStopped())
+    return refused("This Agent run was stopped before it started.", "stopped");
   const required = localRuntime.requiredSource;
   if (required && !book)
     return refused("The required source needs a saved workroom before this agent can run. No model was asked.");
@@ -236,12 +240,17 @@ export async function runAgentById(
   const active = { controller, workroomId: null as string | null };
   let workroom: AgentWorkroom | null = null;
   const finish = (result: AgentRunResult): AgentRunResult => {
-    if (!workroom || !book) return result;
+    const settled = hostHooks?.isStopped() && result.outcome === "answered"
+      ? { ...result, outcome: "stopped" as const, answer: "",
+          summary: "Stop was requested before this Agent answer could be saved.",
+          problem: "Stop was requested before this Agent answer could be saved." }
+      : result;
+    if (!workroom || !book) return settled;
     try {
-      finishAgentWorkroom(book, workroom, result);
-      return { ...result, workroomId: workroom.caseId, recordProblem: null };
+      finishAgentWorkroom(book, workroom, settled, hostHooks);
+      return { ...settled, workroomId: workroom.caseId, recordProblem: null };
     } catch {
-      return { ...result, workroomId: workroom.caseId,
+      return { ...settled, workroomId: workroom.caseId,
         recordProblem: "This result could not be saved. Keep this window open to copy it; the earlier saved start does not confirm completion. Nothing will retry automatically." };
     }
   };
@@ -253,9 +262,10 @@ export async function runAgentById(
       await checkAccess();
       controller.signal.throwIfAborted();
     }
+    if (hostHooks?.isStopped()) controller.abort();
     if (book) {
       try {
-        workroom = startAgentWorkroom(book, brief, question, originalAccess, required?.snapshot);
+        workroom = startAgentWorkroom(book, brief, question, originalAccess, required?.snapshot, hostHooks);
         active.workroomId = workroom.caseId;
       } catch {
         return refused("The agent's workroom could not be saved. No model was asked or agent tool run. Check local storage before trying again.");
@@ -263,7 +273,7 @@ export async function runAgentById(
     }
     let local: Awaited<ReturnType<typeof prepareLocalAgent>>;
     try {
-      local = await prepareLocalAgent(brief, localRuntime, controller.signal);
+      local = await prepareLocalAgent(brief, localRuntime, controller.signal, "local-draft-v1", hostHooks);
     } catch (error) {
       return finish(controller.signal.aborted
         ? refused(`You stopped ${brief.name} before it asked the model.`, "stopped")

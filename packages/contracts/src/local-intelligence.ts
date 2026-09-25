@@ -9,8 +9,13 @@ import {
   AutomationAgentSchema,
   AutomationConnectorEnsureLocalInputSchema,
   AutomationConnectorSchema,
+  AutomationPendingHostReviewInputSchema,
+  AutomationHostReserveAttemptInputSchema,
+  AutomationHostBindOperationInputSchema,
+  AutomationHostReconcileTerminalInputSchema,
   AutomationMemoryDocumentSaveInputSchema,
   AutomationMemoryDocumentSchema,
+  AutomationReviewBoundWorkflowInputSchema,
   AutomationSourceDocumentSchema,
   AutomationSourceImportInputSchema,
   AutomationRunActionInputSchema,
@@ -28,8 +33,12 @@ import {
   type AutomationArtifactReviewInput,
   type AutomationConnector,
   type AutomationConnectorEnsureLocalInput,
+  type AutomationHostReserveAttemptInput,
+  type AutomationHostBindOperationInput,
+  type AutomationHostReconcileTerminalInput,
   type AutomationMemoryDocument,
   type AutomationMemoryDocumentSaveInput,
+  type AutomationReviewBoundWorkflowInput,
   type AutomationSourceDocument,
   type AutomationRunActionInput,
   type AutomationRunSnapshot,
@@ -157,7 +166,7 @@ export const LocalChatRequestSchema = z.object({
   messages: z.array(ChatMessageSchema).min(1).max(64),
   temperature: z.number().min(0).max(2).default(0.2),
   maxTokens: z.number().int().min(32).max(8_192).default(2_048),
-  responseProfile: z.enum(["print-enquiry-v1", "local-draft-v1", "bill-excerpts-v1"]).optional()
+  responseProfile: z.enum(["print-enquiry-v1", "local-draft-v1", "bill-excerpts-v1", "graph-node-v1"]).optional()
 }).superRefine((value, context) => {
   if (value.responseProfile && value.runtimeId !== "cadrane-local-loopback")
     context.addIssue({ code: "custom", path: ["responseProfile"],
@@ -255,9 +264,37 @@ export const CaseArtifactSaveSchema = z.strictObject({
   id: z.string().min(1).max(64),
   baseVersionId: z.uuid().nullable(),
   sourceTurnId: z.uuid().nullable(),
-  body: z.string().trim().min(1).max(50_000)
+  body: z.string().min(1).max(50_000).refine(value => value.trim().length > 0, "Output cannot be blank.")
 });
 export type CaseArtifactSave = z.infer<typeof CaseArtifactSaveSchema>;
+/** One selected region of an existing saved output; impact is calculated in main. */
+export const CaseArtifactEditPreviewInputSchema = z.strictObject({
+  id: z.string().min(1).max(64),
+  baseVersionId: z.uuid(),
+  baseSha256: z.string().regex(/^[a-f0-9]{64}$/i),
+  selectionStart: z.number().int().min(0).max(50_000),
+  selectionEnd: z.number().int().min(0).max(50_000),
+  replacement: z.string().max(50_000)
+});
+export type CaseArtifactEditPreviewInput = z.infer<typeof CaseArtifactEditPreviewInputSchema>;
+export interface CaseArtifactEditReview {
+  readonly token: string;
+  readonly expiresAt: number;
+  readonly caseId: string;
+  readonly baseVersionId: string;
+  readonly baseSha256: string;
+  readonly newBody: string;
+  readonly preview: {
+    readonly affectedScope: { readonly start: number; readonly end: number };
+    readonly userSuppliedScopeLabel: string | null;
+    readonly codeUnits: { readonly before: number; readonly after: number; readonly delta: number; readonly totalBefore: number; readonly totalAfter: number };
+    readonly lines: { readonly delta: number; readonly totalBefore: number; readonly totalAfter: number; readonly selectedLines: number; readonly replacementLines: number };
+    readonly excerpts: { readonly before: string; readonly after: string };
+    readonly unchangedPrefix: { readonly length: number; readonly sha256: string };
+    readonly unchangedSuffix: { readonly length: number; readonly sha256: string };
+    readonly expectedSha256: string;
+  };
+}
 export interface CaseArtifactVersion {
   readonly id: string;
   readonly revision: number;
@@ -351,6 +388,12 @@ export const DaemonRequestSchema = z.discriminatedUnion("type", [
   z.strictObject({
     protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
     requestId: IdSchema,
+    type: z.literal("automation.workflow.save-review-bound"),
+    payload: AutomationReviewBoundWorkflowInputSchema
+  }),
+  z.strictObject({
+    protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
+    requestId: IdSchema,
     type: z.literal("automation.memory.save"),
     payload: AutomationMemoryDocumentSaveInputSchema
   }),
@@ -414,6 +457,48 @@ export const DaemonRequestSchema = z.discriminatedUnion("type", [
     requestId: IdSchema,
     type: z.literal("automation.run.action"),
     payload: AutomationRunActionInputSchema
+  }),
+  z.strictObject({
+    protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
+    requestId: IdSchema,
+    type: z.literal("automation.host-review.describe"),
+    payload: AutomationPendingHostReviewInputSchema
+  }),
+  /**
+   * Private main-to-daemon transport for review-bound graph Host attempt reservation.
+   *
+   * Private main-to-daemon transport only.
+   * Do NOT add a renderer-facing IPC route for reserve/bind/reconcile or a caller-supplied completed flag.
+   */
+  z.strictObject({
+    protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
+    requestId: IdSchema,
+    type: z.literal("automation.host-attempt.reserve"),
+    payload: AutomationHostReserveAttemptInputSchema
+  }),
+  /**
+   * Private main-to-daemon transport for review-bound graph Host operation binding.
+   *
+   * Private main-to-daemon transport only.
+   * Do NOT add a renderer-facing IPC route for reserve/bind/reconcile or a caller-supplied completed flag.
+   */
+  z.strictObject({
+    protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
+    requestId: IdSchema,
+    type: z.literal("automation.host-attempt.bind"),
+    payload: AutomationHostBindOperationInputSchema
+  }),
+  /**
+   * Private main-to-daemon transport for review-bound graph Host terminal reconciliation.
+   *
+   * Private main-to-daemon transport only.
+   * Only main-process WorkstationHost may invoke this after reading proven Book terminal evidence.
+   */
+  z.strictObject({
+    protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
+    requestId: IdSchema,
+    type: z.literal("automation.host-attempt.reconcile"),
+    payload: AutomationHostReconcileTerminalInputSchema
   }),
   z.object({
     protocolVersion: z.literal(DAEMON_PROTOCOL_VERSION),
@@ -1644,6 +1729,22 @@ export interface CaseRoom {
   readonly exports: readonly CaseArtifactExport[];
 }
 
+/** Read-only provenance projection; no artifact body is returned. */
+export interface CaseArtifactLineageEntry {
+  readonly id: string;
+  readonly versionId: string;
+  readonly revision: number;
+  readonly sha256: string;
+  readonly previousVersionId: string | null;
+  readonly sourceTurnId: string | null;
+  readonly sourceSeat: string | null;
+  readonly sourceKind: "verbatim" | "finding" | "receipt" | "compacted" | null;
+  readonly source: { readonly id: string; readonly seat: string; readonly kind: "verbatim" | "finding" | "receipt" | "compacted" } | null;
+  readonly acceptedAt: number | null;
+  readonly status: "verified" | "unverified";
+  readonly reason: string | null;
+}
+
 export interface DesktopBridge {
   localShortcuts: {
     begin(input: { kind: LocalShortcutKind }): Promise<{ handle: string }>;
@@ -1655,14 +1756,15 @@ export interface DesktopBridge {
   };
   runtimes: {
     discover(): Promise<RuntimeDescriptor[]>;
-    chat(request: LocalChatRequest): Promise<LocalChatResult>;
-    cancel(operationId: string): Promise<{ cancelled: boolean }>;
   };
   automations: {
     snapshot(): Promise<AutomationWorkspaceSnapshot>;
     saveAgent(input: AutomationAgentSaveInput): Promise<AutomationAgent>;
     saveWorkflow(
       input: AutomationWorkflowSaveInput
+    ): Promise<AutomationWorkflow>;
+    saveReviewBoundWorkflow(
+      input: AutomationReviewBoundWorkflowInput
     ): Promise<AutomationWorkflow>;
     saveMemory(
       input: AutomationMemoryDocumentSaveInput
@@ -1810,6 +1912,9 @@ export interface DesktopBridge {
      * hand-written brief goes through, and folders it names that were not
      * granted are dropped. Nothing reaches the roster until a person saves.
      */
+    draftHistory(): Promise<{ count: number; unfinished: number; oldestAt: number | null;
+      newestAt: number | null; reviewSha256: string }>;
+    forgetDraftHistory(input: { reviewSha256: string; confirmed: true }): Promise<{ removed: number }>;
     draft(input: { handle: string; sentence: string }): Promise<{
       ok: boolean;
       draft: {
@@ -2066,6 +2171,9 @@ export interface DesktopBridge {
     }): Promise<{ deal: Deal | null; said: string }>;
   };
   cases: {
+    artifactLineage(input: { caseId: string }): Promise<readonly CaseArtifactLineageEntry[]>;
+    previewArtifactEdit(input: CaseArtifactEditPreviewInput): Promise<CaseArtifactEditReview>;
+    applyArtifactEdit(input: { token: string }): Promise<CaseRoom>;
     /**
      * Every case, most recently active first.
      *

@@ -4,9 +4,21 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import type { DatabaseSync } from "node:sqlite";
+import {
+  GovernedProjectMemoryCommandSchema,
+  type GovernedProjectMemoryView
+} from "@cadrane/contracts";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import { learnFrom, STALE_AGE_MS, type Learned } from "./project-memory.js";
 import { createAgentSourceOwners } from "../agents/source-owner.js";
+import {
+  proposeProjectMemory as bookProposeProjectMemory,
+  reviewProjectMemory as bookReviewProjectMemory,
+  forgetProjectMemory as bookForgetProjectMemory,
+  listProjectMemory as bookListProjectMemory,
+  projectMemoryEpoch as bookProjectMemoryEpoch
+} from "./project-memory-book.js";
 
 export const MAX_PROJECT_FACTS = 2_000;
 export const MAX_PROJECT_MEMORY_BYTES = 512 * 1024;
@@ -81,6 +93,9 @@ export interface ProjectMemoryResult {
 export interface InstallMemoryOptions {
   readonly assertTrusted: (event: IpcMainInvokeEvent) => void;
   readonly folder: () => string;
+  readonly book?: () => DatabaseSync;
+  readonly principalFor?: (event: IpcMainInvokeEvent) => string;
+  readonly beforeMutation?: (projectId: string) => void;
 }
 
 export const ProjectIdSchema = z
@@ -650,4 +665,86 @@ export function installProjectMemory(options: InstallMemoryOptions): void {
       return result;
     }
   );
+
+  if (options.book && options.principalFor && options.beforeMutation) {
+    const getBook = options.book;
+    const principalFor = options.principalFor;
+    const beforeMutation = options.beforeMutation;
+
+    ipcMain.handle(
+      IPC_CHANNELS.workstationMemoryGoverned,
+      async (event, input: unknown): Promise<GovernedProjectMemoryView> => {
+        options.assertTrusted(event);
+        const owner = ownerFor(event);
+
+        const command = GovernedProjectMemoryCommandSchema.parse(input);
+        const principal = principalFor(event);
+        if (!principal || typeof principal !== "string" || principal.trim().length === 0) {
+          throw new Error("A valid principal identity is required.");
+        }
+
+        const db = getBook();
+
+        if (command.action === "read") {
+          const items = bookListProjectMemory(db, command.projectId);
+          const epoch = bookProjectMemoryEpoch(db, command.projectId);
+
+          options.assertTrusted(event);
+          if (ownerFor(event) !== owner) {
+            throw new Error("This window changed while accessing project memory.");
+          }
+
+          return { projectId: command.projectId, epoch, items };
+        }
+
+        options.assertTrusted(event);
+        if (ownerFor(event) !== owner) {
+          throw new Error("This window changed while accessing project memory.");
+        }
+
+        beforeMutation(command.projectId);
+
+        if (command.action === "propose") {
+          bookProposeProjectMemory(db, {
+            projectId: command.projectId,
+            ...(command.id !== undefined ? { id: command.id } : {}),
+            ...(command.expectedRevision !== undefined ? { expectedRevision: command.expectedRevision } : {}),
+            kind: command.kind,
+            text: command.text,
+            ...(command.sourceRefs !== undefined ? { sourceRefs: command.sourceRefs } : {}),
+            ...(command.roleTags !== undefined ? { roleTags: command.roleTags } : {}),
+            actorId: principal
+          });
+        } else if (command.action === "review") {
+          bookReviewProjectMemory(db, {
+            projectId: command.projectId,
+            id: command.id,
+            expectedRevision: command.expectedRevision,
+            decision: command.decision,
+            actorId: principal,
+            ...(command.roleTags !== undefined ? { roleTags: command.roleTags } : {}),
+            ...(command.reason !== undefined ? { reason: command.reason } : {})
+          });
+        } else if (command.action === "forget") {
+          bookForgetProjectMemory(db, {
+            projectId: command.projectId,
+            id: command.id,
+            expectedRevision: command.expectedRevision,
+            actorId: principal,
+            ...(command.reason !== undefined ? { reason: command.reason } : {})
+          });
+        }
+
+        const items = bookListProjectMemory(db, command.projectId);
+        const epoch = bookProjectMemoryEpoch(db, command.projectId);
+
+        options.assertTrusted(event);
+        if (ownerFor(event) !== owner) {
+          throw new Error("This window changed while accessing project memory.");
+        }
+
+        return { projectId: command.projectId, epoch, items };
+      }
+    );
+  }
 }

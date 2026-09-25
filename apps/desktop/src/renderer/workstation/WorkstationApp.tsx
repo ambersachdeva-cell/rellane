@@ -7,6 +7,7 @@ import { RichText } from "../RichText.js";
 import { RellaneMark } from "../components/RellaneMark.js";
 import { checkBundledModel } from "../bundled-model-readiness.js";
 import { ArtifactEditor, type EditorDraft } from "./ArtifactEditor.js";
+import { loadArtifactDraft, removeArtifactDraft, saveArtifactDraft } from "./artifact-drafts.js";
 import { Icon, IconButton, Modal, ProviderGlyph, type IconName } from "./ui.js";
 import { ReviewPacket } from "./ReviewPacket.js";
 import { summariseToolReview } from "./tool-review.js";
@@ -47,13 +48,11 @@ import { AgentLibraryPanel } from "./AgentLibraryPanel.js";
 import { AgentEditor } from "./AgentEditor.js";
 import { KnowledgePanel } from "./KnowledgePanel.js";
 import { ConnectorsPanel } from "./ConnectorsPanel.js";
-import { splitForCrew } from "./crew-split.js";
-import { composeSeatBrief } from "./crew-seat-brief.js";
-import { composeRefinePrompt } from "./crew-refine.js";
+import { eligibleCrewIntegrationOwners, splitForCrew, withCrewIntegrationOwner } from "./crew-split.js";
 import { readAgent, checkAgentDraft } from "./agent-library.js";
-import type { CrewRunPollView, CrewPartInput } from "@cadrane/contracts";
+import type { CrewRunPollView } from "@cadrane/contracts";
 import type { AgentPollView, DispatchBoardView, PairingStatusView, PublishPreviewView, PublishFormatView } from "@cadrane/contracts";
-import type { ProjectMemoryView, ResearchRunView, WatchView, WorkstationChangesView } from "@cadrane/contracts";
+import type { GovernedProjectMemoryCommand, GovernedProjectMemoryItem, GovernedProjectMemoryView, ProjectMemoryView, ResearchRunView, WatchView, WorkstationChangesView } from "@cadrane/contracts";
 import { ResearchPanel } from "./ResearchPanel.js";
 import { MemoryPanel, type Learned as LearnedForPanel } from "./MemoryPanel.js";
 import { ChangesPanel } from "./ChangesPanel.js";
@@ -70,6 +69,9 @@ import { onboardingView } from "./onboarding-path.js";
 import { availableActions, matchActions, type ActionId } from "./quick-actions.js";
 import { presentProposal, proposalKey, shouldOffer, type DismissalRecord, type ProposalLike } from "./routine-proposal.js";
 import { WorkroomCanvas } from "./WorkroomCanvas.js";
+import { StudioWorkspace, type StudioStage } from "./StudioWorkspace.js";
+import { ProjectWorkspaceSwitcher } from "./ProjectWorkspaceSwitcher.js";
+import { WorkOverview } from "./WorkOverview.js";
 import "./workstation.css";
 import "./workstation-panels.css";
 
@@ -203,9 +205,20 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState(initialDraft.error);
   const [review, setReview] = useState<WorkstationReview | null>(null);
+  const [dispatchReview, setDispatchReview] = useState<Awaited<ReturnType<WorkstationBridge["dispatchPrepare"]>> | null>(null);
+  const [agentReview, setAgentReview] = useState<Awaited<ReturnType<WorkstationBridge["agentPrepare"]>> | null>(null);
+  const [crewReview, setCrewReview] = useState<Awaited<ReturnType<WorkstationBridge["crewPrepare"]>> | null>(null);
+  const [researchReview, setResearchReview] = useState<Awaited<ReturnType<WorkstationBridge["researchPrepare"]>> | null>(null);
+  const [crewModelPicker, setCrewModelPicker] = useState(false);
+  const [crewModelIds, setCrewModelIds] = useState<Record<string, string>>({});
+  const [crewRoles, setCrewRoles] = useState<Record<string, string>>({});
+  const [crewExpectedOutputs, setCrewExpectedOutputs] = useState<Record<string, string>>({});
+  const [crewIntegrationOwner, setCrewIntegrationOwner] = useState("");
   const [filePreview, setFilePreview] = useState<CaseSourcePreview | null>(null);
   const [editor, setEditor] = useState<EditorDraft | null>(null);
   const [savedBody, setSavedBody] = useState("");
+  const [studioOpen, setStudioOpen] = useState(false);
+  const [studioStage, setStudioStage] = useState<StudioStage>("direction");
   const [localModels, setLocalModels] = useState<readonly RuntimeModel[]>([]);
   const [checkingLocal, setCheckingLocal] = useState(false);
   const [localOperation, setLocalOperation] = useState<string | null>(null);
@@ -227,6 +240,12 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   const seenText = useRef(new Map<string, string>());
   const [agentRunId, setAgentRunId] = useState<string | null>(null);
   const [agentGoal, setAgentGoal] = useState("");
+  const [agentExpectedOutput, setAgentExpectedOutput] = useState("");
+  const [selectedSavedAgent, setSelectedSavedAgent] = useState<{
+    readonly id: string;
+    readonly origin: "bundled" | "user";
+    readonly revision: string;
+  } | null>(null);
   const [agentPoll, setAgentPoll] = useState<AgentPollView | null>(null);
   const [dispatchRunId, setDispatchRunId] = useState<string | null>(null);
   const [dispatchBoard, setDispatchBoard] = useState<DispatchBoardView | null>(null);
@@ -237,6 +256,14 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   const [researchRunId, setResearchRunId] = useState<string | null>(null);
   const [researchRun, setResearchRun] = useState<ResearchRunView | null>(null);
   const [memory, setMemory] = useState<ProjectMemoryView | null>(null);
+  const [governedMemory, setGovernedMemory] = useState<GovernedProjectMemoryView | null>(null);
+  const [governedLoading, setGovernedLoading] = useState(false);
+  const [governedError, setGovernedError] = useState<string | null>(null);
+  const [memoryDraftsByProject, setMemoryDraftsByProject] = useState<
+    Record<string, { kind: GovernedProjectMemoryItem["kind"]; text: string; id?: string; expectedRevision?: number }>
+  >({});
+  const memoryReqSeq = useRef(0);
+  const memoryProjectIdRef = useRef<string | null>(null);
   const [changes, setChanges] = useState<WorkstationChangesView | null>(null);
   const [changeDiff, setChangeDiff] = useState<{ readonly relativePath: string; readonly before: string; readonly after: string } | null>(null);
   const [restoring, setRestoring] = useState<string | null>(null);
@@ -252,8 +279,9 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   const [crewRunId, setCrewRunId] = useState<string | null>(null);
   const [crewRun, setCrewRun] = useState<CrewRunPollView | null>(null);
   const [crewAnswers, setCrewAnswers] = useState<readonly { readonly partId: string; readonly text: string }[]>([]);
-  const [agents, setAgents] = useState<readonly { readonly id: string; readonly origin: "bundled" | "mine"; readonly markdown: string; readonly updatedAt: number }[]>([]);
+  const [agents, setAgents] = useState<Awaited<ReturnType<WorkstationBridge["agentsList"]>>["agents"]>([]);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
+  const [editingAgentOrigin, setEditingAgentOrigin] = useState<"bundled" | "user">("user");
   const [agentDraft, setAgentDraft] = useState("");
   const [agentSavedAt, setAgentSavedAt] = useState<number | null>(null);
   const [phoneLink, setPhoneLink] = useState<TelegramLink>({ state: "off" });
@@ -277,9 +305,62 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   const currentId = room?.case?.id;
   const draftKey = currentId ?? `new:${newProjectId ?? "personal"}`;
   const project = continuity.projects.find(value => value.id === (currentId ? continuity.links.find(link => link.caseId === currentId)?.projectId : newProjectId));
+  const currentProjectId = project?.id ?? null;
+  useEffect(() => {
+    if (memoryProjectIdRef.current !== currentProjectId) {
+      memoryProjectIdRef.current = currentProjectId;
+      setMemory(null);
+      setGovernedMemory(null);
+      setGovernedError(null);
+      const reqSeq = ++memoryReqSeq.current;
+      if (panel === "memory" || studioOpen) {
+        setPanelBusy(true);
+        if (currentProjectId) {
+          setGovernedLoading(true);
+        }
+        void (async () => {
+          try {
+            const [legacyResult, governedResult] = await Promise.allSettled([
+              host().memoryRead({ projectId: currentProjectId ?? "personal" }),
+              currentProjectId
+                ? (async () => {
+                    const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+                    if (typeof bridge.memoryGoverned !== "function") {
+                      throw new Error("Canonical project memory is unavailable.");
+                    }
+                    return bridge.memoryGoverned({ action: "read", projectId: currentProjectId });
+                  })()
+                : Promise.resolve(null)
+            ]);
+            if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === currentProjectId) {
+              if (legacyResult.status === "fulfilled") {
+                setMemory(legacyResult.value);
+              } else {
+                setMemory(null);
+                setNotice(problem(legacyResult.reason));
+              }
+              if (currentProjectId) {
+                if (governedResult.status === "fulfilled" && governedResult.value) {
+                  setGovernedMemory(governedResult.value);
+                } else if (governedResult.status === "rejected") {
+                  setGovernedMemory(null);
+                  setGovernedError(problem(governedResult.reason));
+                }
+              }
+            }
+          } finally {
+            if (memoryReqSeq.current === reqSeq) {
+              setPanelBusy(false);
+              setGovernedLoading(false);
+            }
+          }
+        })();
+      }
+    }
+  }, [currentProjectId, panel, studioOpen]);
   const lastRequest = room?.turns.filter(turn => turn.kind === "verbatim" && turn.seat === "owner").at(-1);
   const running = (status !== null && ACTIVE.has(status.status)) || localOperation !== null;
-  const dirty = editor !== null && (editor.body !== savedBody || editor.baseVersionId === null);
+  const dirty = editor !== null && editor.body.trim().length > 0 && (editor.body !== savedBody || editor.baseVersionId === null);
   const pickedProvider = providers.find(value => value.id === providerId);
   const openCases = cases.filter(value => !value.closedAt);
   const label = providerId === "local" ? "On this Mac" : pickedProvider?.label ?? LABELS[providerId];
@@ -424,7 +505,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       if (typeof id !== "string") return;
       drafts.current.delete(id); choices.current.delete(id);
       if (roomRef.current?.case?.id === id) {
-        setRoom(null); setDraft(drafts.current.get("new:personal") ?? ""); setSelected([]); setWorkspace(null); setEditor(null); setStatus(null);
+        setRoom(null); setDraft(drafts.current.get("new:personal") ?? ""); setSelected([]); setWorkspace(null); setEditor(null); setStudioOpen(false); setStatus(null);
         setNewProjectId(null);
       }
       void refreshCases().catch(error => message(problem(error)));
@@ -443,7 +524,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     let saved;
     try { saved = readComposerDraft(localStorage, key); }
     catch { message("That draft could not be read. Your current work is still here."); return; }
-    setRoom(null); setStatus(null); setEditor(null); setPanel(null); setSelected([]); setWorkspace(null); setLocalOperation(null); setEnableTools(false);
+    setRoom(null); setStatus(null); setEditor(null); setStudioOpen(false); setPanel(null); setSelected([]); setWorkspace(null); setLocalOperation(null); setEnableTools(false);
     setNewProjectId(projectId); setDraft(drafts.current.get(key) ?? saved?.text ?? ""); setNotice(""); conversationScroll.latest();
     requestAnimationFrame(() => composer.current?.focus());
   }
@@ -453,7 +534,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     try {
       const [next, lastSession] = await Promise.all([api().cases.read({ id }), host().state({ caseId: id })]);
       const saved = readComposerDraft(localStorage, id);
-      setRoom(next); setStatus(null); setPanel(null); setEditor(null); setDraft(drafts.current.get(id) ?? saved?.text ?? ""); setNotice(""); setLocalOperation(null);
+      setRoom(next); setStatus(null); setPanel(null); setEditor(null); setStudioOpen(false); setDraft(drafts.current.get(id) ?? saved?.text ?? ""); setNotice(""); setLocalOperation(null);
       const choice = choices.current.get(id);
       const previousAI = choice?.ai ?? previousWorkModel(next.turns, lastSession?.caseId === id ? lastSession : null);
       if (previousAI) { setProviderId(previousAI.providerId); setModelId(previousAI.modelId); }
@@ -461,7 +542,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       setSelected((choice?.selected ?? saved?.selected ?? []).filter(id => available.has(id)));
       setWorkspace(choice?.workspace ?? null);
       conversationScroll.latest();
-      if (openOutput && next.artifacts[0]) { const value = next.artifacts[0]; setEditor({ body: value.body, sourceTurnId: value.sourceTurnId, baseVersionId: value.id }); setSavedBody(value.body); }
+      if (openOutput && next.artifacts[0]) { const value = next.artifacts[0]; const recovered = loadArtifactDraft(id); setEditor(recovered.status === "loaded" ? recovered.draft : { body: value.body, sourceTurnId: value.sourceTurnId, baseVersionId: value.id }); setSavedBody(value.body); }
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
   }
@@ -546,7 +627,8 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
           void refreshCases().catch(error => message(problem(error)));
         }).catch(error => { setDraft(previous => previous || prompt); message(problem(error)); }).finally(() => setLocalOperation(null));
       } else {
-        setReview(await host().prepare({ caseId: value.case.id, providerId, ...(modelId ? { modelId } : {}), prompt: draft, sourceTurnIds: [...sourceIds], ...(workspace ? { workspaceId: workspace.id } : {}), ...(providerId === "codex" && enableTools ? { enableTools: true } : {}) }));
+        if (!modelId.trim()) throw new Error("Choose a model for this connection before reviewing.");
+        setReview(await host().prepare({ caseId: value.case.id, providerId, modelId: modelId.trim(), prompt: draft, sourceTurnIds: [...sourceIds], ...(workspace ? { workspaceId: workspace.id } : {}), ...(providerId === "codex" && enableTools ? { enableTools: true } : {}) }));
       }
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
@@ -579,12 +661,46 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   function openEditor(body: string, sourceTurnId: string | null) {
     if (dirty) { message("Save or close your current output before opening another."); return; }
     const latest = room?.artifacts[0];
-    setEditor({ body, sourceTurnId, baseVersionId: latest?.id ?? null }); setSavedBody(latest?.body ?? "");
+    const recovered = room?.case ? loadArtifactDraft(room.case.id) : null;
+    setEditor(recovered?.status === "loaded" ? recovered.draft : { body, sourceTurnId, baseVersionId: latest?.id ?? null }); setSavedBody(latest?.body ?? "");
+    if (recovered?.status === "loaded") message("Recovered your unfinished output draft.");
+  }
+  function openStudio() {
+    if (!room?.case) return;
+    if (!editor) {
+      const latest = room.artifacts[0];
+      const recovered = loadArtifactDraft(room.case.id);
+      setEditor(recovered.status === "loaded" ? recovered.draft : { body: latest?.body ?? "", sourceTurnId: latest?.sourceTurnId ?? null, baseVersionId: latest?.id ?? null });
+      setSavedBody(latest?.body ?? "");
+      if (recovered.status === "loaded") message("Recovered your unfinished output draft.");
+    }
+    setStudioStage("direction");
+    setStudioOpen(true);
+    if (!project) return;
+    const targetProjectId = project.id;
+    memoryProjectIdRef.current = targetProjectId;
+    const reqSeq = ++memoryReqSeq.current;
+    setGovernedLoading(true);
+    setGovernedError(null);
+    void host().memoryGoverned({ action: "read", projectId: targetProjectId }).then(value => {
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) setGovernedMemory(value);
+    }).catch(error => {
+      if (memoryReqSeq.current === reqSeq) setGovernedError(problem(error));
+    }).finally(() => {
+      if (memoryReqSeq.current === reqSeq) setGovernedLoading(false);
+    });
   }
   function closeEditor() { if (dirty) setPanel("discard"); else setEditor(null); }
-  function savedOutput(next: CaseRoom) {
+  function keepOutputDraftAndClose() {
+    if (!currentId || !editor) return;
+    const saved = saveArtifactDraft(currentId, editor);
+    if (!saved.success) { message(saved.error); return; }
+    setEditor(null);
+    setPanel(null);
+  }
+  function savedOutput(next: CaseRoom, updatedDraft: EditorDraft) {
     setRoom(next); const latest = next.artifacts[0];
-    if (latest) { setEditor({ body: latest.body, sourceTurnId: latest.sourceTurnId, baseVersionId: latest.id }); setSavedBody(latest.body); }
+    if (latest) { setEditor(updatedDraft); setSavedBody(latest.body); }
   }
   async function loadLibrary() {
     setPanel("library"); setLibraryLoading(true);
@@ -635,7 +751,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     } finally { try { await refreshContinuity(); } finally { setBusy(false); } }
   }
   function showProjects(id: string | null = null) {
-    if (!canNavigate()) return; setProjectPanelId(id); setPanel("projects");
+    setProjectPanelId(id); setPanel("projects");
   }
   function saveRequestAsRoutine() {
     if (!currentId || !lastRequest || !canNavigate()) return;
@@ -675,11 +791,23 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     if (!currentId) { message("Open a piece of work first — the answer is written into it."); return; }
     const question = draft.trim();
     if (question.length === 0) { message("Type what you want looked up, then press Look it up."); return; }
+    if (providerId === "local" || pickedProvider?.state !== "detected" || !modelId.trim()) {
+      message("Choose a subscription connection and its model before reviewing research."); return;
+    }
+    if (selected.length === 0) { message("Select at least one saved source for this research."); return; }
     setPanel("research"); setPanelBusy(true); setResearchRun(null);
     try {
-      const started = await host().researchStart({ caseId: currentId, question, depth: "thorough" });
-      setResearchRunId(started.runId);
-      setDraft("");
+      setResearchReview(await host().researchPrepare({ caseId: currentId, question,
+        providerId, modelId: modelId.trim(), sourceTurnIds: [...selected], depth: "quick" }));
+    } catch (error) { setResearchRunId(null); message(problem(error)); }
+    finally { setPanelBusy(false); }
+  }
+  async function startReviewedResearch() {
+    if (researchReview === null) return;
+    setPanelBusy(true);
+    try {
+      const started = await host().researchStart({ token: researchReview.token });
+      setResearchReview(null); setResearchRunId(started.runId); setDraft("");
       setResearchRun(await host().researchPoll({ runId: started.runId }));
     } catch (error) { setResearchRunId(null); message(problem(error)); }
     finally { setPanelBusy(false); }
@@ -726,20 +854,210 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
 
   async function openMemory() {
     setPanel("memory"); setPanelBusy(true);
-    try { setMemory(await host().memoryRead({ projectId: project?.id ?? "personal" })); }
-    catch (error) { setMemory(null); message(problem(error)); }
-    finally { setPanelBusy(false); }
+    const targetProjectId = project?.id ?? null;
+    memoryProjectIdRef.current = targetProjectId;
+    setMemory(null);
+    setGovernedMemory(null);
+    setGovernedError(null);
+    const reqSeq = ++memoryReqSeq.current;
+    if (targetProjectId) {
+      setGovernedLoading(true);
+    }
+    try {
+      const [legacyResult, governedResult] = await Promise.allSettled([
+        host().memoryRead({ projectId: targetProjectId ?? "personal" }),
+        targetProjectId
+          ? (async () => {
+              const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+              if (typeof bridge.memoryGoverned !== "function") {
+                throw new Error("Canonical project memory is unavailable.");
+              }
+              return bridge.memoryGoverned({ action: "read", projectId: targetProjectId });
+            })()
+          : Promise.resolve(null)
+      ]);
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        if (legacyResult.status === "fulfilled") {
+          setMemory(legacyResult.value);
+        } else {
+          setMemory(null);
+          message(problem(legacyResult.reason));
+        }
+        if (targetProjectId) {
+          if (governedResult.status === "fulfilled" && governedResult.value) {
+            setGovernedMemory(governedResult.value);
+          } else if (governedResult.status === "rejected") {
+            setGovernedMemory(null);
+            setGovernedError(problem(governedResult.reason));
+          }
+        }
+      }
+    } finally {
+      if (memoryReqSeq.current === reqSeq) {
+        setPanelBusy(false);
+        setGovernedLoading(false);
+      }
+    }
+  }
+  const reloadGovernedMemory = useCallback(async () => {
+    if (!project?.id) return;
+    const targetProjectId = project.id;
+    const reqSeq = ++memoryReqSeq.current;
+    setGovernedLoading(true);
+    setGovernedError(null);
+    try {
+      const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+      if (typeof bridge.memoryGoverned !== "function") {
+        throw new Error("Canonical project memory is unavailable.");
+      }
+      const view = await bridge.memoryGoverned({ action: "read", projectId: targetProjectId });
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedMemory(view);
+      }
+    } catch (err) {
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedError(problem(err));
+      }
+    } finally {
+      if (memoryReqSeq.current === reqSeq) {
+        setGovernedLoading(false);
+      }
+    }
+  }, [project?.id]);
+  async function proposeGovernedMemory(input: {
+    kind: GovernedProjectMemoryItem["kind"];
+    text: string;
+    id?: string;
+    expectedRevision?: number;
+  }) {
+    if (!project?.id) {
+      message("Select a project first to propose approved memory.");
+      return;
+    }
+    setGovernedLoading(true);
+    setGovernedError(null);
+    const targetProjectId = project.id;
+    const reqSeq = ++memoryReqSeq.current;
+    try {
+      const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+      if (typeof bridge.memoryGoverned !== "function") {
+        throw new Error("Canonical project memory is unavailable.");
+      }
+      const updated = await bridge.memoryGoverned({
+        action: "propose",
+        projectId: targetProjectId,
+        kind: input.kind,
+        text: input.text,
+        ...(input.id ? { id: input.id } : {}),
+        ...(input.expectedRevision !== undefined ? { expectedRevision: input.expectedRevision } : {})
+      });
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedMemory(updated);
+      }
+    } catch (err) {
+      const msg = problem(err);
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedError(msg);
+      }
+      throw err;
+    } finally {
+      if (memoryReqSeq.current === reqSeq) {
+        setGovernedLoading(false);
+      }
+    }
+  }
+  async function reviewGovernedMemory(
+    id: string,
+    expectedRevision: number,
+    decision: "approve" | "reject",
+    reason?: string
+  ) {
+    if (!project?.id) return;
+    setGovernedLoading(true);
+    setGovernedError(null);
+    const targetProjectId = project.id;
+    const reqSeq = ++memoryReqSeq.current;
+    try {
+      const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+      if (typeof bridge.memoryGoverned !== "function") {
+        throw new Error("Canonical project memory is unavailable.");
+      }
+      const updated = await bridge.memoryGoverned({
+        action: "review",
+        projectId: targetProjectId,
+        id,
+        expectedRevision,
+        decision,
+        ...(reason ? { reason } : {})
+      });
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedMemory(updated);
+      }
+    } catch (err) {
+      const msg = problem(err);
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedError(msg);
+      }
+      throw err;
+    } finally {
+      if (memoryReqSeq.current === reqSeq) {
+        setGovernedLoading(false);
+      }
+    }
+  }
+  async function forgetGovernedMemory(
+    id: string,
+    expectedRevision: number,
+    reason?: string
+  ) {
+    if (!project?.id) return;
+    setGovernedLoading(true);
+    setGovernedError(null);
+    const targetProjectId = project.id;
+    const reqSeq = ++memoryReqSeq.current;
+    try {
+      const bridge = host() as unknown as { memoryGoverned?: (cmd: GovernedProjectMemoryCommand) => Promise<GovernedProjectMemoryView> };
+      if (typeof bridge.memoryGoverned !== "function") {
+        throw new Error("Canonical project memory is unavailable.");
+      }
+      const updated = await bridge.memoryGoverned({
+        action: "forget",
+        projectId: targetProjectId,
+        id,
+        expectedRevision,
+        ...(reason ? { reason } : {})
+      });
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedMemory(updated);
+      }
+    } catch (err) {
+      const msg = problem(err);
+      if (memoryReqSeq.current === reqSeq && memoryProjectIdRef.current === targetProjectId) {
+        setGovernedError(msg);
+      }
+      throw err;
+    } finally {
+      if (memoryReqSeq.current === reqSeq) {
+        setGovernedLoading(false);
+      }
+    }
   }
   async function setMemoryFlag(id: string, flag: { readonly pinned?: boolean; readonly hidden?: boolean }) {
     setPanelBusy(true);
-    try { setMemory(await host().memorySet({ projectId: project?.id ?? "personal", id, ...flag })); }
-    catch (error) { message(problem(error)); }
+    const targetProjectId = project?.id ?? "personal";
+    try {
+      const res = await host().memorySet({ projectId: targetProjectId, id, ...flag });
+      if ((project?.id ?? "personal") === targetProjectId) setMemory(res);
+    } catch (error) { message(problem(error)); }
     finally { setPanelBusy(false); }
   }
   async function forgetMemory(id: string) {
     setPanelBusy(true);
-    try { setMemory(await host().memoryForget({ projectId: project?.id ?? "personal", id })); }
-    catch (error) { message(problem(error)); }
+    const targetProjectId = project?.id ?? "personal";
+    try {
+      const res = await host().memoryForget({ projectId: targetProjectId, id });
+      if ((project?.id ?? "personal") === targetProjectId) setMemory(res);
+    } catch (error) { message(problem(error)); }
     finally { setPanelBusy(false); }
   }
 
@@ -1344,12 +1662,33 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
   async function startAgent() {
     const goal = agentGoal.trim();
     if (!goal) { message("Say what you want it to work through, then start it."); return; }
+    if (providerId === "local" || pickedProvider?.state !== "detected" || !modelId.trim()) {
+      message("Choose a subscription connection and its model before reviewing this agent run."); return;
+    }
+    if (selectedSavedAgent !== null && !agentExpectedOutput.trim()) {
+      message("Say what the saved agent should produce before reviewing this run."); return;
+    }
     setBusy(true);
     try {
       const { value, sourceIds } = await ensureRoom();
       if (!value.case) throw new Error("The work could not be opened.");
-      const started = await host().agentStart({ caseId: value.case.id, goal, sourceTurnIds: [...sourceIds] });
-      setAgentRunId(started.runId); setAgentPoll(null); setDraft("");
+      setAgentReview(await host().agentPrepare({ caseId: value.case.id, goal,
+        providerId, modelId: modelId.trim(), sourceTurnIds: [...sourceIds],
+        ...(selectedSavedAgent ? { savedAgent: {
+          id: selectedSavedAgent.id, origin: selectedSavedAgent.origin,
+          expectedRevision: selectedSavedAgent.revision,
+          expectedOutput: agentExpectedOutput.trim(), requestedToolScopes: ["none"]
+        } } : {}) }));
+    } catch (error) { message(problem(error)); }
+    finally { setBusy(false); }
+  }
+  async function startReviewedAgent() {
+    if (agentReview === null) return;
+    setBusy(true);
+    try {
+      const started = await host().agentStart({ token: agentReview.token });
+      setAgentReview(null); setAgentRunId(started.runId); setAgentPoll(null); setDraft("");
+      setSelectedSavedAgent(null); setAgentExpectedOutput("");
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
   }
@@ -1359,12 +1698,21 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     catch (error) { message(problem(error)); }
   }
 
-  async function startDispatch(brief: string, providerIds: readonly string[]) {
+  async function prepareDispatch(brief: string, selections: readonly { readonly providerId: string; readonly modelId: string }[]) {
     setBusy(true);
     try {
       const { value, sourceIds } = await ensureRoom();
       if (!value.case) throw new Error("The work could not be opened.");
-      const started = await host().dispatchStart({ caseId: value.case.id, brief, providerIds, sourceTurnIds: [...sourceIds] });
+      setDispatchReview(await host().dispatchPrepare({ caseId: value.case.id, brief, selections, sourceTurnIds: [...sourceIds] }));
+    } catch (error) { message(problem(error)); }
+    finally { setBusy(false); }
+  }
+  async function startDispatch() {
+    if (dispatchReview === null) return;
+    setBusy(true);
+    try {
+      const started = await host().dispatchStart({ token: dispatchReview.token });
+      setDispatchReview(null);
       setDispatchRunId(started.runId); setDispatchBoard(null); setAnswers([]); setComparison(null);
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
@@ -1474,49 +1822,58 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     return () => { disposed = true; clearTimeout(timer); };
   }, [panel, crewRunId, currentId, message]);
 
-  /**
-   * Sending to several bots. The split is reviewed first, like everything else.
-   */
+  /** A selected model for each Crew seat is required before any review is prepared. */
   async function sendToCrew() {
     if (crewSplit.refusedBecause !== null) { message(crewSplit.refusedBecause); return; }
+    if (!crewSplit.parts.some(part => part.id === crewIntegrationOwner)) {
+      message("Choose which Crew part owns the final result before reviewing this run.");
+      return;
+    }
+    for (const part of crewSplit.parts) {
+      const seat = providers.find(one => one.id === part.seatId);
+      if (seat?.state !== "detected" || !crewModelIds[part.seatId]?.trim()) {
+        message(`Choose a model for ${part.seatLabel} before reviewing this Crew run.`);
+        return;
+      }
+      if (!crewRoles[part.id]?.trim() || !crewExpectedOutputs[part.id]?.trim()) {
+        message(`Name the role and expected output for ${part.title} before reviewing this Crew run.`);
+        return;
+      }
+    }
     setBusy(true);
     try {
       const { value, sourceIds } = await ensureRoom();
       if (!value.case) throw new Error("The work could not be opened.");
-      const chosen = sources.filter(turn => sourceIds.includes(turn.id))
-        .map(turn => ({ id: turn.id, label: contextLabel(turn), text: turn.body }));
-      const parts: CrewPartInput[] = crewSplit.parts.map(part => {
-        const brief = composeSeatBrief({
-          myPart: { title: part.title, prompt: part.prompt },
-          otherParts: crewSplit.parts.filter(other => other.id !== part.id)
-            .map(other => ({ title: other.title, seatLabel: other.seatLabel })),
-          wholeRequest: draft.trim(),
-          sources: chosen,
-          agentInstructions: null,
-          maxChars: 120_000
-        });
-        const refine = composeRefinePrompt({
-          part,
-          ownAnswer: "",
-          others: crewSplit.parts.filter(other => other.id !== part.id)
-            .map(other => ({ partId: other.id, seatLabel: other.seatLabel, title: other.title, answer: "" })),
-          sharedMemory: [],
-          maxChars: 60_000
-        });
-        return {
-          id: part.id,
-          title: part.title,
-          prompt: brief.refusedBecause === null ? brief.prompt : part.prompt,
-          seatId: part.seatId,
-          seatLabel: part.seatLabel,
-          dependsOn: [...part.dependsOn],
-          ...(refine.skip ? {} : { refinePrompt: refine.prompt })
-        };
-      });
-      const started = await host().crewStart({
-        caseId: value.case.id, request: draft.trim(), parts, sourceTurnIds: [...sourceIds]
-      });
-      setCrewRunId(started.runId); setCrewRun(null); setCrewAnswers([]); setDraft(""); setPanel("crew");
+      const parts = withCrewIntegrationOwner(crewSplit.parts, crewIntegrationOwner).map(part => ({
+        id: part.id, title: part.title, role: crewRoles[part.id]!.trim(),
+        work: part.prompt, expectedOutput: crewExpectedOutputs[part.id]!.trim(),
+        providerId: part.seatId, modelId: crewModelIds[part.seatId]!.trim(),
+        seatLabel: part.seatLabel, dependsOn: [...part.dependsOn],
+        sourceTurnIds: [...sourceIds]
+      }));
+      setCrewReview(await host().crewPrepare({
+        caseId: value.case.id, request: draft.trim(), integrationOwner: crewIntegrationOwner,
+        parts, sourceTurnIds: [...sourceIds]
+      }));
+      setCrewModelPicker(false);
+    } catch (error) { message(problem(error)); }
+    finally { setBusy(false); }
+  }
+  async function prepareCrewContinuation() {
+    if (crewRunId === null) return;
+    setBusy(true);
+    try { setCrewReview(await host().crewPrepare({ runId: crewRunId })); }
+    catch (error) { message(problem(error)); }
+    finally { setBusy(false); }
+  }
+  async function startReviewedCrew() {
+    if (crewReview === null) return;
+    setBusy(true);
+    try {
+      const started = await host().crewStart({ token: crewReview.token });
+      setCrewReview(null); setCrewRunId(started.runId); setCrewAnswers([]);
+      setDraft(""); setPanel("crew");
+      setCrewRun(await host().crewPoll({ runId: started.runId }));
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
   }
@@ -1584,20 +1941,37 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     try { const result = await host().agentsList(); setAgents(result.agents); }
     catch (error) { message(problem(error)); }
   }
-  function openAgent(id: string) {
-    const found = agents.find(agent => agent.id === id);
+  function openAgent(key: string) {
+    const found = agents.find(agent => `${agent.origin}:${agent.id}` === key);
     if (!found) { message("That agent is no longer here."); return; }
-    setEditingAgentId(id); setAgentDraft(found.markdown); setAgentSavedAt(null); setPanel("agent-edit");
+    setEditingAgentId(found.id); setEditingAgentOrigin(found.origin);
+    setAgentDraft(found.markdown); setAgentSavedAt(null); setPanel("agent-edit");
   }
   async function saveAgent() {
     if (editingAgentId === null) return;
     setBusy(true);
     try {
       const saved = await host().agentSave({ id: editingAgentId, markdown: agentDraft });
-      setEditingAgentId(saved.id); setAgentSavedAt(saved.updatedAt);
+      setEditingAgentId(saved.id); setEditingAgentOrigin("user"); setAgentSavedAt(saved.updatedAt);
       const result = await host().agentsList(); setAgents(result.agents);
     } catch (error) { message(problem(error)); }
     finally { setBusy(false); }
+  }
+  function runSavedAgent() {
+    const found = agents.find(agent => agent.id === editingAgentId &&
+      agent.origin === editingAgentOrigin && agent.markdown === agentDraft);
+    if (!found) { message("Save this agent before running it, so the review can pin its exact version."); return; }
+    setSelectedSavedAgent({ id: found.id, origin: found.origin, revision: found.revision });
+    setAgentExpectedOutput("");
+    setAgentReview(null); setAgentRunId(null); setAgentPoll(null);
+    if (!draft.trim()) {
+      setPanel(null);
+      composer.current?.focus();
+      message("Type this agent's task, then choose Agent to review its full instructions.");
+      return;
+    }
+    setAgentGoal(draft.trim());
+    setPanel("agent");
   }
   async function deleteAgent(id: string) {
     try { await host().agentDelete({ id }); const result = await host().agentsList(); setAgents(result.agents); }
@@ -1670,11 +2044,54 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       <footer className="ws-sidebar-footer"><button className="ws-connection-link" onClick={() => setPanel("models")}><span className="ws-connection-dots"><i /><i /><i /></span><span>Your AI connections</span><Icon name="chevron" size={14} /></button><button className="ws-connection-link" onClick={() => setPanel("outside")}><span className="ws-connection-dots"><i /><i /></span><span>Outside tools</span><Icon name="chevron" size={14} /></button><button className="ws-connection-link" onClick={() => void openPhone()}><span className="ws-connection-dots"><i /></span><span>Connect your phone</span><Icon name="chevron" size={14} /></button><button className="ws-connection-link" onClick={() => void openWhatsApp()}><span className="ws-connection-dots"><i /></span><span>WhatsApp business</span><Icon name="chevron" size={14} /></button><div className="ws-profile-row"><span className="ws-avatar">P</span><div><strong>Personal workspace</strong><span>Saved on this Mac</span></div><IconButton icon={theme === "light" ? "moon" : "sun"} label={`Switch to ${theme === "light" ? "dark" : "light"} appearance`} onClick={changeAppearance} /></div><div className="ws-footer-links"><button onClick={() => { if (canNavigate()) onTools(); }}>More tools<Icon name="chevron" size={12} /></button><button onClick={() => setPanel("help")}><Icon name="help" size={14} />How it works</button></div></footer>
     </aside>
     <main className="ws-main">
-      <header className="ws-titlebar"><div className="ws-breadcrumb"><Icon name="folder" size={15} /><span>{project?.title ?? workspace?.label ?? "Personal workspace"}</span><span className="ws-breadcrumb-slash">/</span><strong>{room?.case?.title ?? "New work"}</strong>{currentId ? <IconButton icon="edit" label="Rename work" onClick={editWorkTitle} disabled={busy || running} /> : null}</div><div className="ws-title-actions">{lastRequest && currentId ? <button className="ws-button ws-button--small" onClick={saveRequestAsRoutine} disabled={busy || running}><Icon name="grid" size={15} />Save routine</button> : null}{currentId ? <button className="ws-button ws-button--small" onClick={() => void openFiles()} title="Browse this work’s folder and see what changed"><Icon name="folder" size={15} />Files</button> : null}{currentId ? <button className="ws-button ws-button--small" onClick={() => void openChanges()} title="What the last session changed in this folder, and putting a file back"><Icon name="refresh" size={15} />Changes</button> : null}{currentId ? <button className="ws-button ws-button--small" onClick={() => void startResearch()} disabled={busy || running} title="Go and read, rather than answer from memory"><Icon name="search" size={15} />Look it up</button> : null}{currentId ? <button className="ws-button ws-button--small" onClick={() => void openInsights()} title="Who did what, and what you can hand over"><Icon name="shield" size={15} />Record</button> : null}{currentId ? <button className="ws-button ws-button--small" onClick={() => setPanel("pairing")} title="Carry on from your phone"><Icon name="device" size={15} />Phone</button> : null}{room?.artifacts[0] && !editor ? <button className="ws-button ws-button--small" onClick={() => { const output = room.artifacts[0]!; openEditor(output.body, output.sourceTurnId); }}><Icon name="panel" size={15} />Output</button> : null}{room?.artifacts[0] ? <button className="ws-button ws-button--small" onClick={() => setPanel("publish")} title="Publish as document, slides or Typst"><Icon name="export" size={15} />Publish</button> : null}<IconButton icon="help" label="How this workspace works" onClick={() => setPanel("help")} /></div></header>
+      <header className="ws-titlebar"><div className="ws-breadcrumb"><Icon name="folder" size={15} /><span>{project?.title ?? workspace?.label ?? "Personal workspace"}</span><span className="ws-breadcrumb-slash">/</span><strong>{room?.case?.title ?? "New work"}</strong>{currentId ? <IconButton icon="edit" label="Rename work" onClick={editWorkTitle} disabled={busy || running} /> : null}</div><div className="ws-title-actions">
+        {currentId && !studioOpen ? <button className="ws-button ws-button--small ws-button--primary" onClick={openStudio}><Icon name="file" size={15} />Studio</button> : null}
+        <details className="ws-title-more" onKeyDown={event => { if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); } }} onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.open = false; }} onClick={event => { if ((event.target as HTMLElement).closest("button")) event.currentTarget.open = false; }}>
+          <summary className="ws-button ws-button--small">More <Icon name="chevron" size={13} /></summary>
+          <div className="ws-title-more-menu" aria-label="More work actions">
+            {lastRequest && currentId ? <button onClick={saveRequestAsRoutine} disabled={busy || running}>Save routine</button> : null}
+            {currentId ? <button onClick={() => void openFiles()}>Files</button> : null}
+            {currentId ? <button onClick={() => void openChanges()}>Changes</button> : null}
+            {currentId ? <button onClick={() => void startResearch()} disabled={busy || running}>Look it up</button> : null}
+            {currentId ? <button onClick={() => void openInsights()}>Record</button> : null}
+            {currentId ? <button onClick={() => setPanel("pairing")}>Phone</button> : null}
+            {!studioOpen && room?.artifacts[0] && !editor ? <button onClick={() => { const output = room.artifacts[0]!; openEditor(output.body, output.sourceTurnId); }}>Output</button> : null}
+            {!studioOpen && room?.artifacts[0] ? <button onClick={() => setPanel("publish")}>Publish</button> : null}
+            <button onClick={() => setPanel("help")}>How this workspace works</button>
+          </div>
+        </details>
+      </div></header>
+      <div className="ws-work-switcher"><ProjectWorkspaceSwitcher
+        projects={continuity.projects}
+        projectId={project?.id ?? null}
+        workspace={workspace}
+        disabled={busy || running}
+        onSelectProject={id => { if (id !== (project?.id ?? null)) newWork(id); }}
+        onManageProjects={() => showProjects(project?.id ?? null)}
+        onChooseWorkspace={() => void chooseWorkspace()}
+        onUseDefaultWorkspace={() => setWorkspace(null)}
+      /></div>
       <div className="ws-work-area">
-        <section className={`ws-conversation ${empty ? "ws-conversation--empty" : ""}`} aria-label="Conversation">
+        {studioOpen && currentId && room ? <StudioWorkspace
+          caseId={currentId}
+          title={room.case?.title ?? "This work"}
+          stage={studioStage}
+          onStageChange={setStudioStage}
+          onClose={() => setStudioOpen(false)}
+          direction={<div className="ws-studio-direction">
+            <p className="ws-eyebrow">This work</p><h3>Set the direction</h3>
+            <p>{room.case?.question || "Shape the document for this work."}</p>
+            <section><h4>Project brief</h4>{project ? <><p>{project.brief}</p><button className="ws-button ws-button--small" onClick={() => showProjects(project.id)}>Edit project brief</button></> : <><p>No project is linked to this work.</p><button className="ws-button ws-button--small" onClick={() => showProjects()}>Choose a project</button></>}</section>
+            <section><h4>Approved project memory</h4>{governedLoading ? <p>Loading approved memory…</p> : governedError ? <p role="alert">{governedError}</p> : (governedMemory?.items.filter(item => item.active?.state === "approved" && item.kind !== "finding") ?? []).length ? <ul>{governedMemory?.items.filter(item => item.active?.state === "approved" && item.kind !== "finding").map(item => <li key={item.id}><strong>{item.kind[0]?.toUpperCase()}{item.kind.slice(1)}</strong> {item.active?.text}</li>)}</ul> : <p>No approved instructions, decisions, or exclusions are linked to this project.</p>}<button className="ws-button ws-button--small" onClick={() => void openMemory()}>Review project memory</button></section>
+            {governedMemory?.items.some(item => item.kind === "finding" && item.active?.state === "approved") ? <section><h4>Findings to consider</h4><p>Findings are reference material, not instructions.</p><ul>{governedMemory.items.filter(item => item.kind === "finding" && item.active?.state === "approved").map(item => <li key={item.id}>{item.active?.text}</li>)}</ul></section> : null}
+            <button className="ws-button ws-button--primary" onClick={() => setStudioStage("design")}>Design document</button>
+          </div>}
+          editingSurface={editor ? <ArtifactEditor key={currentId} room={room} stage={studioStage} selectedSourceIds={selected} draft={editor} setDraft={setEditor} savedBody={savedBody} onSaved={savedOutput} onClose={() => setStudioOpen(false)} onMessage={message} /> : null}
+          resources={<div className="ws-studio-resource-list"><p>{selected.length} selected for this work</p><button className="ws-button ws-button--small" onClick={() => setPanel("sources")}>Choose sources</button><button className="ws-button ws-button--small" disabled={busy || running || Boolean(room.case?.closedAt)} onClick={() => void addFile()}>Add file</button>{sources.length ? <ul>{sources.map(turn => <li key={turn.id}><label><input type="checkbox" checked={selected.includes(turn.id)} disabled={running || Boolean(room.case?.closedAt) || (!selected.includes(turn.id) && selected.length >= 20)} onChange={event => setSelected(previous => event.target.checked ? [...previous, turn.id] : previous.filter(id => id !== turn.id))} />{contextLabel(turn)}</label><button onClick={() => setCitationId(turn.id)}>Read</button></li>)}</ul> : <p>No saved sources in this work yet.</p>}</div>}
+        /> : <>
+        <section className={`ws-conversation ${empty ? "ws-conversation--empty" : ""} ${empty && !currentId ? "ws-conversation--overview" : ""}`} aria-label="Conversation">
           <div ref={conversationScroll.viewport} className="ws-conversation-scroll" tabIndex={0} role="region" aria-label="Conversation messages" onScroll={conversationScroll.onScroll} onWheel={conversationScroll.onWheel} onPointerDown={conversationScroll.onPointerDown} onKeyDown={conversationScroll.onKeyDown} onTouchMove={conversationScroll.onTouchMove}>
-            {empty ? <div className="ws-welcome"><div className="ws-orbit-mark" aria-hidden="true"><span /><span /><span /><i /></div><p className="ws-welcome-kicker">A little space. A lot of possibility.</p><h1>Where should we start?</h1><p className="ws-welcome-description">Think with your AIs. Work with your files.<br />Make something you can use.</p></div> : <div className="ws-messages">{turns.map(turn => {
+            {empty ? !currentId ? <WorkOverview cases={cases} sessions={liveRows} loading={loading} error={null} busy={busy} onOpenWork={id => void openWork(id)} onOpenSession={id => void goToSession(id)} onStop={id => void stopOne(id)} onNewWork={() => composer.current?.focus()} onRetry={() => void refreshCases().catch(error => message(problem(error)))} onAllSessions={() => setPanel("sessions")} /> : <div className="ws-welcome"><div className="ws-orbit-mark" aria-hidden="true"><span /><span /><span /><i /></div><p className="ws-welcome-kicker">A little space. A lot of possibility.</p><h1>Where should we start?</h1><p className="ws-welcome-description">Think with your AIs. Work with your files.<br />Make something you can use.</p></div> : <div className="ws-messages">{turns.map(turn => {
               const thoughtMatch = /<thought>([\s\S]*?)<\/thought>/i.exec(turn.body);
               const thoughtContent = thoughtMatch ? thoughtMatch[1]?.trim() : null;
               const cleanBody = turn.body.replace(/<thought>[\s\S]*?<\/thought>/gi, "").trim();
@@ -1714,7 +2131,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
               <span>Next</span>{guide.nextAction}
               <button onClick={dismissGuide} aria-label="Stop showing what is next">Hide</button>
             </p> : null}
-            {empty ? <div className="ws-starters">
+            {empty && (currentId || (cases.length === 0 && liveRows.length === 0)) ? <div className="ws-starters">
               {starters.map(starter => <button
                 key={starter.id === "routine" ? `routine:${starter.routineId ?? ""}` : starter.id}
                 className={`ws-starter ws-starter--${starter.icon}`}
@@ -1730,6 +2147,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
           </div>
         </section>
         {editor && room ? <ArtifactEditor key={room.case?.id ?? "new"} room={room} selectedSourceIds={selected} draft={editor} setDraft={setEditor} savedBody={savedBody} onSaved={savedOutput} onClose={closeEditor} onMessage={message} /> : null}
+        </>}
       </div>
     </main>
     {panel === "images" && currentId ? <ImagesPanel caseId={currentId} title={room?.case?.title ?? "This work"} onCreate={() => setPanel("creative")} bridge={host()} readOnly={Boolean(room?.case?.closedAt)} onClose={() => setPanel(null)} /> : null}
@@ -1740,7 +2158,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       chosen={crewSeats}
       onToggle={id => setCrewSeats(previous => previous.includes(id as WorkstationProviderId) ? previous.filter(one => one !== id) : [...previous, id as WorkstationProviderId])}
       onClear={() => setCrewSeats([])}
-      max={5} /><div className="ws-provider-list">{providers.map(value => <button key={value.id} className={`ws-provider-row ${providerId === value.id ? "is-selected" : ""}`} disabled={value.state !== "detected" || running} onClick={() => { setProviderId(value.id); setModelId(value.models[0]?.id ?? ""); setEnableTools(false); }}><ProviderGlyph family={value.family} badge={value.id.match(/^gemini(\d)$/i)?.[1]} /><div><strong>{value.label}</strong><span>{value.state === "detected" ? "Subscription app found on this Mac" : value.detail}</span></div>{providerId === value.id ? <Icon name="check" /> : <span className="ws-badge">{value.state === "detected" ? "Detected" : "Unavailable"}</span>}</button>)}</div>{pickedProvider && providerId !== "local" ? <div className="ws-model-detail"><label>Model<select value={modelId} onChange={event => setModelId(event.target.value)} disabled={running}><option value="">Subscription default</option>{pickedProvider.models.map(value => <option key={value.id} value={value.id}>{value.label}</option>)}</select></label><details className="ws-connection-details"><summary>Connection details</summary><p>{pickedProvider.detail}</p></details><p>{pickedProvider.canApproveTools ? "Tool actions can ask for your approval here." : "This connection is for conversation and selected context. Tool actions may be unavailable."}</p></div> : null}<div className="ws-local-choice"><ProviderGlyph family="local" /><div><strong>Keep it on this Mac</strong><p>Use an installed local model for private questions and selected files.</p></div><button className="ws-button ws-button--small" disabled={checkingLocal} onClick={() => void checkLocal()}>{checkingLocal ? "Checking…" : "Check models"}</button></div>{localModels.map(value => <button className="ws-local-model" key={value.id} onClick={() => { setProviderId("local"); setModelId(value.id); setEnableTools(false); }} disabled={running}><span>{value.id}</span>{providerId === "local" && modelId === value.id ? <Icon name="check" /> : <span>Use locally</span>}</button>)}<footer className="ws-modal-footer"><span>Login and usage limits stay with each provider.</span><button className="ws-button ws-button--primary" onClick={() => setPanel(null)}>Done</button></footer></Modal> : null}
+      max={5} /><div className="ws-provider-list">{providers.map(value => <button key={value.id} className={`ws-provider-row ${providerId === value.id ? "is-selected" : ""}`} disabled={value.state !== "detected" || running} onClick={() => { setProviderId(value.id); setModelId(""); setEnableTools(false); }}><ProviderGlyph family={value.family} badge={value.id.match(/^gemini(\d)$/i)?.[1]} /><div><strong>{value.label}</strong><span>{value.state === "detected" ? "Subscription app found on this Mac" : value.detail}</span></div>{providerId === value.id ? <Icon name="check" /> : <span className="ws-badge">{value.state === "detected" ? "Detected" : "Unavailable"}</span>}</button>)}</div>{pickedProvider && providerId !== "local" ? <div className="ws-model-detail"><label>Model{providerId === "codex" ? <input value={modelId} onChange={event => setModelId(event.target.value)} disabled={running} placeholder="Enter a Codex model ID" /> : <select value={modelId} onChange={event => setModelId(event.target.value)} disabled={running}><option value="">Choose a model</option>{pickedProvider.models.map(value => <option key={value.id} value={value.id}>{value.label}</option>)}</select>}</label><details className="ws-connection-details"><summary>Connection details</summary><p>{pickedProvider.detail}</p></details><p>{pickedProvider.canApproveTools ? "Tool actions can ask for your approval here." : "This connection is for conversation and selected context. Tool actions may be unavailable."}</p></div> : null}<div className="ws-local-choice"><ProviderGlyph family="local" /><div><strong>Keep it on this Mac</strong><p>Use an installed local model for private questions and selected files.</p></div><button className="ws-button ws-button--small" disabled={checkingLocal} onClick={() => void checkLocal()}>{checkingLocal ? "Checking…" : "Check models"}</button></div>{localModels.map(value => <button className="ws-local-model" key={value.id} onClick={() => { setProviderId("local"); setModelId(value.id); setEnableTools(false); }} disabled={running}><span>{value.id}</span>{providerId === "local" && modelId === value.id ? <Icon name="check" /> : <span>Use locally</span>}</button>)}<footer className="ws-modal-footer"><span>Login and usage limits stay with each provider.</span><button className="ws-button ws-button--primary" onClick={() => setPanel(null)}>Done</button></footer></Modal> : null}
     {panel === "routines" ? <RoutinesPanel starters={routines} saved={continuity.routines} seed={routineSeed} onChoose={useRoutine} onSave={saveRoutine} onVersions={routineVersions} onClose={() => {setPanel(null);setRoutineSeed(null);}} /> : null}
     {panel === "projects" ? <ProjectsPanel projects={continuity.projects} links={continuity.links} cases={cases} initialId={projectPanelId} currentId={currentId} onSave={saveProject} onStart={id => newWork(id)} onOpen={id => void openWork(id)} onUse={useProjectBrief} onClose={() => setPanel(null)} /> : null}
     {panel === "search" ? <SearchPanel
@@ -1762,6 +2180,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       answers={crewAnswers}
       onStopPart={id => void stopCrewPart(id)}
       onStopAll={() => void stopCrew()}
+      onReviewNext={() => void prepareCrewContinuation()}
       onKeep={id => { const found = crewAnswers.find(a => a.partId === id); if (found) { setPanel(null); openEditor(found.text, null); } }}
       onClose={() => setPanel(null)}
       busy={busy} /> : null}
@@ -1775,8 +2194,14 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       sourceLabels={sources.filter(turn => selected.includes(turn.id)).map(turn => contextLabel(turn))}
       wholeJob={crewSplit.wholeJob}
       refusedBecause={crewSplit.refusedBecause}
-      estimatedCalls={crewSplit.parts.length * 2}
-      onSend={() => { setPanel(null); void sendToCrew(); }}
+      estimatedCalls={crewSplit.parts.length}
+      onSend={() => {
+        setCrewModelIds(providerId !== "local" && modelId.trim() ? { [providerId]: modelId.trim() } : {});
+        setCrewRoles(Object.fromEntries(crewSplit.parts.map(part => [part.id, part.title])));
+        setCrewExpectedOutputs({});
+        setCrewIntegrationOwner("");
+        setPanel(null); setCrewModelPicker(true);
+      }}
       onEditPart={() => message("Edit the request in the composer, then review the split again.")}
       onClose={() => setPanel(null)}
       busy={busy} /> : null}
@@ -1795,17 +2220,17 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       onTestMessage={() => void sendPhoneTest()}
       onClose={() => setPanel(null)} /> : null}
     {panel === "agents" ? <AgentLibraryPanel
-      agents={agents.map(agent => { const read = readAgent({ id: agent.id, origin: agent.origin, markdown: agent.markdown, updatedAt: agent.updatedAt }); return { id: agent.id, origin: agent.origin, name: read.name, summary: read.summary, updatedAt: agent.updatedAt }; })}
+      agents={agents.map(agent => { const origin = agent.origin === "user" ? "mine" : "bundled"; const read = readAgent({ id: agent.id, origin, markdown: agent.markdown, updatedAt: agent.updatedAt }); return { id: `${agent.origin}:${agent.id}`, origin, name: read.name, summary: read.summary, updatedAt: agent.updatedAt }; })}
       now={Date.now()}
       onOpen={openAgent}
-      onDuplicate={id => { const found = agents.find(a => a.id === id); if (found) { setEditingAgentId(`${id}-mine`); setAgentDraft(found.markdown); setAgentSavedAt(null); setPanel("agent-edit"); } }}
-      onDelete={id => void deleteAgent(id)}
-      onNew={() => { setEditingAgentId("my-agent"); setAgentDraft("# My agent\n\nWhat it should do, in your own words.\n"); setAgentSavedAt(null); setPanel("agent-edit"); }}
+      onDuplicate={key => { const found = agents.find(a => `${a.origin}:${a.id}` === key); if (found) { setEditingAgentId(`${found.id}-mine`); setEditingAgentOrigin("user"); setAgentDraft(found.markdown); setAgentSavedAt(null); setPanel("agent-edit"); } }}
+      onDelete={key => { const found = agents.find(a => `${a.origin}:${a.id}` === key); if (found?.origin === "user") void deleteAgent(found.id); }}
+      onNew={() => { setEditingAgentId("my-agent"); setEditingAgentOrigin("user"); setAgentDraft("# My agent\n\nWhat it should do, in your own words.\n"); setAgentSavedAt(null); setPanel("agent-edit"); }}
       onClose={() => setPanel(null)}
       busy={busy} /> : null}
     {panel === "agent-edit" && editingAgentId !== null ? <AgentEditor
       id={editingAgentId}
-      origin={agents.find(a => a.id === editingAgentId)?.origin ?? "mine"}
+      origin={editingAgentOrigin === "bundled" ? "bundled" : "mine"}
       markdown={agentDraft}
       check={checkAgentDraft(agentDraft)}
       saving={busy}
@@ -1813,7 +2238,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       now={Date.now()}
       onChange={setAgentDraft}
       onSave={() => void saveAgent()}
-      onRun={() => { setDraft(agentDraft.slice(0, 4000)); setPanel(null); composer.current?.focus(); }}
+      onRun={runSavedAgent}
       onClose={() => { setPanel("agents"); setEditingAgentId(null); }} /> : null}
     {panel === "knowledge" ? <KnowledgePanel
       seen={null}
@@ -1834,6 +2259,9 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       onRecheck={() => message("Checking from here is not wired yet.")}
       onClose={() => setPanel(null)} /> : null}
     {panel === "agent" ? <AgentRunPanel
+      savedAgentLabel={selectedSavedAgent?.id ?? null}
+      expectedOutput={agentExpectedOutput}
+      onExpectedOutputChange={(value) => { setAgentExpectedOutput(value); setAgentReview(null); }}
       plan={agentPlan}
       view={buildAgentRunView({
         runId: agentRunId ?? "",
@@ -1847,15 +2275,15 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       })}
       onStart={() => void startAgent()}
       onStop={() => void stopAgent()}
-      onCancel={() => { setPanel(null); setAgentRunId(null); }}
+      onCancel={() => { setPanel(null); setAgentRunId(null); setSelectedSavedAgent(null); setAgentExpectedOutput(""); }}
       onClose={() => setPanel(null)}
       busy={busy} /> : null}
     {panel === "dispatch" ? <DispatchPanel
-      providers={providers.map(value => ({ id: value.id, label: value.label, usable: value.state === "detected", detail: value.detail }))}
+      providers={providers.map(value => ({ id: value.id, label: value.label, usable: value.state === "detected", detail: value.detail, models: value.models }))}
       board={dispatchBoard}
       answers={answers}
       sourceCount={selected.length}
-      onSend={(brief, providerIds) => void startDispatch(brief, providerIds)}
+      onSend={(brief, selections) => void prepareDispatch(brief, selections)}
       onStopLane={id => void stopLane(id)}
       onStopAll={() => void stopAllLanes()}
       onCompare={compareNow}
@@ -1902,11 +2330,27 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       stale={(memory?.facts ?? []).filter(fact => !fact.pinned && (Date.now() - (Date.parse(fact.updatedAt) || 0)) >= MEMORY_STALE_MS).map(toPanelFact)}
       projectTitle={project?.title ?? "Personal workspace"}
       now={Date.now()}
-      busy={panelBusy}
+      busy={panelBusy || governedLoading}
       onPin={(id, pinned) => void setMemoryFlag(id, { pinned })}
       onHide={(id, hidden) => void setMemoryFlag(id, { hidden })}
       onForget={id => void forgetMemory(id)}
-      onClose={() => setPanel(null)} /> : null}
+      onClose={() => setPanel(null)}
+      projectId={project?.id ?? null}
+      governedView={governedMemory}
+      governedLoading={governedLoading}
+      governedError={governedError}
+      proposalDraft={memoryDraftsByProject[currentProjectId ?? "__no_project__"] ?? { kind: "instruction", text: "" }}
+      onProposalDraftChange={(draft) => {
+        setMemoryDraftsByProject((prev) => ({
+          ...prev,
+          [currentProjectId ?? "__no_project__"]: draft
+        }));
+      }}
+      onReload={reloadGovernedMemory}
+      onPropose={proposeGovernedMemory}
+      onReview={reviewGovernedMemory}
+      onForgetGoverned={forgetGovernedMemory}
+      onSelectProject={() => showProjects()} /> : null}
     {panel === "changes" ? <ChangesPanel
       changes={(changes?.changes ?? []).map(change => ({
         relativePath: change.relativePath,
@@ -1954,7 +2398,7 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
       onClose={() => setPanel(null)}
       busy={panelBusy} /> : null}
     {panel === "sessions" ? <SessionsPanel rows={liveRows} summary={fleet} onStop={id => void stopOne(id)} onOpen={id => void goToSession(id)} onClose={() => setPanel(null)} /> : null}
-    {panel === "crew" ? <CrewPanel board={board} onStart={id => { const seat = providers.find(value => value.id === id); setPanel(null); if (seat) { setProviderId(seat.id); setModelId(seat.models[0]?.id ?? ""); setEnableTools(false); } if (!room || turns.length === 0) newWork(); }} onOpen={id => void goToSession(id)} onClose={() => setPanel(null)} /> : null}
+    {panel === "crew" && crewRunId === null ? <CrewPanel board={board} onStart={id => { const seat = providers.find(value => value.id === id); setPanel(null); if (seat) { setProviderId(seat.id); setModelId(""); setEnableTools(false); } if (!room || turns.length === 0) newWork(); }} onOpen={id => void goToSession(id)} onClose={() => setPanel(null)} /> : null}
     {panel === "files" && currentId ? <FilesPanel listing={listing} preview={filePreviewText} change={fileDiff} onSelect={value => void selectFile(value)} onRefresh={() => void openFiles()} onReveal={value => void revealFile(value)} onClose={() => setPanel(null)} busy={panelBusy} /> : null}
     {panel === "data" && currentId ? <DataPanel table={table} result={tableResult} onQuery={spec => void runTableQuery(spec)} onUseAsContext={tableToDraft} onClose={() => setPanel(null)} busy={panelBusy} /> : null}
     {panel === "data" && tableResult ? <button className="ws-button ws-button--primary ws-chart-open" onClick={() => setPanel("chart")}><Icon name="grid" size={15} />Chart this</button> : null}
@@ -1967,9 +2411,56 @@ export function WorkstationApp({ onTools, active = true }: { onTools: () => void
     </Modal> : null}
     {panel === "insights" && currentId ? <ProjectInsights view={insightView} pack={pack} onPlanPack={() => void planPack()} onConfirmPack={() => void confirmPack()} onOpenWork={id => { setPanel(null); void openWork(id); }} onClose={() => setPanel(null)} busy={panelBusy} /> : null}
     {panel === "canvas" ? <WorkroomCanvas caseId={currentId ?? "draft"} title={room?.case?.title ?? "Workroom Canvas"} turns={room?.turns ?? []} onClose={() => setPanel(null)} /> : null}
-    {panel === "discard" ? <Modal title="Keep your changes?" onClose={() => setPanel(null)}><p className="ws-modal-description">This output has unsaved edits. Close this dialog to save a version, or discard only the edits in the editor.</p><footer className="ws-modal-footer"><button className="ws-button" onClick={() => { setEditor(null); setPanel(null); }}>Discard edits</button><button className="ws-button ws-button--primary" onClick={() => setPanel(null)}>Keep editing</button></footer></Modal> : null}
+    {panel === "discard" ? <Modal title="Keep your changes?" onClose={() => setPanel(null)}><p className="ws-modal-description">This output has unsaved edits. You can keep the local draft and return later, or discard it.</p><footer className="ws-modal-footer"><button className="ws-button" onClick={() => { if (currentId) removeArtifactDraft(currentId); setEditor(null); setPanel(null); }}>Discard edits</button><button className="ws-button" onClick={keepOutputDraftAndClose}>Keep draft and close</button><button className="ws-button ws-button--primary" onClick={() => setPanel(null)}>Keep editing</button></footer></Modal> : null}
     {citation ? <Modal title={contextLabel(citation)} eyebrow="Saved source" wide onClose={() => setCitationId(null)}><p className="ws-modal-description">The exact saved text behind this reference. Reading it sends nothing.</p><pre className="ws-source-preview">{citation.body}</pre></Modal> : null}
     {filePreview ? <Modal title={filePreview.fileName} eyebrow="Add a file to this work" wide onClose={() => { if (!busy) void cancelFile(); }}><div className="ws-review-facts"><span><Icon name="file" size={15} />{filePreview.format.toUpperCase()}</span><span>{filePreview.bytes.toLocaleString()} bytes</span><span>{filePreview.coverage}</span></div><pre className="ws-source-preview">{filePreview.text}</pre><footer className="ws-modal-footer"><span>This step saves the reviewed text locally.</span><button className="ws-button ws-button--primary" disabled={busy} onClick={() => void acceptFile()}>{busy ? "Adding…" : "Add to context"}</button></footer></Modal> : null}
+    {crewModelPicker ? <Modal title="Choose Crew models" eyebrow="One model per connection" wide onClose={() => { if (!busy) { setCrewModelPicker(false); setPanel("crew-plan"); } }}>
+      <p className="ws-modal-description">Choose the exact model each connection will use. The next screen shows every full request before anything starts.</p>
+      {Array.from(new Set(crewSplit.parts.map(part => part.seatId))).map(id => {
+        const seat = providers.find(one => one.id === id);
+        return <label key={id} className="ws-model-detail">{seat?.label ?? id}
+          <input value={crewModelIds[id] ?? ""} onChange={event => setCrewModelIds(previous => ({ ...previous, [id]: event.target.value }))}
+            list={`crew-models-${id}`} placeholder="Enter exact model ID" disabled={busy} />
+          <datalist id={`crew-models-${id}`}>{seat?.models.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}</datalist>
+        </label>;
+      })}
+      {crewSplit.parts.map(part => <section key={part.id}>
+        <h3>{part.title}</h3>
+        <label className="ws-model-detail">Role for this part<input value={crewRoles[part.id] ?? ""} onChange={event => setCrewRoles(previous => ({ ...previous, [part.id]: event.target.value }))} disabled={busy} /></label>
+        <label className="ws-model-detail">Expected output<input value={crewExpectedOutputs[part.id] ?? ""} onChange={event => setCrewExpectedOutputs(previous => ({ ...previous, [part.id]: event.target.value }))} placeholder="Describe the result this part must produce" disabled={busy} /></label>
+      </section>)}
+      <label className="ws-model-detail">Owner of the final result<select value={crewIntegrationOwner} onChange={event => setCrewIntegrationOwner(event.target.value)} disabled={busy}>
+        <option value="">Choose a part</option>
+        {crewSplit.parts.filter(part => eligibleCrewIntegrationOwners(crewSplit.parts).includes(part.id)).map(part => <option key={part.id} value={part.id}>{part.title}</option>)}
+      </select></label>
+      <footer className="ws-modal-footer"><button className="ws-button" disabled={busy} onClick={() => { setCrewModelPicker(false); setPanel("crew-plan"); }}>Back to plan</button><button className="ws-button ws-button--primary" disabled={busy || !crewIntegrationOwner || crewSplit.parts.some(part => !crewModelIds[part.seatId]?.trim() || !crewRoles[part.id]?.trim() || !crewExpectedOutputs[part.id]?.trim())} onClick={() => void sendToCrew()}>Review exact calls</button></footer>
+    </Modal> : null}
+    {agentReview ? <Modal title="Review Step Agent" eyebrow="Exact request" wide onClose={() => { if (!busy) setAgentReview(null); }}>
+      {agentReview.reviews.map((lane, index) => <section key={index}><h3>Step {index + 1} · {lane.providerLabel} · {lane.modelId}</h3><p>{lane.workspace.label}: {lane.workspace.path}</p><ReviewPacket raw={lane.contextPreview} /><p>Request fingerprint: <code>{lane.sourceHash}</code></p></section>)}
+      <p className="ws-modal-description">This connection may use native tools according to its own permissions. Approval prompts appear when supported.</p>
+      <footer className="ws-modal-footer"><button className="ws-button" disabled={busy} onClick={() => setAgentReview(null)}>Keep editing</button><button className="ws-button ws-button--primary" disabled={busy} onClick={() => void startReviewedAgent()}>Start reviewed Agent</button></footer>
+    </Modal> : null}
+    {crewReview ? <Modal title="Review Crew" eyebrow="Exact requests" wide onClose={() => { if (!busy) setCrewReview(null); }}>
+      {crewReview.reviews.map((lane, index) => <section key={`${lane.partId}-${index}`}><h3>{lane.title} · {lane.providerLabel} · {lane.modelId}</h3><p>Role: {lane.role} · Expected output: {lane.expectedOutput} · Final result owner: {lane.integrationOwner}</p><p>{lane.workspace.label}: {lane.workspace.path}</p><ReviewPacket raw={lane.contextPreview} /><p>Request fingerprint: <code>{lane.sourceHash}</code></p></section>)}
+      <p className="ws-modal-description">These parts run in order as dependencies allow. Later dependency packets require another review. Native tool access follows each connection’s permissions.</p>
+      <footer className="ws-modal-footer"><button className="ws-button" disabled={busy} onClick={() => setCrewReview(null)}>Keep editing</button><button className="ws-button ws-button--primary" disabled={busy} onClick={() => void startReviewedCrew()}>Start reviewed Crew parts</button></footer>
+    </Modal> : null}
+    {researchReview ? <Modal title="Review Research" eyebrow="Exact request" wide onClose={() => { if (!panelBusy) setResearchReview(null); }}>
+      <h3>{researchReview.review.providerLabel} · {researchReview.review.modelId}</h3><p>{researchReview.review.workspace.label}: {researchReview.review.workspace.path}</p>
+      <ReviewPacket raw={researchReview.review.contextPreview} /><p>Request fingerprint: <code>{researchReview.review.sourceHash}</code></p>
+      <p className="ws-modal-description">This connection may use native tools according to its own permissions. Approval prompts appear when supported.</p>
+      <footer className="ws-modal-footer"><button className="ws-button" disabled={panelBusy} onClick={() => setResearchReview(null)}>Keep editing</button><button className="ws-button ws-button--primary" disabled={panelBusy} onClick={() => void startReviewedResearch()}>Start reviewed Research</button></footer>
+    </Modal> : null}
+    {dispatchReview ? <Modal title="Review Compare" eyebrow="One call per selected connection" wide onClose={() => { if (!busy) setDispatchReview(null); }}>
+      <p className="ws-modal-description">These sessions run in order. Each connection receives the exact packet shown below in this work's folder.</p>
+      {dispatchReview.reviews.map((lane) => <section key={lane.providerId} aria-label={`${lane.providerLabel} review`}>
+        <h3>{lane.providerLabel} · {lane.modelId}</h3>
+        <p>{lane.workspace.label}: {lane.workspace.path}</p>
+        <ReviewPacket raw={lane.contextPreview} />
+        <p>Request fingerprint: <code>{lane.sourceHash}</code></p>
+      </section>)}
+      <footer className="ws-modal-footer"><button className="ws-button" disabled={busy} onClick={() => setDispatchReview(null)}>Keep editing</button><button className="ws-button ws-button--primary" disabled={busy} onClick={() => void startDispatch()}>{busy ? "Starting…" : `Send ${dispatchReview.reviews.length} reviewed calls`}</button></footer>
+    </Modal> : null}
     {review ? <Modal title={`Send to ${review.providerLabel}`} eyebrow="One last look" wide onClose={() => { if (!busy) setReview(null); }}><p className="ws-modal-description">This is the request and context your subscription will receive.</p><div className="ws-review-facts"><span><ProviderGlyph family={FALLBACK_FAMILY[review.providerId]} small />{review.modelId ?? "Subscription default"}</span><span><Icon name="file" size={15} />{review.sourceIds.length} selected {review.sourceIds.length === 1 ? "source" : "sources"}</span><span>{review.resumeSessionId ? "Continues this provider’s saved session" : "New native session"}</span>{toolSummary ? <span>{toolSummary.sessionLine}</span> : null}</div>{toolSummary ? <section className="ws-review-tools" aria-label="Tools this session may use"><h3>{toolSummary.heading}</h3><p className="ws-review-tools-reach">{toolSummary.reachLine}</p><ul className="ws-review-tools-list">{toolSummary.toolRows.map((row, index) => <li key={index}><strong>{row.label}</strong><span>{row.detail}</span></li>)}</ul>{toolSummary.skillNames.length ? <p className="ws-review-tools-skills">Bundled procedures it may read: {toolSummary.skillNames.join(", ")}.</p> : null}<ul className="ws-review-tools-sources">{toolSummary.sourceRows.map((row, index) => <li key={index}><span>{row.label}</span><span>{row.detail}</span></li>)}</ul><p className="ws-review-tools-total">{toolSummary.totalLine}</p></section> : null}<ReviewPacket raw={review.contextPreview} /><details className="ws-review-integrity"><summary>Request fingerprint</summary><code>{review.sourceHash}</code><p>This identifies the exact text being sent.</p></details><div className="ws-review-workspace"><Icon name="folder" /><div><strong>{review.workspace.label}</strong><p>{review.workspace.path}</p><span>{review.providerId === "claude" ? "Claude asks you before each text-file read or write in this folder." : review.providerId === "codex" ? "Codex can read and edit this folder, with minimal system files available for its tools. Access beyond that scope needs a separate approval." : "Tool access stays within the connection’s supported permissions."}</span></div></div><footer className="ws-modal-footer"><button className="ws-button" disabled={busy} onClick={() => setReview(null)}>Keep editing</button><button className="ws-button ws-button--primary" disabled={busy} onClick={() => void sendReviewed()}>{busy ? "Starting…" : `Send to ${review.providerLabel}`}<Icon name="arrow" size={15} /></button></footer></Modal> : null}
   </div>;
 }

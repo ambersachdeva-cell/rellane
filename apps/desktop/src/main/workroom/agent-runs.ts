@@ -12,6 +12,14 @@ export interface AgentWorkroom {
   readonly attemptId: string;
   readonly agentId: string;
   readonly agentName: string;
+  readonly requiredSourceTurnId: string | null;
+}
+
+/** Optional Host hooks run inside the existing Case start/finish transactions. */
+export interface AgentWorkroomHooks {
+  readonly attemptId: string;
+  onStart(room: AgentWorkroom): void;
+  onFinish(room: AgentWorkroom, result: AgentRunResult, answerTurnId: string | null): void;
 }
 
 /** A short label helps scanning; the full request is still saved verbatim. */
@@ -29,13 +37,13 @@ export function agentWorkroomTitle(name: string, question: string): string {
 /** A failed start rolls back the entire room and prevents the first read. */
 export function startAgentWorkroom(
   db: DatabaseSync, brief: AgentBrief, question: string, access: ResolvedBrief,
-  source?: AgentSourceSnapshot
+  source?: AgentSourceSnapshot, hooks?: AgentWorkroomHooks
 ): AgentWorkroom {
   const snapshot = JSON.stringify({ brief, allowedFolders: access.folders,
     allowedTools: access.capabilities, withheld: access.withheld }, null, 2);
   if (!question.trim() || question.length > 8_000 || snapshot.length > 50_000)
     throw new Error("This agent request or brief is too large to keep safely. Shorten it before running.");
-  const attemptId = randomUUID();
+  const attemptId = hooks?.attemptId ?? randomUUID();
   db.exec("BEGIN IMMEDIATE");
   try {
     const caseId = openCase(db, {
@@ -52,9 +60,11 @@ export function startAgentWorkroom(
         : "While it runs, use Stop on the Agents page. The receipt will list completed reads; original file contents are not archived here.",
       `Brief and access at the start:\n${snapshot}`
     ].join("\n") });
+    let requiredSourceTurnId: string | null = null;
     if (source) {
       const sourceId = appendTurn(db, caseId, { seat: `${CASE_SOURCE_SEAT_PREFIX}${source.fileName}`,
         kind: "verbatim", body: source.text });
+      requiredSourceTurnId = sourceId;
       appendTurn(db, caseId, { seat: "workroom", kind: "receipt", body: [
         `Required source snapshot selected by you for agent run ${attemptId}. Source turn: ${sourceId}.`,
         `File: ${source.fileName}. Format: ${source.format}. Bytes: ${source.bytes}.`,
@@ -63,8 +73,11 @@ export function startAgentWorkroom(
         "This captured text is the required input, not a live file reread. A saved start does not prove that a model received it or answered correctly."
       ].join("\n") });
     }
+    const room = { caseId, attemptId, agentId: brief.id, agentName: brief.name,
+      requiredSourceTurnId };
+    hooks?.onStart(room);
     db.exec("COMMIT");
-    return { caseId, attemptId, agentId: brief.id, agentName: brief.name };
+    return room;
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -74,7 +87,8 @@ export function startAgentWorkroom(
 /** No answer is saved on its own, no completion is implied by a start, and no
  * retry can append a second terminal result to the same attempt. */
 export function finishAgentWorkroom(
-  db: DatabaseSync, room: AgentWorkroom, result: AgentRunResult
+  db: DatabaseSync, room: AgentWorkroom, result: AgentRunResult,
+  hooks?: AgentWorkroomHooks
 ): void {
   const prefix = `Agent run ${room.attemptId}`;
   db.exec("BEGIN IMMEDIATE");
@@ -104,6 +118,7 @@ export function finishAgentWorkroom(
       answerId ? `Saved answer: ${answerId}. Review it in Your output before accepting or exporting. Nothing was automatically accepted.`
         : "No answer was accepted. Any retry is a new explicit request."
     ].join("\n") });
+    hooks?.onFinish(room, result, answerId);
     db.exec("COMMIT");
   } catch (error) {
     db.exec("ROLLBACK");

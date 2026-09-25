@@ -46,6 +46,14 @@ const ALLOWED_RUNTIME: Readonly<Record<string, string>> = {
   katex: "Models write LaTeX constantly and it was shown as backslashes. Rendered through katex's DOM API with `trust: false`, so no \\href or \\includegraphics in model output can become active content. Imported dynamically.",
   "fuse.js": "440 KB. The palette the owner reaches for most was a `.includes()` filter that failed on a single typo or a different word order. Typo tolerance and match positions are the whole feature.",
   mermaid: "Models answer process questions with diagrams and the owner was shown the source. Imported dynamically and only after a cheap structural check, initialised with `securityLevel: \"strict\"`, and it sanitises its own SVG with DOMPurify.",
+  lexical: "Structured, editable document drafts in Studio, with explicit save and preserved local draft state; pinned to one reviewed editor version.",
+  "@lexical/react": "React bindings for the Studio document editor and its controlled update, history, and rich-text plugins.",
+  "@lexical/rich-text": "Heading and quotation nodes for editable Studio documents instead of flattening them to plain text.",
+  "@lexical/list": "Editable ordered and unordered list nodes in Studio documents.",
+  "@lexical/link": "Editable link nodes in Studio documents, handled within the editor boundary.",
+  "@lexical/code": "Editable code blocks in Studio documents without a second editor runtime.",
+  "@lexical/markdown": "Imports and exports the Studio editor's Markdown representation without a hand-written converter.",
+  "cron-parser": "Pinned recurrence parser for bounded schedule preview and occurrence calculation, replacing ad hoc cron interpretation.",
   "@cadrane/contracts": "Workspace package in this repository, not third-party code.",
   "@cadrane/daemon": "Workspace package in this repository, not third-party code.",
   "@cadrane/runtime": "Workspace package in this repository, not third-party code."
@@ -137,9 +145,10 @@ describe("what the shipping tree is licensed under", () => {
   });
 
   it("contains no copyleft licence", async () => {
-    // Rellane uses a permissive license. Keep the shipping dependency budget
-    // explicit and preserve each upstream notice. Measured 2026-09-04:
-    // 337 packages, all permissive.
+    // Rellane is a private product that is meant to be sold. GPL or AGPL in the
+    // shipping tree is not a licensing footnote — it is a demand to publish the
+    // source of the thing being sold, and by the time it is noticed it is
+    // load-bearing. Measured 2026-09-04: 337 packages, all permissive.
     //
     // MPL-2.0 is deliberately allowed. It is file-level copyleft, so shipping an
     // unmodified copy carries no obligation over the rest of the app.

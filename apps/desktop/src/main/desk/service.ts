@@ -24,8 +24,8 @@ import type { DatabaseSync } from "node:sqlite";
 import { counts, outstanding, overdue, totalOwedPaise } from "../book/records.js";
 import { rupees } from "../book/money.js";
 import { glossary, glossaryPrompt } from "../glossary/terms.js";
-import { askEngine } from "../agents/ask.js";
-import { readEngineRoom } from "../subscription-brain/engine-room.js";
+import type { askEngine } from "../agents/ask.js";
+import type { readEngineRoom } from "../subscription-brain/engine-room.js";
 import { route, type BookAsk, type DeskRoute, type KnownAgent } from "./route.js";
 import { chaseMessage, upiLink, whatsappLink } from "../dispatch/upi.js";
 
@@ -245,51 +245,15 @@ export async function say(text: string, deps: DeskDeps): Promise<DeskAnswer> {
     };
   }
 
-  // Nothing cheaper could answer it, so this is the one that spends a call.
-  //
-  // Reading the room is inside the try as well. It was outside, so a failure
-  // there threw straight out of a function whose whole contract is that it never
-  // does — losing what somebody had typed.
-  let engine: { engineId: string; modelId: string } | null;
-  try {
-    engine = cheapest(await (deps.room ?? readEngineRoom)());
-  } catch {
-    return {
-      kind: "refused",
-      because: "",
-      said: "Rellane could not work out which engine to ask. Open Engines and see what it says there.",
-      open: null,
-      draft: null
-    };
-  }
-  if (engine === null) {
-    return {
-      kind: "refused",
-      because: "",
-      said: "No engine is connected, so there is nobody to ask. Open Engines and sign in to one, or add an API key.",
-      open: null,
-      draft: null
-    };
-  }
-
-  try {
-    const answer = await (deps.ask ?? askEngine)({
-      engineId: engine.engineId,
-      modelId: engine.modelId,
-      system: deskPrompt(deps.book),
-      prompt: said,
-      signal: AbortSignal.timeout(DESK_TIMEOUT_MS)
-    });
-    return { kind: "ask", because: "", said: answer.trim(), open: null, draft: null };
-  } catch (error) {
-    return {
-      kind: "refused",
-      because: "",
-      said: error instanceof Error ? error.message : "That could not be answered.",
-      open: null,
-      draft: null
-    };
-  }
+  // A free-form Desk sentence is not review of a provider, model, sources or
+  // outgoing packet. The Case workroom has the review path; Desk only routes.
+  return {
+    kind: "refused",
+    because: "",
+    said: "Open a case workroom to review the model and request before sending it. Nothing was sent.",
+    open: null,
+    draft: null
+  };
 }
 
 /**
@@ -369,22 +333,4 @@ function chase(party: string, deps: DeskDeps, at: number): DeskAnswer {
     open: null,
     draft: { to: party, text, whatsapp, pay: pay.ok ? pay.uri : null }
   };
-}
-
-/** The cheapest engine that is actually ready. Same rule the bill reader uses. */
-function cheapest(
-  room: Awaited<ReturnType<typeof readEngineRoom>>
-): { engineId: string; modelId: string } | null {
-  for (const tier of ["fast", "balanced", "frontier"] as const) {
-    for (const engine of room.engines) {
-      if (engine.state !== "ready") {
-        continue;
-      }
-      const model = engine.models.find((candidate) => candidate.tier === tier);
-      if (model !== undefined) {
-        return { engineId: engine.id, modelId: model.id };
-      }
-    }
-  }
-  return null;
 }

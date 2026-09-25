@@ -19,7 +19,9 @@ export type CrewPartState =
   | "refining"
   | "done"
   | "failed"
-  | "stopped";
+  | "stopped"
+  | "interrupted"
+  | "awaiting-review";
 
 export interface CrewPartView {
   readonly id: string;
@@ -46,7 +48,9 @@ export interface CrewRunView {
     | "reading-each-other"
     | "done"
     | "stopped"
-    | "failed";
+    | "failed"
+    | "interrupted"
+    | "awaiting-review";
   readonly headline: string;
   readonly canStop: boolean;
 }
@@ -70,6 +74,7 @@ export interface CrewRunPanelProps {
   readonly answers: readonly CrewRunAnswer[];
   readonly onStopPart: (partId: string) => void;
   readonly onStopAll: () => void;
+  readonly onReviewNext?: () => void;
   readonly onKeep: (partId: string) => void;
   readonly onClose: () => void;
   readonly busy: boolean;
@@ -89,6 +94,10 @@ function formatRound(round: CrewRunView["round"]): string {
       return "Stopped";
     case "failed":
       return "Failed";
+    case "interrupted":
+      return "Interrupted";
+    case "awaiting-review":
+      return "Awaiting review";
   }
 }
 
@@ -110,6 +119,10 @@ function formatState(state: CrewPartState): string {
       return "Failed";
     case "stopped":
       return "Stopped";
+    case "interrupted":
+      return "Interrupted";
+    case "awaiting-review":
+      return "Awaiting review";
   }
 }
 
@@ -186,6 +199,7 @@ export function CrewRunPanel({
   answers,
   onStopPart,
   onStopAll,
+  onReviewNext,
   onKeep,
   onClose,
   busy,
@@ -220,6 +234,9 @@ export function CrewRunPanel({
             ) : null}
           </div>
           <div className="ws-crew-header-actions">
+            {view.round === "awaiting-review" && onReviewNext ? <button
+              type="button" className="ws-crew-stop-all" onClick={onReviewNext} disabled={busy}
+            >Review next part</button> : null}
             <button
               type="button"
               className="ws-crew-stop-all"

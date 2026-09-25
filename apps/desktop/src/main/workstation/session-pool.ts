@@ -1,3 +1,5 @@
+import path from "node:path";
+
 export interface RunningSession {
   readonly operationId: string;
   readonly caseId: string;
@@ -20,6 +22,12 @@ export type PoolDecision =
 
 export const MAX_CONCURRENT_SESSIONS = 4;
 
+function workspacesOverlap(first: string, second: string): boolean {
+  const left = path.resolve(first);
+  const right = path.resolve(second);
+  return left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
+}
+
 function formatProvider(providerId: string): string {
   if (providerId.length === 0) {
     return "active";
@@ -34,9 +42,9 @@ export function admit(
 ): PoolDecision {
   void now;
 
-  // Two sessions targeting the same workspace would write concurrently and corrupt files.
+  // A parent and child folder share files as surely as two identical roots.
   if (request.workspacePath.trim().length > 0) {
-    const folderConflict = running.find((session) => session.workspacePath === request.workspacePath);
+    const folderConflict = running.find((session) => workspacesOverlap(session.workspacePath, request.workspacePath));
     if (folderConflict !== undefined) {
       return {
         allowed: false,

@@ -5,7 +5,13 @@ import {
   AutomationConnectorSchema,
   AutomationMemoryDocumentSchema,
   AutomationDryRunSchema,
+  AutomationHostAttemptIntentSchema,
+  AutomationHostBindOperationResultSchema,
+  AutomationHostReconcileTerminalResultSchema,
+  AutomationHostReserveAttemptResultSchema,
+  AutomationHostReviewDescriptorSchema,
   AutomationRunSnapshotSchema,
+  type AutomationRunSnapshot,
   AutomationSourceDocumentSchema,
   AutomationWorkflowSchema,
   AutomationWorkspaceSnapshotSchema,
@@ -56,6 +62,36 @@ import {
   EncryptedFileAutomationRepository
 } from "./automation-runtime.js";
 
+function extractAndValidateNestedRun(rawResult: object): AutomationRunSnapshot {
+  const runEntry = Object.entries(rawResult).find(([k]) => k === "run");
+  if (
+    runEntry === undefined ||
+    typeof runEntry[1] !== "object" ||
+    runEntry[1] === null
+  ) {
+    throw new RuntimeBoundaryError({
+      code: "RUNTIME_UNAVAILABLE",
+      message: "Automation runtime result must contain an object run property.",
+      retryable: false
+    });
+  }
+
+  const parsedRun = AutomationRunSnapshotSchema.parse(runEntry[1]);
+  if (
+    parsedRun.state === "completed" ||
+    parsedRun.state === "failed" ||
+    parsedRun.state === "cancelled"
+  ) {
+    throw new RuntimeBoundaryError({
+      code: "RUNTIME_UNAVAILABLE",
+      message: "Automation run is closed or cancelled.",
+      retryable: false
+    });
+  }
+
+  return parsedRun;
+}
+
 const MANAGED_MODEL_DIRECTORY = path.join(
   "local-intelligence",
   "managed-models"
@@ -91,6 +127,7 @@ export interface DaemonAutomationBoundary {
   snapshot(): Promise<unknown>;
   saveAgent(input: unknown): Promise<unknown>;
   saveWorkflow(input: unknown): Promise<unknown>;
+  saveReviewBoundWorkflow?(input: unknown): Promise<unknown>;
   saveMemory(input: unknown): Promise<unknown>;
   saveSource(input: unknown): Promise<unknown>;
   reviewArtifact(input: unknown): Promise<unknown>;
@@ -101,6 +138,10 @@ export interface DaemonAutomationBoundary {
   folderChanged(root: string): Promise<void>;
   start(input: unknown): Promise<unknown>;
   action(input: unknown): Promise<unknown>;
+  getPendingHostReviewDescriptor?(input: unknown): Promise<unknown>;
+  reserveHostAttempt?(input: unknown): Promise<unknown>;
+  bindHostOperation?(input: unknown): Promise<unknown>;
+  reconcileHostTerminal?(input: unknown): Promise<unknown>;
   shutdown(): Promise<void>;
 }
 
@@ -309,6 +350,24 @@ export function createDispatcherFromDependencies(
           return AutomationWorkflowSchema.parse(
             await automationRuntime.saveWorkflow(request.payload)
           );
+        case "automation.workflow.save-review-bound": {
+          if (
+            typeof automationRuntime.saveReviewBoundWorkflow !==
+            "function"
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Review-bound workflow saving is not available.",
+              retryable: false
+            });
+          }
+          return AutomationWorkflowSchema.parse(
+            await automationRuntime.saveReviewBoundWorkflow(
+              request.payload
+            )
+          );
+        }
         case "automation.memory.save":
           return AutomationMemoryDocumentSchema.parse(
             await automationRuntime.saveMemory(request.payload)
@@ -348,6 +407,405 @@ export function createDispatcherFromDependencies(
           return AutomationRunSnapshotSchema.parse(
             await automationRuntime.action(request.payload)
           );
+        case "automation.host-review.describe": {
+          if (
+            typeof automationRuntime.getPendingHostReviewDescriptor !==
+            "function"
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation host-review descriptor inspection is not available.",
+              retryable: false
+            });
+          }
+          return AutomationHostReviewDescriptorSchema.parse(
+            await automationRuntime.getPendingHostReviewDescriptor(
+              request.payload
+            )
+          );
+        }
+        case "automation.host-attempt.reserve": {
+          if (
+            typeof automationRuntime.reserveHostAttempt !==
+            "function"
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation host-attempt reservation is not available.",
+              retryable: false
+            });
+          }
+          const rawResult = await automationRuntime.reserveHostAttempt(
+            request.payload
+          );
+          if (
+            typeof rawResult !== "object" ||
+            rawResult === null ||
+            !("run" in rawResult) ||
+            !("intent" in rawResult) ||
+            !("correlation" in rawResult)
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation runtime reserveHostAttempt returned an invalid result shape.",
+              retryable: false
+            });
+          }
+
+          const parsedRun = extractAndValidateNestedRun(rawResult);
+
+          const resultEntries = Object.entries(rawResult);
+          const rawIntent = resultEntries.find(([k]) => k === "intent")?.[1];
+          const rawCorrelation = resultEntries.find(
+            ([k]) => k === "correlation"
+          )?.[1];
+
+          if (
+            typeof rawCorrelation !== "string" ||
+            rawCorrelation.length === 0
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation correlation must be a non-empty string.",
+              retryable: false
+            });
+          }
+
+          const parsedIntent =
+            AutomationHostAttemptIntentSchema.parse(rawIntent);
+
+          if (rawCorrelation !== parsedIntent.correlation) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation reservation correlation mismatch.",
+              retryable: false
+            });
+          }
+
+          if (
+            parsedIntent.descriptorSha256 !== request.payload.descriptorSha256
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation descriptor SHA256 mismatch.",
+              retryable: false
+            });
+          }
+
+          if (parsedRun.schemaVersion !== 2) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Host attempt reservation is only available for review-bound runs.",
+              retryable: false
+            });
+          }
+
+          if (parsedRun.id !== request.payload.runId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation reservation run ID mismatch.",
+              retryable: false
+            });
+          }
+
+          if (parsedRun.activeNodeId !== request.payload.nodeId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation active node ID mismatch.",
+              retryable: false
+            });
+          }
+
+          const targetStep = parsedRun.steps.find(
+            (step) => step.nodeId === request.payload.nodeId
+          );
+          if (targetStep === undefined) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation target step not found.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.attemptId !== request.payload.attemptId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation reservation attempt ID mismatch.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.state !== "host-reserved") {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation step state must be host-reserved.",
+              retryable: false
+            });
+          }
+
+          if (
+            targetStep.intent === null ||
+            targetStep.intent.correlation !== parsedIntent.correlation ||
+            targetStep.intent.descriptorSha256 !==
+              request.payload.descriptorSha256
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation reservation step intent mismatch.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.operationId !== null) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation reservation step must not have an operation ID.",
+              retryable: false
+            });
+          }
+
+          return AutomationHostReserveAttemptResultSchema.parse({
+            run: parsedRun,
+            intent: parsedIntent,
+            correlation: rawCorrelation
+          });
+        }
+        case "automation.host-attempt.bind": {
+          if (
+            typeof automationRuntime.bindHostOperation !==
+            "function"
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation host-attempt operation binding is not available.",
+              retryable: false
+            });
+          }
+          const rawResult = await automationRuntime.bindHostOperation(
+            request.payload
+          );
+          if (
+            typeof rawResult !== "object" ||
+            rawResult === null ||
+            !("run" in rawResult)
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation runtime bindHostOperation returned an invalid result shape.",
+              retryable: false
+            });
+          }
+
+          const parsedRun = extractAndValidateNestedRun(rawResult);
+
+          if (parsedRun.schemaVersion !== 2) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Host operation binding is only available for review-bound runs.",
+              retryable: false
+            });
+          }
+
+          if (parsedRun.id !== request.payload.runId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation operation binding run ID mismatch.",
+              retryable: false
+            });
+          }
+
+          if (parsedRun.activeNodeId !== request.payload.nodeId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding active node ID mismatch.",
+              retryable: false
+            });
+          }
+
+          const targetStep = parsedRun.steps.find(
+            (step) => step.nodeId === request.payload.nodeId
+          );
+          if (targetStep === undefined) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding target step not found.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.attemptId !== request.payload.attemptId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation operation binding attempt ID mismatch.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.state !== "host-reserved") {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding step state must be host-reserved.",
+              retryable: false
+            });
+          }
+
+          if (targetStep.operationId !== request.payload.operationId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding operation ID mismatch.",
+              retryable: false
+            });
+          }
+
+          if (
+            request.payload.correlation !== undefined &&
+            (targetStep.intent === null ||
+              targetStep.intent.correlation !== request.payload.correlation)
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding correlation mismatch.",
+              retryable: false
+            });
+          }
+
+          if (
+            request.payload.correlationId !== undefined &&
+            (targetStep.intent === null ||
+              targetStep.intent.correlationId !==
+                request.payload.correlationId)
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation operation binding correlationId mismatch.",
+              retryable: false
+            });
+          }
+
+          return AutomationHostBindOperationResultSchema.parse({
+            run: parsedRun
+          });
+        }
+        case "automation.host-attempt.reconcile": {
+          if (
+            typeof automationRuntime.reconcileHostTerminal !==
+            "function"
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation host-attempt terminal reconciliation is not available.",
+              retryable: false
+            });
+          }
+          const rawResult = await automationRuntime.reconcileHostTerminal(
+            request.payload
+          );
+          if (typeof rawResult !== "object" || rawResult === null) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation runtime reconcileHostTerminal returned an invalid result shape.",
+              retryable: false
+            });
+          }
+
+          const runEntry = Object.entries(rawResult).find(([k]) => k === "run");
+          const runCandidate = runEntry !== undefined ? runEntry[1] : rawResult;
+          if (typeof runCandidate !== "object" || runCandidate === null) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation runtime result must contain an object run property.",
+              retryable: false
+            });
+          }
+          const parsedRun = AutomationRunSnapshotSchema.parse(runCandidate);
+          if (parsedRun.schemaVersion !== 2) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Host terminal reconciliation is only available for review-bound runs.",
+              retryable: false
+            });
+          }
+          if (
+            request.payload.runId !== undefined &&
+            parsedRun.id !== request.payload.runId
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation terminal reconciliation run ID mismatch.",
+              retryable: false
+            });
+          }
+
+          const targetStep = parsedRun.steps.find(
+            (step) =>
+              step.intent !== null &&
+              step.intent.correlation === request.payload.correlation
+          );
+          if (targetStep === undefined) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation terminal reconciliation target step not found.",
+              retryable: false
+            });
+          }
+          if (
+            request.payload.nodeId !== undefined &&
+            targetStep.nodeId !== request.payload.nodeId
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message: "Automation terminal reconciliation node ID mismatch.",
+              retryable: false
+            });
+          }
+          if (
+            request.payload.attemptId !== undefined &&
+            targetStep.attemptId !== request.payload.attemptId
+          ) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation terminal reconciliation attempt ID mismatch.",
+              retryable: false
+            });
+          }
+          if (targetStep.operationId !== request.payload.operationId) {
+            throw new RuntimeBoundaryError({
+              code: "RUNTIME_UNAVAILABLE",
+              message:
+                "Automation terminal reconciliation operation ID mismatch.",
+              retryable: false
+            });
+          }
+
+          return AutomationHostReconcileTerminalResultSchema.parse({
+            run: parsedRun
+          });
+        }
         case "model.recommend": {
           const profile = HardwareProfileSchema.parse(
             await dependencies.profile(dataDirectory)

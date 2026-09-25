@@ -8,6 +8,7 @@ export type LaneState =
   | "answered"
   | "stopped"
   | "failed"
+  | "interrupted"
   | "unavailable";
 
 export interface DispatchLane {
@@ -38,6 +39,7 @@ export interface DispatchPanelProps {
     readonly label: string;
     readonly usable: boolean;
     readonly detail: string;
+    readonly models: readonly { readonly id: string; readonly label: string }[];
   }[];
   readonly board: DispatchBoard | null;
   readonly answers: readonly {
@@ -45,7 +47,7 @@ export interface DispatchPanelProps {
     readonly text: string;
   }[];
   readonly sourceCount: number;
-  readonly onSend: (brief: string, providerIds: readonly string[]) => void;
+  readonly onSend: (brief: string, selections: readonly { readonly providerId: string; readonly modelId: string }[]) => void;
   readonly onStopLane: (providerId: string) => void;
   readonly onStopAll: () => void;
   readonly onCompare: () => void;
@@ -71,6 +73,8 @@ function formatLaneState(state: LaneState): string {
       return "Stopped";
     case "failed":
       return "Failed";
+    case "interrupted":
+      return "Interrupted";
     case "unavailable":
       return "Unavailable";
   }
@@ -103,6 +107,7 @@ export function DispatchPanel({
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
+  const [models, setModels] = useState<Readonly<Record<string, string>>>({});
   const [expandedLaneIds, setExpandedLaneIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -137,7 +142,8 @@ export function DispatchPanel({
   );
   const usableCount = usableSelectedProviders.length;
   const trimmedBrief = brief.trim();
-  const canSend = trimmedBrief.length > 0 && usableCount > 0 && !busy;
+  const canSend = trimmedBrief.length > 0 && usableCount > 0 &&
+    usableSelectedProviders.every((provider) => Boolean(models[provider.id]?.trim())) && !busy;
   const sendLabel =
     usableCount === 1 ? "Send to 1 bot" : `Send to ${usableCount} bots`;
 
@@ -145,8 +151,10 @@ export function DispatchPanel({
     if (!canSend) {
       return;
     }
-    const providerIds = usableSelectedProviders.map((provider) => provider.id);
-    onSend(trimmedBrief, providerIds);
+    const selections = usableSelectedProviders.map((provider) => ({
+      providerId: provider.id, modelId: models[provider.id]!.trim()
+    }));
+    onSend(trimmedBrief, selections);
   };
 
   if (board === null) {
@@ -210,6 +218,18 @@ export function DispatchPanel({
                   </button>
                 );
               })}
+            </div>
+            <div role="group" aria-label="Models for selected connections">
+              {usableSelectedProviders.map((provider) => (
+                <label key={provider.id}>{provider.label} model
+                  {provider.models.length === 0
+                    ? <input value={models[provider.id] ?? ""} onChange={(event) => setModels((previous) => ({ ...previous, [provider.id]: event.target.value }))} placeholder="Enter model ID" disabled={busy} />
+                    : <select value={models[provider.id] ?? ""} onChange={(event) => setModels((previous) => ({ ...previous, [provider.id]: event.target.value }))} disabled={busy}>
+                        <option value="">Choose a model</option>
+                        {provider.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+                      </select>}
+                </label>
+              ))}
             </div>
           </div>
 

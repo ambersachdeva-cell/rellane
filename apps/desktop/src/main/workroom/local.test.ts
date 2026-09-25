@@ -178,7 +178,7 @@ describe("local workroom", () => {
     };
     await expect(service.run(db, input, h.deps)).rejects.toThrow("late answer");
     expect(turnsFor(db, id).filter(turn => turn.kind === "verbatim")).toEqual([expect.objectContaining({seat: "owner", body: input.question})]);
-    expect(turnsFor(db, id).at(-1)?.body).toContain("stopped");
+    expect(turnsFor(db, id).at(-1)?.body).toContain("stop requested; did not complete");
     expect(h.cancelled).toContain(input.operationId);
     expect(() => service.assertIdle(id)).not.toThrow();
     expect(service.current(id)).toBeNull();
@@ -228,5 +228,118 @@ describe("local workroom", () => {
     await expect(service.run(db, request(), h.deps)).rejects.toThrow("start refused");
     expect(h.prompts).toEqual([]);
     expect(turnsFor(db, id)).toEqual([]);
+  });
+
+  it("executes a graph-node request without writing an owner turn and saves a finding turn on graph-host-answer seat", async () => {
+    const sourceId = appendTurn(db, id, {
+      seat: "owner",
+      kind: "verbatim",
+      body: "Original case note."
+    });
+    const operationId = randomUUID();
+    const graphChatRequest: LocalChatRequest = {
+      operationId,
+      runtimeId: "cadrane-local-loopback",
+      modelId: "qwen",
+      messages: [
+        { role: "system", content: "System prompt." },
+        { role: "user", content: "User packet with source." }
+      ],
+      temperature: 0.2,
+      maxTokens: 512,
+      responseProfile: "graph-node-v1"
+    };
+    const h = harness();
+    const out = await service.runGraphNode(
+      db,
+      {
+        caseId: id,
+        nodeTitle: "Node 1",
+        instruction: "Analyze the note.",
+        sourceTurnIds: [sourceId],
+        request: graphChatRequest
+      },
+      h.deps
+    );
+
+    expect(h.prompts).toEqual([graphChatRequest]);
+    const stored = turnsFor(db, id);
+    expect(stored.filter((t) => t.seat === "owner")).toHaveLength(1);
+    const finding = stored.find((t) => t.id === out.answerTurnId);
+    expect(finding).toMatchObject({
+      seat: "graph-host-answer",
+      kind: "finding",
+      body: "A draft, not a fact."
+    });
+    expect(stored.at(-1)).toMatchObject({
+      seat: "workroom",
+      kind: "receipt"
+    });
+    expect(stored.at(-1)?.body).toContain(`Saved answer: ${out.answerTurnId}`);
+  });
+
+  it("refuses graph-node execution with wrong responseProfile or rolls back finding on onFinish failure", async () => {
+    const h = harness();
+    const badRequest: LocalChatRequest = {
+      operationId: randomUUID(),
+      runtimeId: "cadrane-local-loopback",
+      modelId: "qwen",
+      messages: [
+        { role: "system", content: "System" },
+        { role: "user", content: "User" }
+      ],
+      temperature: 0.2,
+      maxTokens: 256,
+      responseProfile: "local-draft-v1"
+    };
+    await expect(
+      service.runGraphNode(
+        db,
+        {
+          caseId: id,
+          nodeTitle: "Node 1",
+          instruction: "Analyze",
+          sourceTurnIds: [],
+          request: badRequest
+        },
+        h.deps
+      )
+    ).rejects.toThrow("graph-node-v1");
+    expect(h.prompts).toHaveLength(0);
+
+    const validRequest: LocalChatRequest = {
+      ...badRequest,
+      operationId: randomUUID(),
+      responseProfile: "graph-node-v1"
+    };
+    let failureInterrupted: boolean | null = null;
+    await expect(
+      service.runGraphNode(
+        db,
+        {
+          caseId: id,
+          nodeTitle: "Node 1",
+          instruction: "Analyze",
+          sourceTurnIds: [],
+          request: validRequest
+        },
+        h.deps,
+        {
+          beforeStart: () => {},
+          onStart: () => {},
+          beforeChat: () => {},
+          onFinish: () => {
+            throw new Error("Correlation terminal write failed");
+          },
+          onFailure: (interrupted) => {
+            failureInterrupted = interrupted;
+          },
+          isStopped: () => false
+        }
+      )
+    ).rejects.toThrow("Correlation terminal write failed");
+
+    expect(failureInterrupted).toBe(true);
+    expect(turnsFor(db, id).filter((t) => t.seat === "graph-host-answer")).toHaveLength(0);
   });
 });

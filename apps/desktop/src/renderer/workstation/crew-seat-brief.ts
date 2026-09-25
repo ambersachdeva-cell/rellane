@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+// Build bounded seat prompts in the renderer using browser-safe framing nonces.
 
 /** One part of a split request, and who is taking it. */
 export interface CrewPart {
@@ -18,7 +18,9 @@ export type CrewPartState =
   | "refining"
   | "done"
   | "failed"
-  | "stopped";
+  | "stopped"
+  | "interrupted"
+  | "awaiting-review";
 
 export interface CrewPartView {
   readonly id: string;
@@ -43,7 +45,9 @@ export interface CrewRunView {
     | "reading-each-other"
     | "done"
     | "stopped"
-    | "failed";
+    | "failed"
+    | "interrupted"
+    | "awaiting-review";
   readonly headline: string;
   readonly canStop: boolean;
 }
@@ -75,7 +79,8 @@ export interface SeatBrief {
 
 // 96-bit random marker unguessable by text written prior to the call
 export function boundary(): string {
-  return `«${randomBytes(12).toString("hex")}»`;
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(12));
+  return `«${Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("")}»`;
 }
 
 // Strip newline characters so labels cannot forge structural protocol lines

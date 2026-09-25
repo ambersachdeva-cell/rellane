@@ -121,6 +121,9 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:automation-snapshot",
       "cadrane:v4:automation-agent-save",
       "cadrane:v4:automation-workflow-save",
+      // Reviewed 2026-09-25. Saves a v2 review-bound workflow definition with
+      // strict schema validation; starts nothing and grants no folder path.
+      "cadrane:v4:automation-workflow-save-review-bound",
       "cadrane:v4:automation-memory-save",
       "cadrane:v4:automation-source-import",
       "cadrane:v4:automation-artifact-review",
@@ -327,6 +330,12 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:cases-list",
       "cadrane:v4:cases-open",
       "cadrane:v4:cases-read",
+      // Read-only lineage and selected-edit review are case-scoped. Apply
+      // accepts only a main-owned one-use review token, rechecks the current
+      // version/hash, then uses the existing append-only artifact writer.
+      "cadrane:v4:cases-artifact-lineage",
+      "cadrane:v4:cases-preview-artifact-edit",
+      "cadrane:v4:cases-apply-artifact-edit",
       "cadrane:v4:cases-say",
       // A native picker grants one preview; only its scoped token and optional
       // excerpt offsets can commit it. No renderer path or source body is accepted.
@@ -425,15 +434,35 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-start",
       "cadrane:v4:workstation-state",
       "cadrane:v4:workstation-running",
+      // Reviewed 2026-09-25. Shared WorkstationHost execution for automation
+      // graph v2 nodes: prepare validates Case/sources/agent/model and makes
+      // zero model calls; start consumes a single-use owner review token and
+      // binds one operation id; stop cancels the bound operation; reconcile
+      // settles crash cuts against durable Book evidence without replay.
+      "cadrane:v4:workstation-graph-prepare",
+      "cadrane:v4:workstation-graph-start",
+      "cadrane:v4:workstation-graph-stop",
+      "cadrane:v4:workstation-graph-reconcile",
+      // Reviewed 2026-09-24. Prepare returns an exact host review packet and
+      // starts nothing. Each matching Start consumes a short-lived token;
+      // existing per-run Stop and owner invalidation still apply.
+      "cadrane:v4:workstation-agent-prepare",
       "cadrane:v4:workstation-agent-start",
       "cadrane:v4:workstation-agent-poll",
       "cadrane:v4:workstation-agent-stop",
+      "cadrane:v4:workstation-dispatch-prepare",
       "cadrane:v4:workstation-dispatch-start",
       "cadrane:v4:workstation-dispatch-poll",
       "cadrane:v4:workstation-dispatch-stop",
       "cadrane:v4:workstation-pairing-status",
       "cadrane:v4:workstation-pairing-start",
       "cadrane:v4:workstation-pairing-stop",
+      // Trusted Mac-window review of one live run. A current pairing owner
+      // prepares a short-lived exact scope; approval consumes it and revokes
+      // the previous bearer. Pairing PINs alone cannot adopt a run.
+      "cadrane:v4:workstation-pairing-handover-candidates",
+      "cadrane:v4:workstation-pairing-handover-prepare",
+      "cadrane:v4:workstation-pairing-handover-approve",
       "cadrane:v4:workstation-dictation-status",
       "cadrane:v4:workstation-dictation-write",
       "cadrane:v4:workstation-dictation-stop",
@@ -443,6 +472,7 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-semantic-search",
       "cadrane:v4:workstation-publish-preview",
       "cadrane:v4:workstation-publish-write",
+      "cadrane:v4:workstation-crew-prepare",
       "cadrane:v4:workstation-crew-start",
       "cadrane:v4:workstation-crew-poll",
       "cadrane:v4:workstation-crew-stop",
@@ -454,6 +484,7 @@ describe("desktop model installation IPC v4 boundary", () => {
       // Going and reading, rather than answering from memory. Only the start
       // leaves this Mac, and only through the same private-network guards the
       // owner's own web read uses.
+      "cadrane:v4:workstation-research-prepare",
       "cadrane:v4:workstation-research-start",
       "cadrane:v4:workstation-research-poll",
       "cadrane:v4:workstation-research-stop",
@@ -463,6 +494,12 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-memory-learn",
       "cadrane:v4:workstation-memory-set",
       "cadrane:v4:workstation-memory-forget",
+      // Project-scoped governed proposals, approvals, exclusions and reads;
+      // main resolves the principal and requires trusted owner context.
+      "cadrane:v4:workstation:memory:governed",
+      // Contradiction review is owner-scoped and blocks conflicting approved
+      // authority until an exact-revision ruling is recorded.
+      "cadrane:v4:workstation:memory:conflicts",
       // What a session changed in a folder, and putting a file back. The
       // restore refuses any path that resolves outside the folder it was given.
       "cadrane:v4:workstation-changes-list",
@@ -473,11 +510,40 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-watch-save",
       "cadrane:v4:workstation-watch-remove",
       "cadrane:v4:workstation-watch-now",
+      // Save and preview are inert. Native confirmation grants only queueing;
+      // a due occurrence needs separate host Prepare and owner Start.
+      "cadrane:v4:workstation-schedule-list",
+      "cadrane:v4:workstation-schedule-save",
+      "cadrane:v4:workstation-schedule-preview",
+      "cadrane:v4:workstation-schedule-grant-review",
+      "cadrane:v4:workstation-schedule-grant-confirm",
+      "cadrane:v4:workstation-schedule-revoke",
+      "cadrane:v4:workstation-schedule-queue",
+      "cadrane:v4:workstation-schedule-prepare",
+      "cadrane:v4:workstation-schedule-start",
+      "cadrane:v4:workstation-schedule-poll",
+      "cadrane:v4:workstation-schedule-stop",
       // Who has knocked, and saying one of them is him. The only path by which a
       // fresh install ever gains its first obeyed chat.
       "cadrane:v4:workstation-phone-knocks",
       "cadrane:v4:workstation-phone-pair",
       "cadrane:v4:workstation-usage",
+      // Read-only receipts-backed observations; no model/provider dispatch.
+      "cadrane:v4:workstation-model-outcome-evidence",
+      // Trusted proposal and explicit acceptance of future advice weights.
+      // Acceptance rechecks exact receipt evidence, catalog, preferences and
+      // reviewed digest; it cannot alter a Solo pin or start a run.
+      "cadrane:v4:workstation-model-adaptation-propose",
+      "cadrane:v4:workstation-model-adaptation-accept",
+      // Project-scoped owner policy and receipt-backed Solo advice. Advice
+      // cannot prepare, select, or start a provider; exclusions are enforced.
+      "cadrane:v4:workstation-model-preferences-read",
+      "cadrane:v4:workstation-model-preferences-save",
+      "cadrane:v4:workstation-model-preferences-forget",
+      "cadrane:v4:workstation-solo-model-advice",
+      // Read-only role planning; the host catalog declares no capabilities,
+      // so Team candidates remain unassigned until reviewed.
+      "cadrane:v4:workstation-team-model-advice",
       "cadrane:v4:workstation-self-check",
       "cadrane:v4:workstation-stop",
       "cadrane:v4:workstation-decide",
@@ -491,6 +557,8 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-capture-list",
       "cadrane:v4:workstation-capture-take",
       "cadrane:v4:workstation-delivery-pack",
+      "cadrane:v4:workstation-portable-workspace",
+      "cadrane:v4:workstation-recovery",
       "cadrane:v4:workstation-document-import",
       "cadrane:v4:workstation-file-change",
       "cadrane:v4:workstation-file-preview",
@@ -502,6 +570,10 @@ describe("desktop model installation IPC v4 boundary", () => {
       "cadrane:v4:workstation-table-query",
       "cadrane:v4:workstation-web-read",
       "cadrane:v4:agent-draft",
+      // Owner-only summary and exact reviewed erasure of preparatory draft
+      // history. Active drafts block erasure; saved Agents are unaffected.
+      "cadrane:v4:agent-draft-history",
+      "cadrane:v4:agent-draft-forget",
       // Reviewed 2026-09-09: one-use host handles bound to actual document and
       // kind, local-only work, exact Stop; no file path or runtime selector.
       "cadrane:v4:local-shortcut-begin",
@@ -833,6 +905,7 @@ describe("frozen preload model bridge", () => {
       "reviewArtifact",
       "saveAgent",
       "saveMemory",
+      "saveReviewBoundWorkflow",
       "saveWorkflow",
       "snapshot",
       "start",

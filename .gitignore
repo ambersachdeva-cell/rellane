@@ -41,3 +41,6 @@ apps/desktop/vendor/llama-b10182/*
 # are ignored: they are large, they are superseded by FINDINGS.md, and nothing
 # reads them twice.
 .crew/runs/
+
+# Compiled native inventory helper binary
+apps/desktop/src/main/workstation/r24-native-inventory/r24_nofollow_inventory

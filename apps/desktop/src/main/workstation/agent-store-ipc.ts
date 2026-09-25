@@ -1,7 +1,8 @@
 import type { Dirent } from "node:fs";
+import { constants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { IpcMainInvokeEvent } from "electron";
 import { ipcMain } from "electron";
 import { z } from "zod";
@@ -11,14 +12,18 @@ import { createAgentSourceOwners } from "../agents/source-owner.js";
 export const AGENT_ID_REGEX = /^[a-zA-Z0-9-]{1,64}$/;
 export const MAX_AGENT_ID_LENGTH = 64;
 export const MAX_AGENT_MARKDOWN_BYTES = 64 * 1024;
+export const DEFAULT_MAX_PROMPT_LENGTH = 8000;
 
 export type AgentOrigin = "bundled" | "user";
+
+export type RequestedToolScope = "none" | "review-each-call";
 
 export interface StoredAgent {
   readonly id: string;
   readonly origin: AgentOrigin;
   readonly markdown: string;
   readonly updatedAt: number;
+  readonly revision: string;
 }
 
 export interface WorkstationAgentsListResult {
@@ -33,6 +38,7 @@ export interface WorkstationAgentSaveInput {
 export interface WorkstationAgentSaveResult {
   readonly id: string;
   readonly updatedAt: number;
+  readonly revision: string;
 }
 
 export interface WorkstationAgentDeleteInput {
@@ -49,6 +55,50 @@ export interface InstallAgentStoreOptions {
   readonly agentsFolder: () => string;
   /** The bundled ones, already read for you. */
   readonly bundled: () => readonly { readonly id: string; readonly markdown: string }[];
+}
+
+export interface LoadStoredAgentContractOptions {
+  /** The folder user agents live in. */
+  readonly agentsFolder: () => string;
+  /** The bundled ones, already read. */
+  readonly bundled: () => readonly { readonly id: string; readonly markdown: string }[];
+}
+
+export interface StoredAgentContract {
+  readonly agentId: string;
+  readonly origin: AgentOrigin;
+  readonly revision: string;
+  readonly contractHash: string;
+  readonly fullPrompt: string;
+  readonly expectedOutput: string;
+  readonly requestedToolScopes: readonly RequestedToolScope[];
+}
+
+export interface CompileStoredAgentContractInput {
+  readonly agent:
+    | StoredAgent
+    | {
+        readonly id: string;
+        readonly origin: AgentOrigin;
+        readonly markdown: string;
+        readonly revision?: string;
+        readonly updatedAt?: number;
+      };
+  readonly task: string;
+  readonly expectedOutput: string;
+  readonly requestedToolScopes?: readonly RequestedToolScope[];
+  readonly expectedRevision?: string;
+  readonly maxPromptLength?: number;
+}
+
+export interface LoadStoredAgentContractInput {
+  readonly id: string;
+  readonly origin: AgentOrigin;
+  readonly expectedRevision: string;
+  readonly task: string;
+  readonly expectedOutput: string;
+  readonly requestedToolScopes?: readonly RequestedToolScope[];
+  readonly maxPromptLength?: number;
 }
 
 export const WorkstationAgentSaveInputSchema = z.object({
@@ -80,6 +130,150 @@ function validateMarkdown(markdown: string): void {
   }
 }
 
+export function computeAgentRevision(
+  id: string,
+  origin: AgentOrigin,
+  markdown: string
+): string {
+  if (!AGENT_ID_REGEX.test(id) || id.length === 0 || id.length > MAX_AGENT_ID_LENGTH) {
+    throw new Error("Invalid agent identifier.");
+  }
+  if (origin !== "bundled" && origin !== "user") {
+    throw new Error("Invalid agent origin.");
+  }
+  validateMarkdown(markdown);
+
+  return createHash("sha256")
+    .update(JSON.stringify({ id, origin, markdown }))
+    .digest("hex");
+}
+
+export const computeStoredAgentRevision = computeAgentRevision;
+
+export function compileStoredAgentContract(input: CompileStoredAgentContractInput): StoredAgentContract {
+  const { agent, task, expectedOutput, requestedToolScopes, expectedRevision, maxPromptLength } = input;
+
+  if (!agent || typeof agent !== "object") {
+    throw new Error("Agent definition is required.");
+  }
+  if (!AGENT_ID_REGEX.test(agent.id) || agent.id.length === 0 || agent.id.length > MAX_AGENT_ID_LENGTH) {
+    throw new Error("Invalid agent identifier.");
+  }
+  if (agent.origin !== "bundled" && agent.origin !== "user") {
+    throw new Error("Invalid agent origin.");
+  }
+  if (typeof agent.markdown !== "string" || agent.markdown.trim().length === 0) {
+    throw new Error("Agent markdown cannot be blank for compilation.");
+  }
+  validateMarkdown(agent.markdown);
+
+  const revision = computeAgentRevision(agent.id, agent.origin, agent.markdown);
+  if (agent.revision !== undefined && agent.revision !== revision) {
+    throw new Error("Agent revision does not match content hash.");
+  }
+  if (expectedRevision !== undefined && expectedRevision !== revision) {
+    throw new Error(
+      `Agent revision mismatch: expected '${expectedRevision}', got '${revision}'.`
+    );
+  }
+
+  if (task === undefined || task === null || typeof task !== "string" || task.trim().length === 0) {
+    throw new Error("Invocation task is required and cannot be blank.");
+  }
+  if (task.includes("\0")) {
+    throw new Error("Invocation task contains invalid characters.");
+  }
+  try {
+    encodeURIComponent(task);
+  } catch {
+    throw new Error("Invocation task is not valid text.");
+  }
+
+  if (
+    expectedOutput === undefined ||
+    expectedOutput === null ||
+    typeof expectedOutput !== "string" ||
+    expectedOutput.trim().length === 0
+  ) {
+    throw new Error("Expected output is required and cannot be blank.");
+  }
+  if (expectedOutput.includes("\0")) {
+    throw new Error("Expected output contains invalid characters.");
+  }
+  try {
+    encodeURIComponent(expectedOutput);
+  } catch {
+    throw new Error("Expected output is not valid text.");
+  }
+
+  const rawScopes = requestedToolScopes ?? ["none"];
+  if (rawScopes.length === 0) {
+    throw new Error("requestedToolScopes cannot be empty; use ['none'] to request no tools.");
+  }
+
+  const seenScopes = new Set<RequestedToolScope>();
+  for (const scope of rawScopes) {
+    if (scope !== "none" && scope !== "review-each-call") {
+      throw new Error(`Invalid requested tool scope '${scope}'.`);
+    }
+    if (seenScopes.has(scope)) {
+      throw new Error(`Duplicate requested tool scope '${scope}' is prohibited.`);
+    }
+    seenScopes.add(scope);
+  }
+
+  if (seenScopes.has("none") && rawScopes.length > 1) {
+    throw new Error("'none' tool scope is exclusive and cannot be combined with other scopes.");
+  }
+
+  const validatedScopes: readonly RequestedToolScope[] = Object.freeze([...rawScopes]);
+
+  const effectiveMaxPromptLength = maxPromptLength ?? DEFAULT_MAX_PROMPT_LENGTH;
+  if (
+    typeof effectiveMaxPromptLength !== "number" ||
+    !Number.isFinite(effectiveMaxPromptLength) ||
+    effectiveMaxPromptLength <= 0
+  ) {
+    throw new Error("maxPromptLength must be a positive number.");
+  }
+
+  const fullPrompt = JSON.stringify({
+    markdown: agent.markdown,
+    task,
+    expectedOutput,
+    requestedToolScopes: validatedScopes,
+  });
+
+  if (fullPrompt.length > effectiveMaxPromptLength) {
+    throw new Error(
+      `Compiled prompt length (${fullPrompt.length}) exceeds maximum allowed length of ${effectiveMaxPromptLength} characters.`
+    );
+  }
+
+  const contractHash = createHash("sha256")
+    .update(
+      JSON.stringify({
+        agentId: agent.id,
+        origin: agent.origin,
+        revision,
+        fullPrompt,
+        expectedOutput,
+        requestedToolScopes: validatedScopes,
+      })
+    )
+    .digest("hex");
+
+  return Object.freeze({
+    agentId: agent.id,
+    origin: agent.origin,
+    revision,
+    contractHash,
+    fullPrompt,
+    expectedOutput,
+    requestedToolScopes: validatedScopes,
+  });
+}
+
 function resolveAgentPath(folder: string, id: string): string {
   if (!AGENT_ID_REGEX.test(id) || id.length === 0 || id.length > MAX_AGENT_ID_LENGTH) {
     throw new Error("Invalid agent identifier.");
@@ -91,6 +285,144 @@ function resolveAgentPath(folder: string, id: string): string {
     throw new Error("Agent path is outside the agents directory.");
   }
   return targetPath;
+}
+
+export async function loadStoredAgentContract(
+  options: LoadStoredAgentContractOptions,
+  input: LoadStoredAgentContractInput
+): Promise<StoredAgentContract> {
+  if (!input || typeof input !== "object") {
+    throw new Error("Input is required.");
+  }
+  if (!input.id || !AGENT_ID_REGEX.test(input.id) || input.id.length > MAX_AGENT_ID_LENGTH) {
+    throw new Error("Invalid agent identifier.");
+  }
+  if (input.origin !== "bundled" && input.origin !== "user") {
+    throw new Error("Invalid agent origin.");
+  }
+  if (
+    !input.expectedRevision ||
+    typeof input.expectedRevision !== "string" ||
+    input.expectedRevision.trim() === ""
+  ) {
+    throw new Error("expectedRevision is required.");
+  }
+
+  const { task, expectedOutput, requestedToolScopes, maxPromptLength } = input;
+
+  if (task === undefined || typeof task !== "string" || task.trim().length === 0) {
+    throw new Error("Invocation task is required and cannot be blank.");
+  }
+  if (
+    expectedOutput === undefined ||
+    typeof expectedOutput !== "string" ||
+    expectedOutput.trim().length === 0
+  ) {
+    throw new Error("Expected output is required and cannot be blank.");
+  }
+
+  if (input.origin === "bundled") {
+    const bundledList = options.bundled();
+    const found = bundledList.find((b) => b.id === input.id);
+    if (!found) {
+      throw new Error(`Bundled agent '${input.id}' not found.`);
+    }
+    validateMarkdown(found.markdown);
+    const actualRevision = computeAgentRevision(found.id, "bundled", found.markdown);
+    if (actualRevision !== input.expectedRevision) {
+      throw new Error(
+        `Agent revision mismatch: expected '${input.expectedRevision}', found '${actualRevision}'.`
+      );
+    }
+    return compileStoredAgentContract({
+      agent: {
+        id: found.id,
+        origin: "bundled",
+        markdown: found.markdown,
+        updatedAt: 0,
+        revision: actualRevision,
+      },
+      task,
+      expectedOutput,
+      ...(requestedToolScopes === undefined ? {} : { requestedToolScopes }),
+      expectedRevision: input.expectedRevision,
+      ...(maxPromptLength === undefined ? {} : { maxPromptLength }),
+    });
+  }
+
+  const folder = options.agentsFolder();
+  const targetPath = resolveAgentPath(folder, input.id);
+
+  let lstats;
+  try {
+    lstats = await fs.lstat(targetPath);
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new Error(`Agent '${input.id}' not found.`);
+    }
+    throw new Error("Unable to access agent file.");
+  }
+
+  if (lstats.isSymbolicLink()) {
+    throw new Error("Symbolic links are not permitted.");
+  }
+  if (!lstats.isFile()) {
+    throw new Error("Agent path is not a regular file.");
+  }
+  if (lstats.size > MAX_AGENT_MARKDOWN_BYTES) {
+    throw new Error("Agent content exceeds limit.");
+  }
+
+  let handle: fs.FileHandle | undefined;
+  try {
+    const openFlags =
+      constants.O_NOFOLLOW !== undefined ? constants.O_RDONLY | constants.O_NOFOLLOW : "r";
+    handle = await fs.open(targetPath, openFlags);
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      throw new Error("Agent path is not a regular file.");
+    }
+    if (stats.size > MAX_AGENT_MARKDOWN_BYTES) {
+      throw new Error("Agent content exceeds limit.");
+    }
+
+    const content = await handle.readFile("utf8");
+    validateMarkdown(content);
+
+    const actualRevision = computeAgentRevision(input.id, "user", content);
+    if (actualRevision !== input.expectedRevision) {
+      throw new Error(
+        `Agent revision mismatch: expected '${input.expectedRevision}', found '${actualRevision}'.`
+      );
+    }
+
+    return compileStoredAgentContract({
+      agent: {
+        id: input.id,
+        origin: "user",
+        markdown: content,
+        updatedAt: Math.floor(stats.mtimeMs),
+        revision: actualRevision,
+      },
+      task,
+      expectedOutput,
+      ...(requestedToolScopes === undefined ? {} : { requestedToolScopes }),
+      expectedRevision: input.expectedRevision,
+      ...(maxPromptLength === undefined ? {} : { maxPromptLength }),
+    });
+  } catch (error) {
+    if (isNodeError(error) && (error.code === "ELOOP" || error.code === "EMLINK")) {
+      throw new Error("Symbolic links are not permitted.");
+    }
+    if (isNodeError(error) && error.code === "ENOENT") {
+      throw new Error(`Agent '${input.id}' not found.`);
+    }
+    throw error;
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
 }
 
 async function fileExistsInFolder(folder: string, id: string): Promise<boolean> {
@@ -148,6 +480,7 @@ export function installAgentStore(options: InstallAgentStoreOptions): void {
         origin: "bundled",
         markdown: b.markdown,
         updatedAt: 0,
+        revision: computeAgentRevision(b.id, "bundled", b.markdown),
       }));
 
       const folder = options.agentsFolder();
@@ -203,6 +536,7 @@ export function installAgentStore(options: InstallAgentStoreOptions): void {
             origin: "user",
             markdown: content,
             updatedAt: Math.floor(stats.mtimeMs),
+            revision: computeAgentRevision(id, "user", content),
           });
         } catch {
           verifySender();
@@ -291,6 +625,7 @@ export function installAgentStore(options: InstallAgentStoreOptions): void {
         return {
           id: targetId,
           updatedAt: Math.floor(stats.mtimeMs),
+          revision: computeAgentRevision(targetId, "user", parsed.markdown),
         };
       } catch {
         verifySender();

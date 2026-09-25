@@ -1,0 +1,176 @@
+/* The existing case editor fills Studio while the selected source rail remains visible. */
+.ws-studio {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  background: var(--ws-paper);
+  color: var(--ws-ink);
+  font-family: inherit;
+  overflow: hidden;
+}
+
+.ws-studio-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 18px;
+  background: var(--ws-ground);
+  border-bottom: 1px solid var(--ws-line);
+  flex-shrink: 0;
+}
+
+.ws-studio-title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 320px;
+}
+
+.ws-studio-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: var(--ws-sidebar);
+  padding: 3px;
+  border: 1px solid var(--ws-line);
+  border-radius: 8px;
+}
+
+.ws-root .ws-studio-tab {
+  padding: 5px 12px;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--ws-muted);
+  border-radius: 6px;
+  transition: background 140ms var(--ws-ease), color 140ms var(--ws-ease);
+}
+
+.ws-root .ws-studio-tab:hover {
+  color: var(--ws-ink);
+}
+
+.ws-root .ws-studio-tab[aria-pressed="true"] {
+  background: var(--ws-paper);
+  color: var(--ws-blue);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  font-weight: 600;
+}
+
+.ws-root .ws-studio-close {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ws-muted);
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--ws-line);
+  background: var(--ws-paper);
+  transition: background 140ms var(--ws-ease), color 140ms var(--ws-ease);
+}
+
+.ws-root .ws-studio-close:hover {
+  color: var(--ws-ink);
+  background: var(--ws-hover);
+}
+
+.ws-root .ws-studio-tab:focus-visible,
+.ws-root .ws-studio-close:focus-visible {
+  outline: 2px solid var(--ws-blue);
+  outline-offset: 2px;
+}
+
+.ws-studio-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(240px, 24vw, 320px);
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ws-studio-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.ws-studio-pane {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
+.ws-studio-pane[hidden] {
+  display: none !important;
+}
+
+.ws-studio-resources {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--ws-line);
+  background: var(--ws-ground);
+  overflow: hidden;
+}
+
+.ws-studio-resources-header {
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--ws-line);
+  flex-shrink: 0;
+}
+
+.ws-studio-resources-header h3 {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--ws-muted);
+  margin: 0;
+}
+
+.ws-studio-resources-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 14px 16px;
+}
+.ws-studio-pane > .ws-editor { width: 100%; max-width: none; height: 100%; border-left: 0; animation: none; }
+.ws-studio-direction { max-width: 760px; padding: clamp(24px, 4vw, 52px); display: grid; gap: 22px; }
+.ws-studio-direction h3 { font-size: 24px; font-weight: 550; letter-spacing: -.5px; }
+.ws-studio-direction h4 { font-size: 12px; margin: 0 0 8px; }
+.ws-studio-direction p, .ws-studio-direction li { font-size: 12px; color: var(--ws-muted); line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ws-studio-direction section { border-top: 1px solid var(--ws-line); padding-top: 18px; display: grid; gap: 10px; }
+.ws-studio-direction ul { margin: 0; padding-left: 20px; }
+.ws-studio-direction .ws-button { justify-self: start; }
+.ws-studio-resource-list { display: grid; gap: 10px; }
+.ws-studio-resource-list p { color: var(--ws-muted); font-size: 11px; }
+.ws-studio-resource-list > .ws-button { justify-self: start; }
+.ws-studio-resource-list ul { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.ws-studio-resource-list li { border-top: 1px solid var(--ws-line); padding-top: 8px; display: flex; align-items: start; gap: 8px; }
+.ws-studio-resource-list li label { display: flex; align-items: start; gap: 8px; flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 11px; }
+.ws-studio-resource-list li input { margin-top: 2px; }
+.ws-studio-resource-list li button { color: var(--ws-blue); font-size: 10px; }
+.ws-rich-editor-slot { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.ws-rich-editor-slot[hidden] { display: none; }
+.ws-lexical-document-editor { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.ws-lexical-document-editor .ws-editor-paper { min-height: 180px; }
+.ws-lexical-container, .ws-lexical-input { flex: 1; min-height: 180px; outline: 0; }
+.ws-lexical-input { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ws-lexical-placeholder { color: var(--ws-soft); pointer-events: none; font-size: 12px; }
+.ws-lexical-toolbar { justify-content: start; gap: 6px; }
+.ws-lexical-toolbar .ws-segmented { display: flex; align-items: center; }
+.ws-lexical-toolbar .ws-button { border: 0; }
+.ws-lexical-conversion-guard .ws-version-history { display: grid; gap: 10px; }
+.ws-lexical-conversion-guard .ws-button-group { display: flex; gap: 8px; }
+@media (max-width: 900px) { .ws-studio-body { grid-template-columns: minmax(0, 1fr) 190px; } .ws-studio-title { display: none; } }
+@media (max-width: 650px) { .ws-studio-body { display: flex; flex-direction: column; } .ws-studio-main { flex: 1; } .ws-studio-resources { max-height: 150px; border-left: 0; border-top: 1px solid var(--ws-line); } .ws-studio-nav { overflow-x: auto; } .ws-root .ws-studio-tab { padding: 5px 7px; } }

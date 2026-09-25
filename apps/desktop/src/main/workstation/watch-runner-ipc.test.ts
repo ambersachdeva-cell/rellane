@@ -11,6 +11,13 @@ import {
 } from "./watch-runner-ipc.js";
 
 const ipcHandlers = new Map<string, (event: unknown, input: unknown) => Promise<unknown>>();
+const ownerState = vi.hoisted(() => ({ current: {} as object }));
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 vi.mock("electron", () => ({
   ipcMain: {
@@ -24,7 +31,7 @@ vi.mock("electron", () => ({
 }));
 
 vi.mock("../agents/source-owner.js", () => ({
-  createAgentSourceOwners: () => () => "owner-token"
+  createAgentSourceOwners: () => () => ownerState.current
 }));
 
 vi.mock("../../shared/ipc-channels.js", () => ({
@@ -134,6 +141,243 @@ describe("capRememberedText", () => {
 });
 
 describe("installWatch execution loop", () => {
+  it("admits one due sweep synchronously while its first look is pending", async () => {
+    const lookGate = deferred<string | null>();
+    const lookStarted = deferred<void>();
+    let looks = 0;
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => [createWatch()],
+      save: async () => {},
+      look: async () => { looks++; lookStarted.resolve(); return await lookGate.promise; },
+      lastSeen: async () => "prior",
+      remember: async () => {},
+      tell: async () => {}
+    });
+
+    try {
+      const first = installed.checkDue();
+      const duplicate = installed.checkDue();
+      await lookStarted.promise;
+      lookGate.resolve("current");
+      await Promise.all([first, duplicate]);
+      expect(looks).toBe(1);
+    } finally {
+      installed.stop();
+    }
+  });
+
+  it("does not save or deliver after stop during a pending remembered read", async () => {
+    const lastSeenGate = deferred<string | null>();
+    const lastSeenStarted = deferred<void>();
+    const save = vi.fn(async () => {});
+    const remember = vi.fn(async () => {});
+    const tell = vi.fn(async () => {});
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => [createWatch()],
+      save,
+      look: async () => "changed",
+      lastSeen: async () => { lastSeenStarted.resolve(); return await lastSeenGate.promise; },
+      remember,
+      tell
+    });
+
+    const run = installed.checkDue();
+    await lastSeenStarted.promise;
+    installed.stop();
+    lastSeenGate.resolve("prior");
+    await run;
+    expect(remember).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(tell).not.toHaveBeenCalled();
+  });
+
+  it("handles a rejected periodic load without an unhandled timer rejection", async () => {
+    vi.useFakeTimers();
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => { throw new Error("load failed"); },
+      save: async () => {},
+      look: async () => null,
+      lastSeen: async () => null,
+      remember: async () => {},
+      tell: async () => {}
+    });
+
+    try {
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(errorLog).toHaveBeenCalledWith("Watch check failed:", expect.any(Error));
+    } finally {
+      installed.stop();
+      errorLog.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("abandons a queued save when its owner changes during load", async () => {
+    const loadGate = deferred<readonly Watch[]>();
+    const loadStarted = deferred<void>();
+    const save = vi.fn(async () => {});
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => { loadStarted.resolve(); return await loadGate.promise; },
+      save,
+      look: async () => null,
+      lastSeen: async () => null,
+      remember: async () => {},
+      tell: async () => {}
+    });
+
+    try {
+      const saving = ipcHandlers.get("workstation-watch:save")!(createMockEvent(), { watch: createWatch() });
+      await loadStarted.promise;
+      ownerState.current = {};
+      loadGate.resolve([]);
+      await expect(saving).rejects.toThrow("This window changed");
+      expect(save).not.toHaveBeenCalled();
+    } finally {
+      installed.stop();
+    }
+  });
+
+  it("reads the current watch when a manual check reaches the queue", async () => {
+    let currentWatches: readonly Watch[] = [createWatch({ paused: true })];
+    const firstLoad = deferred<readonly Watch[]>();
+    const loadStarted = deferred<void>();
+    let loads = 0;
+    const inspected: string[] = [];
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => {
+        loads++;
+        if (loads === 1) { loadStarted.resolve(); return await firstLoad.promise; }
+        return currentWatches;
+      },
+      save: async (watches) => { currentWatches = watches; },
+      look: async (target) => { inspected.push(target.label); return "new"; },
+      lastSeen: async () => "old",
+      remember: async () => {},
+      tell: async () => {}
+    });
+
+    try {
+      const event = createMockEvent();
+      const save = ipcHandlers.get("workstation-watch:save")!;
+      const now = ipcHandlers.get("workstation-watch:now")!;
+      const changed = createWatch({ paused: true, target: { kind: "page", url: "https://example.com/new", label: "New target" } });
+      const savePromise = save(event, { watch: changed });
+      await loadStarted.promise;
+      const manualPromise = now(event, { id: changed.id });
+      firstLoad.resolve(currentWatches);
+      await savePromise;
+      await manualPromise;
+      expect(inspected).toEqual(["New target"]);
+    } finally {
+      installed.stop();
+    }
+  });
+
+  it("serializes save then remove without restoring a removed watch", async () => {
+    let currentWatches: readonly Watch[] = [];
+    const loadGate = deferred<readonly Watch[]>();
+    const loadStarted = deferred<void>();
+    let loads = 0;
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => {
+        loads++;
+        if (loads === 1) { loadStarted.resolve(); return await loadGate.promise; }
+        return currentWatches;
+      },
+      save: async (watches) => { currentWatches = watches; },
+      look: async () => null,
+      lastSeen: async () => null,
+      remember: async () => {},
+      tell: async () => {}
+    });
+
+    try {
+      const event = createMockEvent();
+      const savePromise = ipcHandlers.get("workstation-watch:save")!(event, { watch: createWatch() });
+      await loadStarted.promise;
+      const removePromise = ipcHandlers.get("workstation-watch:remove")!(event, { id: "watch-1" });
+      loadGate.resolve(currentWatches);
+      await Promise.all([savePromise, removePromise]);
+      expect(currentWatches).toEqual([]);
+    } finally {
+      installed.stop();
+    }
+  });
+
+  it("does not commit a manual result after its owner changes during look", async () => {
+    const lookGate = deferred<string | null>();
+    const lookStarted = deferred<void>();
+    const save = vi.fn(async () => {});
+    const remember = vi.fn(async () => {});
+    const tell = vi.fn(async () => {});
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => [createWatch({ paused: true })],
+      save,
+      look: async () => { lookStarted.resolve(); return await lookGate.promise; },
+      lastSeen: async () => "old",
+      remember,
+      tell
+    });
+
+    try {
+      const manual = ipcHandlers.get("workstation-watch:now")!(createMockEvent(), { id: "watch-1" });
+      await lookStarted.promise;
+      ownerState.current = {};
+      lookGate.resolve("new");
+      await expect(manual).rejects.toThrow("This window changed");
+      expect(remember).not.toHaveBeenCalled();
+      expect(save).not.toHaveBeenCalled();
+      expect(tell).not.toHaveBeenCalled();
+    } finally {
+      installed.stop();
+    }
+  });
+
+  it("drops a quiet-hours message when its watch is edited or removed", async () => {
+    let currentWatches: readonly Watch[] = [createWatch({ quietHours: true })];
+    let currentTime = new Date(2026, 8, 15, 3, 0, 0).getTime();
+    const tell = vi.fn(async () => {});
+    const installed = installWatch({
+      assertTrusted: () => {},
+      load: async () => currentWatches,
+      save: async (watches) => { currentWatches = watches; },
+      look: async () => "changed",
+      lastSeen: async () => "old",
+      remember: async () => {},
+      tell,
+      now: () => currentTime
+    });
+
+    try {
+      const event = createMockEvent();
+      await installed.checkDue();
+      await ipcHandlers.get("workstation-watch:save")!(event, {
+        watch: createWatch({ quietHours: true, paused: true, target: { kind: "page", url: "https://example.com/new", label: "Edited" } })
+      });
+      currentTime = new Date(2026, 8, 15, 7, 0, 0).getTime();
+      await installed.checkDue();
+      expect(tell).not.toHaveBeenCalled();
+
+      currentTime = new Date(2026, 8, 16, 3, 0, 0).getTime();
+      await ipcHandlers.get("workstation-watch:save")!(event, { watch: createWatch({ quietHours: true }) });
+      await installed.checkDue();
+      await ipcHandlers.get("workstation-watch:remove")!(event, { id: "watch-1" });
+      currentTime = new Date(2026, 8, 16, 7, 0, 0).getTime();
+      await installed.checkDue();
+      expect(tell).not.toHaveBeenCalled();
+    } finally {
+      installed.stop();
+    }
+  });
+
   it("runs twenty due watches sequentially, never concurrently", async () => {
     const watches: Watch[] = [];
     for (let i = 0; i < 20; i++) {

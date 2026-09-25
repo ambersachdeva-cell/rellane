@@ -44,6 +44,30 @@ describe("session-pool admit policy", () => {
     }
   });
 
+  it("refuses parent and child workspaces without confusing sibling names", () => {
+    const running: RunningSession = {
+      operationId: "op-1",
+      caseId: "case-1",
+      providerId: "codex",
+      workspacePath: "/workspaces/project-a",
+      owner: {},
+      startedAt: 1000,
+    };
+    const candidate: StartRequest = {
+      caseId: "case-2",
+      providerId: "claude",
+      workspacePath: "/workspaces/project-a/nested",
+      owner: {},
+    };
+
+    expect(admit([running], candidate, 2000)).toMatchObject({ allowed: false, conflictWith: "op-1" });
+    expect(admit([{ ...running, workspacePath: candidate.workspacePath }], {
+      ...candidate, workspacePath: running.workspacePath,
+    }, 2000)).toMatchObject({ allowed: false, conflictWith: "op-1" });
+    expect(admit([running], { ...candidate, workspacePath: "/workspaces/project-a-sibling" }, 2000))
+      .toEqual({ allowed: true });
+  });
+
   it("refuses when a running session has the same case id", () => {
     const running: RunningSession = {
       operationId: "op-1",

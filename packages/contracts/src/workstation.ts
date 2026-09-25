@@ -7,6 +7,10 @@ import type { WorkstationSavedRoutine, WorkstationRoutineSaveInput } from "./wor
 import type { WorkstationImageAsset, WorkstationImagePreview, WorkstationImageExport } from "./workstation-images.js";
 import type { CreativeHandoffBridge } from "./workstation-creative.js";
 import type { WorkstationCitationBridge } from "./workstation-citations.js";
+import type {
+  AutomationHostReconcileTerminalResult,
+  AutomationPendingHostReviewInput
+} from "./automation.js";
 
 export type WorkstationProviderId = "codex" | "claude" | "gemini1" | "gemini2" | "gemini3";
 export interface WorkstationProvider {
@@ -21,7 +25,7 @@ export interface WorkstationProvider {
 }
 export interface WorkstationWorkspace { readonly id: string; readonly label: string; readonly path: string; }
 export interface WorkstationPrepareInput {
-  readonly caseId: string; readonly providerId: WorkstationProviderId; readonly modelId?: string;
+  readonly caseId: string; readonly providerId: WorkstationProviderId; readonly modelId: string;
   readonly prompt: string; readonly sourceTurnIds: readonly string[]; readonly workspaceId?: string;
   /** Opt in to reviewed native tools. Absent and false are the same thing. */
   readonly enableTools?: boolean;
@@ -48,8 +52,40 @@ export interface WorkstationReview {
   readonly token: string; readonly caseId: string; readonly providerId: WorkstationProviderId;
   readonly providerLabel: string; readonly modelId: string | null; readonly prompt: string;
   readonly contextPreview: string; readonly sourceIds: readonly string[]; readonly sourceHash: string;
+  /** Canonical project memory bound to the reviewed packet; null means no linked project. */
+  readonly projectId?: string | null; readonly memoryEpoch?: number;
+  readonly contextSnapshotId?: string;
   readonly workspace: WorkstationWorkspace; readonly expiresAt: number; readonly resumeSessionId: string | null;
   readonly tools?: WorkstationReviewTools;
+}
+export interface WorkstationGraphReview {
+  readonly token: string;
+  readonly runId: string;
+  readonly nodeId: string;
+  readonly nodeTitle: string;
+  readonly attemptId: string;
+  readonly workflowId: string;
+  readonly workflowRevision: number;
+  readonly workflowSha256: string;
+  readonly agentId: string;
+  readonly agentRevision: number;
+  readonly agentSha256: string;
+  readonly caseId: string;
+  readonly sourceTurnIds: readonly string[];
+  readonly operationId: string;
+  readonly runtimeId: string;
+  readonly modelId: string;
+  readonly instruction: string;
+  readonly systemPrompt: string;
+  readonly descriptorSha256: string;
+  readonly sourceBindingSha256: string;
+  readonly requestSha256: string;
+  readonly preview: string;
+  readonly contextPreview: string;
+  readonly workspace: WorkstationWorkspace;
+  readonly projectId: string | null;
+  readonly memoryEpoch: number;
+  readonly expiresAt: number;
 }
 export interface WorkstationPermission {
   readonly id: string; readonly title: string; readonly detail: string;
@@ -60,6 +96,7 @@ export interface WorkstationSnapshot {
   readonly reportedModelId?: string;
   readonly operationId: string; readonly caseId: string; readonly providerId: WorkstationProviderId;
   readonly modelId: string | null; readonly sessionId: string | null; readonly status: WorkstationStatus;
+  readonly answerTurnId?: string | null;
   readonly startedAt: number; readonly updatedAt: number; readonly text: string;
   readonly activity: readonly string[]; readonly permission: WorkstationPermission | null; readonly detail: string;
 }
@@ -105,6 +142,15 @@ export interface WorkstationBridge
   running(): Promise<readonly WorkstationSnapshot[]>;
   stop(input: { readonly caseId: string; readonly operationId: string }): Promise<WorkstationSnapshot>;
   decide(input: { readonly operationId: string; readonly permissionId: string; readonly allow: boolean }): Promise<WorkstationSnapshot>;
+  graphPrepare(input: AutomationPendingHostReviewInput): Promise<WorkstationGraphReview>;
+  graphStart(input: { readonly token: string }): Promise<AutomationHostReconcileTerminalResult>;
+  graphStop(input: { readonly caseId: string; readonly operationId: string }): Promise<{ readonly stopped: boolean }>;
+  graphReconcile(): Promise<number>;
+  selfCheck(): Promise<unknown>;
+  importDocument(input: { readonly filePath: string } | string): Promise<unknown>;
+  speak(input: { readonly text: string } | string): Promise<unknown>;
+  portableWorkspace(input: unknown): Promise<unknown>;
+  recovery(input: unknown): Promise<unknown>;
 }
 
 /**
@@ -134,8 +180,8 @@ export const WORKSTATION_SOURCE_LIMIT = 20;
 
 /**
  * A model name reaches a command line, so it is an identifier rather than text.
- * The host still refuses any id the provider did not itself advertise; this
- * stops the shell-shaped ones before they get that far.
+ * The host validates advertised ids; Codex can accept an owner-entered id
+ * because its native connector does not expose a verified model catalogue.
  */
 const WorkstationModelIdSchema = z
   .string()
@@ -149,7 +195,7 @@ const WorkstationCaseIdSchema = z.string().trim().min(1).max(64);
 export const WorkstationPrepareInputSchema = z.strictObject({
   caseId: WorkstationCaseIdSchema,
   providerId: WorkstationProviderIdSchema,
-  modelId: WorkstationModelIdSchema.optional(),
+  modelId: WorkstationModelIdSchema,
   prompt: z.string().trim().min(1).max(WORKSTATION_PROMPT_LIMIT),
   sourceTurnIds: z
     .array(z.uuid())

@@ -70,6 +70,37 @@ const callStop = async (event = createMockEvent()): Promise<PairingStatus> => {
 };
 
 describe("remote-pairing-ipc", () => {
+  it("closes an expired pairing without waiting for another status request", async () => {
+    vi.useFakeTimers();
+    try {
+      const stop = vi.fn().mockResolvedValue(undefined);
+      installRemotePairing({
+        assertTrusted: vi.fn(),
+        startServer: async () => ({ url: "http://127.0.0.1:49201", pin: "749201",
+          expiresAt: Date.now() + 25, stop }),
+        lanAddress: () => null
+      });
+      expect((await callStart({ reachable: "this-mac" })).state).toBe("listening");
+      await vi.advanceTimersByTimeAsync(25);
+      expect(stop).toHaveBeenCalledTimes(1);
+      expect(await callStatus()).toEqual({ state: "off" });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("closes the paired server during workstation shutdown", async () => {
+    const stop = vi.fn().mockResolvedValue(undefined);
+    const pairing = installRemotePairing({
+      assertTrusted: vi.fn(),
+      startServer: async () => ({ url: "http://127.0.0.1:49201", pin: "749201",
+        expiresAt: Date.now() + 300_000, stop }),
+      lanAddress: () => null
+    });
+    await callStart({ reachable: "this-mac" });
+    await pairing.shutdown();
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(await callStatus()).toEqual({ state: "off" });
+  });
+
   it("reports 'off' before any pairing has been started", async () => {
     const startServer = vi.fn();
     installRemotePairing({
@@ -272,5 +303,38 @@ describe("remote-pairing-ipc", () => {
     expect(message).not.toContain(".ts");
     expect(message).not.toContain("123456");
     expect(message).not.toContain("    at ");
+  });
+
+  it("requires a current trusted Mac pairing for exact one-run handover review and approval", async () => {
+    const event = createMockEvent();
+    const scope = { caseId: "case-1", operationId: "11111111-1111-4111-8111-111111111111",
+      oldPrincipalId: `prnc_${"a".repeat(32)}`, newPrincipalId: `prnc_${"b".repeat(32)}` };
+    const review = { ...scope, token: "a".repeat(64), expiresAt: Date.now() + 60_000, generation: 1 };
+    const prepare = vi.fn(() => review);
+    const approve = vi.fn(() => scope);
+    installRemotePairing({
+      assertTrusted: (incoming) => { if (incoming !== event) throw new Error("Untrusted window"); },
+      startServer: async () => ({ url: "http://127.0.0.1:49201", pin: "749201",
+        expiresAt: Date.now() + 300_000, stop: async () => undefined,
+        handover: { candidates: () => ({ principals: [scope.oldPrincipalId, scope.newPrincipalId],
+          runs: [{ principalId: scope.oldPrincipalId, caseId: scope.caseId, operationId: scope.operationId }] }),
+        prepare, approve } }),
+      lanAddress: () => null
+    });
+    const candidates = getHandler(IPC_CHANNELS.workstationPairingHandoverCandidates);
+    const reviewCall = getHandler(IPC_CHANNELS.workstationPairingHandoverPrepare);
+    const approveCall = getHandler(IPC_CHANNELS.workstationPairingHandoverApprove);
+    expect(() => reviewCall(event, scope)).toThrow(/current pairing/u);
+    await callStart({ reachable: "this-mac" }, event);
+    expect(() => candidates({} as IpcMainInvokeEvent)).toThrow(/Untrusted/u);
+    expect(await candidates(event)).toMatchObject({ runs: [{ operationId: scope.operationId }] });
+    expect(() => reviewCall(event, { ...scope, operationId: "other" })).toThrow();
+    expect(await reviewCall(event, scope)).toEqual(review);
+    expect(prepare).toHaveBeenCalledExactlyOnceWith(scope);
+    expect(() => approveCall(event, { token: "bad" })).toThrow();
+    expect(await approveCall(event, { token: review.token })).toEqual(scope);
+    expect(approve).toHaveBeenCalledExactlyOnceWith(review.token);
+    await callStop(event);
+    expect(() => approveCall(event, { token: review.token })).toThrow(/current pairing/u);
   });
 });

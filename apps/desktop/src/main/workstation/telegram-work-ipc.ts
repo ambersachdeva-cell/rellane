@@ -1,4 +1,5 @@
 import type { IpcMainInvokeEvent } from "electron";
+import type { WorkstationReview } from "@cadrane/contracts";
 import { ipcMain } from "electron";
 import { z } from "zod";
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
@@ -85,10 +86,12 @@ export interface InstallTelegramWorkOptions {
    * One decision, about one named call. There is no verb here for "allow
    * everything from now on", because there is no such thing to allow.
    */
-  readonly decidePending: (allow: boolean) => Promise<{ readonly decided: boolean; readonly detail: string }>;
+  readonly decidePending: (allow: boolean, code: string) => Promise<{ readonly decided: boolean; readonly detail: string }>;
   readonly startWork: (input: {
     readonly request: string; readonly seats: readonly string[];
+    readonly selection?: { readonly providerId: string; readonly modelId: string };
   }) => Promise<{ readonly started: boolean; readonly detail: string }>;
+  readonly confirmWork?: (code: string) => Promise<{ readonly started: boolean; readonly detail: string }>;
   /** What is running right now, already in plain words. */
   readonly status: () => Promise<{ readonly headline: string; readonly lines: readonly string[] }>;
   /** Stops everything. Returns what to say back. */
@@ -131,7 +134,8 @@ export interface TelegramWorkBridge {
  */
 export function sanitiseReply(
   text: string,
-  chatIdsToRedact: readonly (string | null | undefined)[] = []
+  chatIdsToRedact: readonly (string | null | undefined)[] = [],
+  maxLength = 580
 ): string {
   let cleaned = text;
 
@@ -168,12 +172,27 @@ export function sanitiseReply(
   cleaned = cleaned.replace(/\n{3,}/g, "\n\n").trim();
 
   // Telegram replies must stay compact and fit on a phone screen
-  const MAX_REPLY_LENGTH = 580;
-  if (cleaned.length > MAX_REPLY_LENGTH) {
-    cleaned = cleaned.slice(0, MAX_REPLY_LENGTH).trimEnd() + "…";
+  if (cleaned.length > maxLength) {
+    cleaned = cleaned.slice(0, maxLength).trimEnd() + "…";
   }
 
   return cleaned;
+}
+
+/** The whole immutable packet must fit and survive redaction before a phone code is issued. */
+export function exactPhoneReview(
+  review: WorkstationReview,
+  code: string,
+  ownerChatId: string
+): string | null {
+  const toolDetail = review.tools?.enabled
+    ? `\nTools: ${review.tools.toolNames.join(", ")}\n${review.tools.reachNote}\n${review.tools.freshSessionNote}`
+    : "\nTools: off.";
+  const message = `Review ${review.providerLabel} / ${review.modelId ?? "unknown model"} in workspace ${review.workspace.label}.\nExact packet:\n${review.contextPreview}${toolDetail}\nReply send ${code} before this review expires to start. Each tool call asks separately. Nothing has run yet.`;
+  const maximum = 3500;
+  return message.length <= maximum && sanitiseReply(message, [ownerChatId], maximum) === message
+    ? message
+    : null;
 }
 
 function isApprovalRequest(text: string): boolean {
@@ -334,16 +353,36 @@ export function createTelegramWorkBridge(options: InstallTelegramWorkOptions): T
      * message that is nothing but a decision, so a request wearing the word yes
      * is not consent and lands below as an ordinary request.
      */
-    const decision = readDecision(text);
-    if (decision !== null) {
+    const boundDecision = /^(yes|no) ([0-9]{6})$/iu.exec(text);
+    const decisionWord = boundDecision?.[1]?.toLowerCase();
+    const decision = decisionWord === "yes" ? "allow" : decisionWord === "no" ? "deny" : null;
+    if (decision !== null && boundDecision?.[2] !== undefined) {
       let replyText: string;
       try {
-        const result = await options.decidePending(decision === "allow");
+        const result = await options.decidePending(decision === "allow", boundDecision[2]);
         replyText = result.detail.trim().length > 0
           ? result.detail.trim()
           : (decision === "allow" ? "Allowed it once." : "Declined it.");
       } catch {
         replyText = "Could not answer that because an error occurred on your Mac.";
+      }
+      const clean = sanitiseReply(replyText, [rawChatId, cleanOwnerId]);
+      await safeReply(options, clean);
+      return { replied: clean };
+    }
+    if (readDecision(text) !== null) {
+      const replyText = "Reply with yes or no followed by the six-digit code shown with that exact action.";
+      await safeReply(options, replyText);
+      return { replied: replyText };
+    }
+    const sendCode = /^send ([0-9]{6})$/iu.exec(text);
+    if (sendCode?.[1] !== undefined) {
+      let replyText: string;
+      try {
+        const result = await options.confirmWork?.(sendCode[1]);
+        replyText = result?.detail ?? "No reviewed phone request is waiting. Start again with /ask provider/model: request.";
+      } catch {
+        replyText = "The reviewed request could not start. Check your Mac.";
       }
       const clean = sanitiseReply(replyText, [rawChatId, cleanOwnerId]);
       await safeReply(options, clean);
@@ -421,16 +460,20 @@ export function createTelegramWorkBridge(options: InstallTelegramWorkOptions): T
       return { replied: replyText };
     }
 
-    const requestPrompt = intent !== null && intent.body.trim().length > 0
+    const selectedAsk = /^\/ask\s+(codex|claude|gemini[123])\/([A-Za-z0-9][A-Za-z0-9._:-]{0,119}):\s*([\s\S]+)$/iu.exec(text);
+    const requestPrompt = selectedAsk?.[3]?.trim() ?? (intent !== null && intent.body.trim().length > 0
       ? intent.body.trim()
-      : text.replace(/^(\/)?ask[:\s]*/i, "").trim() || text;
+      : text.replace(/^(\/)?ask[:\s]*/i, "").trim() || text);
     const seats = intent !== null && intent.seats.length > 0 ? intent.seats : extractSeats(requestPrompt);
 
     let replyText: string;
     try {
       const result = await options.startWork({
         request: requestPrompt,
-        seats
+        seats,
+        ...(selectedAsk?.[1] !== undefined && selectedAsk[2] !== undefined
+          ? { selection: { providerId: selectedAsk[1].toLowerCase(), modelId: selectedAsk[2] } }
+          : {})
       });
       replyText = result.detail.trim().length > 0
         ? result.detail.trim()

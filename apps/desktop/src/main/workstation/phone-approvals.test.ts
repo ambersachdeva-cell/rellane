@@ -81,6 +81,7 @@ describe("AnnouncedCalls", () => {
     const calls = waitingCalls([run({})]);
 
     expect(announced.fresh(calls)).toHaveLength(1);
+    announced.markDelivered(calls[0]!);
     expect(announced.fresh(calls)).toHaveLength(0);
     expect(announced.fresh(calls)).toHaveLength(0);
   });
@@ -89,6 +90,7 @@ describe("AnnouncedCalls", () => {
     const announced = new AnnouncedCalls();
     const first = waitingCalls([run({})]);
     expect(announced.fresh(first)).toHaveLength(1);
+    announced.markDelivered(first[0]!);
 
     // Settled: nothing is waiting.
     announced.keepOnly([]);
@@ -101,7 +103,19 @@ describe("AnnouncedCalls", () => {
     const announced = new AnnouncedCalls();
     const calls = waitingCalls([run({})]);
     expect(announced.fresh(calls)).toHaveLength(1);
+    announced.markDelivered(calls[0]!);
     announced.keepOnly(calls);
     expect(announced.fresh(calls)).toHaveLength(0);
+  });
+
+  it("retries failed delivery and reissues a challenge after expiry", () => {
+    const announced = new AnnouncedCalls();
+    const calls = waitingCalls([run({})]);
+    expect(announced.fresh(calls)).toHaveLength(1);
+    expect(announced.fresh(calls)).toHaveLength(1);
+    announced.markDelivered(calls[0]!);
+    expect(announced.fresh(calls)).toHaveLength(0);
+    announced.forget(calls[0]!);
+    expect(announced.fresh(calls)).toHaveLength(1);
   });
 });

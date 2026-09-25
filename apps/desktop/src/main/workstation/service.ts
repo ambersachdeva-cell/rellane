@@ -6,9 +6,8 @@
  * back a review carrying that hash, the provider, the model and the folder. The
  * token in that review is thirty-two random bytes, lives five minutes, is bound
  * to the window and document that asked, and is consumed *before* a process is
- * launched. Nothing in this module can reach a provider by any other route, so
- * "it ran without being approved" is not a bug that can be introduced by
- * forgetting a check somewhere — there is no second door.
+ * launched. `start` also requires a durable preimage before dispatch. The
+ * auxiliary `askOnce` path below does not use this reviewed-run policy.
  *
  * The second rule is that a start is not an answer. A user turn and a start
  * receipt are durable before dispatch; the completed turn and its finish receipt
@@ -23,6 +22,18 @@
 import { createHash } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type {
+  AgentRunResult,
+  AutomationHostBindOperationInput,
+  AutomationHostBindOperationResult,
+  AutomationHostReconcileTerminalInput,
+  AutomationHostReconcileTerminalResult,
+  AutomationHostReserveAttemptInput,
+  AutomationHostReserveAttemptResult,
+  AutomationHostReviewDescriptor,
+  AutomationPendingHostReviewInput,
+  AutomationWorkspaceSnapshot,
+  LocalChatRequest,
+  WorkstationContextSuggestion,
   WorkstationPermission,
   WorkstationProvider,
   WorkstationProviderId,
@@ -33,6 +44,7 @@ import type {
   WorkstationStatus,
   WorkstationWorkspace
 } from "@cadrane/contracts";
+import { ProjectMemoryRoleIdSchema } from "@cadrane/contracts";
 import type {
   ContextSource,
   ExtractedArtifact,
@@ -42,6 +54,7 @@ import type {
   NativeWorkerFactory,
   NativeWorkerOptions,
   NativeWorkerResult,
+  NativeAskOutcome,
   WorkstationContext,
   WorkstationSessionReceipt
 } from "./types.js";
@@ -96,6 +109,87 @@ import type {
 // object exists to keep side effects out of this file, not string building.
 import { buildToolLedger, type ToolLedgerEntry } from "./tool-ledger.js";
 import { admit } from "./session-pool.js";
+import { LocalCaseRunScope, type LocalCaseRunInput, type LocalAgentRunInput,
+  type LocalSuggestionRunInput } from "./local-case-run-scope.js";
+import { LocalBriefDraftScope, type LocalBriefDraftInput } from "./local-brief-draft-scope.js";
+import type { AcceptedConstraint, AcceptedFinding, FindingDecision } from "./context.js";
+import type { ContextSnapshot, ContextSnapshotManifest } from "./context-snapshot-store.js";
+import type { LocalCaseRunHooks } from "../workroom/local.js";
+import { composeGraphHostReviewPacket } from "./graph-host-review-packet.js";
+import {
+  lookup,
+  recordDispatch,
+  recordTerminal,
+  recordTerminalInExistingTransaction,
+  saveIntent,
+  type GraphHostCorrelationKey,
+  type GraphHostTerminalOutcome
+} from "./graph-host-correlation-store.js";
+import { readProvenGraphHostTerminal } from "./graph-host-terminal-evidence.js";
+import {
+  RecoveryQuiescenceCoordinator,
+  type WriterPermit
+} from "./recovery-quiescence.js";
+import {
+  createHostWriterGate,
+  createTrustedHostQuiescenceCoordinator,
+  type HostWriterGate
+} from "./recovery-quiescence-host-bridge.js";
+
+export interface WorkstationGraphReview {
+  readonly token: string;
+  readonly runId: string;
+  readonly nodeId: string;
+  readonly nodeTitle: string;
+  readonly attemptId: string;
+  readonly workflowId: string;
+  readonly workflowRevision: number;
+  readonly workflowSha256: string;
+  readonly agentId: string;
+  readonly agentRevision: number;
+  readonly agentSha256: string;
+  readonly caseId: string;
+  readonly sourceTurnIds: readonly string[];
+  readonly operationId: string;
+  readonly runtimeId: string;
+  readonly modelId: string;
+  readonly instruction: string;
+  readonly systemPrompt: string;
+  readonly descriptorSha256: string;
+  readonly sourceBindingSha256: string;
+  readonly requestSha256: string;
+  readonly preview: string;
+  readonly contextPreview: string;
+  readonly workspace: WorkstationWorkspace;
+  readonly projectId: string | null;
+  readonly memoryEpoch: number;
+  readonly expiresAt: number;
+}
+
+export interface WorkstationGraphHostDeps {
+  readonly describeReview: (input: AutomationPendingHostReviewInput) => Promise<AutomationHostReviewDescriptor>;
+  readonly reserveAttempt: (input: AutomationHostReserveAttemptInput) => Promise<AutomationHostReserveAttemptResult>;
+  readonly bindOperation: (input: AutomationHostBindOperationInput) => Promise<AutomationHostBindOperationResult>;
+  readonly reconcileTerminal: (input: AutomationHostReconcileTerminalInput) => Promise<AutomationHostReconcileTerminalResult>;
+  readonly snapshot?: () => Promise<AutomationWorkspaceSnapshot>;
+  readonly runNode: (input: {
+    readonly db: DatabaseSync;
+    readonly caseId: string;
+    readonly nodeTitle: string;
+    readonly instruction: string;
+    readonly sourceTurnIds: readonly string[];
+    readonly request: LocalChatRequest;
+    readonly hooks: LocalCaseRunHooks;
+  }) => Promise<{ readonly answerTurnId: string; readonly output: string }>;
+  readonly stopNode?: (caseId: string, operationId: string) => Promise<{ readonly stopped: boolean }>;
+  readonly composeReviewPacket?: typeof composeGraphHostReviewPacket;
+  readonly saveIntent?: typeof saveIntent;
+  readonly recordDispatch?: typeof recordDispatch;
+  readonly recordTerminal?: typeof recordTerminal;
+  readonly recordTerminalInExistingTransaction?: typeof recordTerminalInExistingTransaction;
+  readonly lookupCorrelation?: typeof lookup;
+  readonly readProvenTerminal?: typeof readProvenGraphHostTerminal;
+}
 
 /**
  * Everything with a side effect, named.
@@ -105,6 +199,11 @@ import { admit } from "./session-pool.js";
  * imports none of them and the host's decisions can be exercised on their own.
  */
 export interface WorkstationHostDeps {
+  /** The bundled Case draft uses this host's admission and owner lifecycle. */
+  readonly localCaseScope?: LocalCaseRunScope;
+  readonly localBriefScope?: LocalBriefDraftScope;
+  readonly quiescenceCoordinator?: RecoveryQuiescenceCoordinator;
+  readonly graph?: WorkstationGraphHostDeps;
   readonly book: () => DatabaseSync;
   readonly readCase: (db: DatabaseSync, caseId: string) => WorkstationCaseRow | null;
   readonly turnsFor: (db: DatabaseSync, caseId: string) => readonly WorkstationTurnRow[];
@@ -116,7 +215,24 @@ export interface WorkstationHostDeps {
     prompt: string;
     sources: readonly ContextSource[];
     maxChars?: number;
-  }) => WorkstationContext;
+    acceptedConstraints?: readonly AcceptedConstraint[];
+    approvedFindings?: readonly AcceptedFinding[];
+    taskRole?: string;
+  }) => WorkstationContext & { readonly findingDecisions?: readonly FindingDecision[] };
+  /** Canonical Book memory. Missing data and read errors fail the review closed. */
+  readonly memory: {
+    readonly projectForCase: (db: DatabaseSync, caseId: string) => string | null;
+    readonly epoch: (db: DatabaseSync, projectId: string) => number;
+    readonly constraints: (db: DatabaseSync, projectId: string) => readonly AcceptedConstraint[];
+    readonly findings?: (db: DatabaseSync, projectId: string) => readonly AcceptedFinding[];
+    readonly saveSnapshot: (db: DatabaseSync, input: {
+      readonly id: string; readonly caseId: string; readonly projectId: string | null;
+      readonly memoryEpoch: number; readonly providerId: string; readonly modelId: string | null;
+      readonly packet: string; readonly manifest: ContextSnapshotManifest;
+    }, at: number) => ContextSnapshot;
+    readonly readSnapshot: (db: DatabaseSync, id: string, caseId: string, projectId: string | null) => ContextSnapshot | null;
+    readonly markDispatchAttempt: (db: DatabaseSync, id: string, caseId: string, projectId: string | null, at: number) => void;
+  };
   readonly createWorker: NativeWorkerFactory;
   readonly saveReceipt: (
     db: DatabaseSync,
@@ -132,22 +248,22 @@ export interface WorkstationHostDeps {
   readonly routines: () => readonly WorkstationRoutine[];
   /** The app's own data directory. One folder per case lives under it. */
   readonly privateWorkspace: (caseId: string) => Promise<WorkstationWorkspace>;
+  /** Resolve filesystem aliases before review and admission bind a workspace. */
+  readonly canonicalWorkspacePath: (workspacePath: string) => Promise<string>;
   /** What an answer appears to contain. Named in the receipt; nothing is saved. */
   readonly extractArtifacts: (text: string) => readonly ExtractedArtifact[];
   readonly now: () => number;
   /**
    * A session is about to touch this folder.
    *
-   * Called once, immediately before the worker is launched, so that whatever
-   * wants to know what the folder looked like beforehand gets its chance while
-   * "beforehand" is still true. Never awaited and never allowed to throw
-   * outward: a snapshot that fails must not stop work from starting.
+   * A durable preimage barrier. A worker cannot be created until it resolves
+   * true; false or rejection fails the run before dispatch.
    */
-  readonly onRunStart?: (input: {
+  readonly onRunStart: (input: {
     readonly caseId: string;
     readonly operationId: string;
     readonly workspacePath: string;
-  }) => void;
+  }) => Promise<boolean>;
   /** Thirty-two cryptographically random bytes, hex. */
   readonly token: () => string;
   readonly newId: () => string;
@@ -191,6 +307,17 @@ interface PendingReview {
   readonly sourceIds: readonly string[];
   /** Whether this review described tools. `start` builds a broker only then. */
   readonly enableTools: boolean;
+  readonly projectId: string | null;
+  readonly memoryEpoch: number;
+  readonly contextSnapshotId: string;
+  readonly includedFindingRefs: readonly { readonly id: string; readonly revision: number }[];
+}
+
+interface PendingGraphReview {
+  readonly review: WorkstationGraphReview;
+  readonly descriptor: AutomationHostReviewDescriptor;
+  readonly request: LocalChatRequest;
+  readonly owner: object;
 }
 
 const TERMINAL_STATUSES = new Set<WorkstationStatus>(["completed", "stopped", "failed", "interrupted"]);
@@ -198,17 +325,21 @@ const TERMINAL_STATUSES = new Set<WorkstationStatus>(["completed", "stopped", "f
 interface RunState {
   readonly operationId: string;
   readonly caseId: string;
+  readonly projectId: string | null;
+  readonly memoryEpoch: number;
+  readonly contextSnapshotId: string;
   readonly providerId: WorkstationProviderId;
   readonly providerLabel: string;
   readonly modelId: string | null;
   readonly workspace: WorkstationWorkspace;
-  readonly owner: object;
+  owner: object;
   readonly startedAt: number;
   sessionId: string | null;
   reportedModelId: string | null;
   status: WorkstationStatus;
   updatedAt: number;
   text: string;
+  answerTurnId: string | null;
   truncated: boolean;
   activity: string[];
   waiting: WorkstationPermission[];
@@ -223,6 +354,7 @@ interface RunState {
   finished: boolean;
   lastEventAt: number;
   lastCheckpointAt: number;
+  quiescencePermit?: WriterPermit;
 }
 
 /** `NativeWorkerOptions` while it is being assembled. Same fields, writable. */
@@ -244,10 +376,19 @@ interface AttemptOutcome {
 
 export class WorkstationHost {
   private readonly deps: WorkstationHostDeps;
+  private readonly localCaseScope: LocalCaseRunScope | null;
+  private readonly localBriefScope: LocalBriefDraftScope | null;
+  private readonly quiescenceCoordinator: RecoveryQuiescenceCoordinator;
+  private readonly hostWriterGate: HostWriterGate;
+  private readonly invalidatedOwners = new WeakSet<object>();
   private readonly pending = new Map<string, PendingReview>();
+  private readonly pendingGraphReviews = new Map<string, PendingGraphReview>();
+  private readonly stoppedGraphOperations = new Set<string>();
   private readonly workspaces = new Map<string, { readonly workspace: WorkstationWorkspace; readonly owner: object }>();
   private readonly finished = new Map<string, WorkstationSnapshot>();
+  private readonly finishedOwners = new Map<string, object>();
   private readonly attempts = new Map<WorkstationProviderId, AttemptOutcome>();
+  private readonly parentStopHooks = new Set<() => Promise<boolean>>();
   /**
    * Every session running right now, keyed by operation id.
    *
@@ -260,12 +401,692 @@ export class WorkstationHost {
    * refuses every case the original sentence was protecting.
    */
   private readonly active = new Map<string, RunState>();
+  /** File restore holds the same workspace admission lane as native starts. */
+  private readonly restoreLeases = new Map<string, {
+    readonly operationId: string;
+    readonly caseId: string;
+    readonly workspacePath: string;
+    readonly owner: object;
+    readonly startedAt: number;
+  }>();
   private readonly running = new Map<string, Promise<void>>();
   private recovered = false;
 
   constructor(deps: WorkstationHostDeps) {
     this.deps = deps;
+    this.localCaseScope = deps.localCaseScope ?? null;
+    this.localBriefScope = deps.localBriefScope ?? null;
+    this.quiescenceCoordinator =
+      deps.quiescenceCoordinator ?? createTrustedHostQuiescenceCoordinator();
+    for (const writerId of [
+      "workstation-brief",
+      "workstation-case",
+      "workstation-agent",
+      "restore-lease",
+      "session-pool"
+    ] as const) {
+      this.quiescenceCoordinator.registerWriter(writerId);
+    }
+    this.hostWriterGate = createHostWriterGate(this.quiescenceCoordinator);
   }
+
+  quiescence(): RecoveryQuiescenceCoordinator {
+    return this.quiescenceCoordinator;
+  }
+
+  writerGate(): HostWriterGate {
+    return this.hostWriterGate;
+  }
+
+  async runLocalBrief(input: Omit<LocalBriefDraftInput, "workspacePath">) {
+    const scope = this.localBriefScope;
+    if (!scope) throw new Error("Local brief ownership is unavailable.");
+    const workspace = await this.deps.privateWorkspace("agent-brief");
+    const workspacePath = await this.deps.canonicalWorkspacePath(workspace.path);
+    if (this.invalidatedOwners.has(input.owner))
+      throw new Error("This window changed before the brief could start.");
+    this.assertAdmissible({ caseId: "agent-brief", providerId: "bundled-local",
+      workspacePath, owner: input.owner });
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("workstation-brief");
+    try {
+      return await scope.run({ ...input, workspacePath });
+    } finally {
+      permit.release();
+    }
+  }
+
+  localBriefHistory() {
+    if (!this.localBriefScope) throw new Error("Local brief history is unavailable.");
+    return this.localBriefScope.history(this.deps.book());
+  }
+
+  forgetLocalBriefHistory(reviewSha256: string) {
+    const scope = this.localBriefScope;
+    if (!scope) throw new Error("Local brief history is unavailable.");
+    return this.hostWriterGate.workstationBrief.runSync(() =>
+      scope.forget(this.deps.book(), reviewSha256)
+    );
+  }
+
+  /** Admit a bundled-local Case draft under the same case/workspace lane as native work. */
+  async runLocalCase(input: Omit<LocalCaseRunInput, "workspacePath">): Promise<void> {
+    const scope = this.localCaseScope;
+    if (!scope) throw new Error("Local Case run ownership is unavailable.");
+    const workspace = await this.deps.privateWorkspace(input.caseId);
+    const workspacePath = await this.deps.canonicalWorkspacePath(workspace.path);
+    if (this.invalidatedOwners.has(input.owner))
+      throw new Error("This window changed before the local request could start.");
+    this.assertAdmissible({
+      caseId: input.caseId, providerId: "bundled-local", workspacePath, owner: input.owner
+    });
+    // No await between admission and the scope's synchronous reservation.
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("workstation-case");
+    try {
+      return await scope.run({ ...input, workspacePath });
+    } finally {
+      permit.release();
+    }
+  }
+
+  localCaseState(caseId: string, owner: object): { operationId: string; stopping: boolean } | null {
+    return this.localCaseScope?.current(caseId, owner) ?? null;
+  }
+
+  stopLocalCase(caseId: string, operationId: string, owner: object): Promise<{ stopped: boolean }> {
+    return this.localCaseScope?.stop(caseId, operationId, owner) ?? Promise.resolve({ stopped: false });
+  }
+
+  async runLocalAgent(input: Omit<LocalAgentRunInput, "workspacePath">): Promise<AgentRunResult> {
+    const scope = this.localCaseScope;
+    if (!scope) throw new Error("Local Agent run ownership is unavailable.");
+    const laneId = `agent:${input.agentId}`;
+    const workspace = await this.deps.privateWorkspace(laneId);
+    const workspacePath = await this.deps.canonicalWorkspacePath(workspace.path);
+    if (this.invalidatedOwners.has(input.owner))
+      throw new Error("This window changed before the Agent could start.");
+    this.assertAdmissible({ caseId: laneId, providerId: "bundled-local", workspacePath, owner: input.owner });
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("workstation-agent");
+    try {
+      return await scope.runAgent({ ...input, workspacePath });
+    } finally {
+      permit.release();
+    }
+  }
+
+  stopLocalAgent(agentId: string, owner: object): { stopped: boolean } {
+    return this.localCaseScope?.stopAgent(agentId, owner) ?? { stopped: false };
+  }
+
+  /** Preparatory local advice holds the same Case/workspace admission as a run. */
+  async runLocalSuggestion(input: Omit<LocalSuggestionRunInput, "workspacePath">): Promise<WorkstationContextSuggestion> {
+    const scope = this.localCaseScope;
+    if (!scope) throw new Error("Local suggestion ownership is unavailable.");
+    const workspace = await this.deps.privateWorkspace(input.request.caseId);
+    const workspacePath = await this.deps.canonicalWorkspacePath(workspace.path);
+    if (this.invalidatedOwners.has(input.owner))
+      throw new Error("This window changed before the suggestion could start.");
+    this.assertAdmissible({ caseId: input.request.caseId, providerId: "bundled-local",
+      workspacePath, owner: input.owner });
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("workstation-case");
+    try {
+      return await scope.runSuggestion({ ...input, workspacePath });
+    } finally {
+      permit.release();
+    }
+  }
+
+  async prepareGraphNode(
+    input: AutomationPendingHostReviewInput,
+    owner: object
+  ): Promise<WorkstationGraphReview> {
+    this.expireReviews();
+    const graph = this.deps.graph;
+    if (!graph) throw new Error("Graph Host execution is unavailable.");
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window changed before the graph review could be prepared.");
+
+    const descriptor = await graph.describeReview(input);
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window changed before the graph review could be prepared.");
+
+    const workspace = await this.deps.privateWorkspace(descriptor.caseId);
+    const canonicalPath = await this.deps.canonicalWorkspacePath(workspace.path);
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window changed before the graph review could be prepared.");
+
+    const db = this.deps.book();
+    const room = this.deps.readCase(db, descriptor.caseId);
+    if (room === null || room.closedAt !== null)
+      throw new Error("This case is closed or missing. Open the case before reviewing a graph step.");
+
+    const projectId = this.deps.memory.projectForCase(db, descriptor.caseId);
+    const memoryEpoch = projectId === null ? 0 : this.deps.memory.epoch(db, projectId);
+    const key: GraphHostCorrelationKey = {
+      caseId: descriptor.caseId,
+      graphRunId: descriptor.runId,
+      nodeId: descriptor.nodeId,
+      attemptId: descriptor.attemptId
+    };
+    const lookupFn = graph.lookupCorrelation ?? lookup;
+    if (lookupFn(db, key) !== null)
+      throw new Error("This graph attempt was already reserved or dispatched. Reconcile or inspect its outcome.");
+
+    const operationId = this.deps.newId();
+    const compose = graph.composeReviewPacket ?? composeGraphHostReviewPacket;
+    const composed = compose(db, descriptor, operationId);
+
+    for (const [existingToken, existing] of this.pendingGraphReviews) {
+      if (
+        existing.review.runId === descriptor.runId &&
+        existing.review.nodeId === descriptor.nodeId
+      ) {
+        this.pendingGraphReviews.delete(existingToken);
+      }
+    }
+    while (this.pendingGraphReviews.size >= MAX_PENDING_REVIEWS) {
+      const oldest = this.pendingGraphReviews.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingGraphReviews.delete(oldest);
+    }
+
+    const token = this.deps.token();
+    const review: WorkstationGraphReview = {
+      token,
+      runId: descriptor.runId,
+      nodeId: descriptor.nodeId,
+      nodeTitle: descriptor.provenance.nodeTitle,
+      attemptId: descriptor.attemptId,
+      workflowId: descriptor.workflowId,
+      workflowRevision: descriptor.workflowRevision,
+      workflowSha256: descriptor.workflowSha256,
+      agentId: descriptor.agentId,
+      agentRevision: descriptor.agentRevision,
+      agentSha256: descriptor.agentSha256,
+      caseId: descriptor.caseId,
+      sourceTurnIds: [...descriptor.sourceTurnIds],
+      operationId,
+      runtimeId: descriptor.runtimeId,
+      modelId: descriptor.modelId,
+      instruction: descriptor.instruction,
+      systemPrompt: descriptor.systemPrompt,
+      descriptorSha256: composed.descriptorSha256,
+      sourceBindingSha256: composed.sourceBindingSha256,
+      requestSha256: composed.requestSha256,
+      preview: composed.preview,
+      contextPreview: composed.preview,
+      workspace: { ...workspace, path: canonicalPath },
+      projectId,
+      memoryEpoch,
+      expiresAt: this.deps.now() + REVIEW_TTL_MS
+    };
+
+    this.pendingGraphReviews.set(token, {
+      review,
+      descriptor,
+      request: composed.request,
+      owner
+    });
+    return review;
+  }
+
+  async startGraphNode(
+    input: { readonly token: string } | string,
+    owner: object
+  ): Promise<AutomationHostReconcileTerminalResult> {
+    this.expireReviews();
+    const graph = this.deps.graph;
+    const scope = this.localCaseScope;
+    if (!graph || !scope) throw new Error("Graph Host execution is unavailable.");
+
+    const token = typeof input === "string" ? input : input.token;
+    const reviewed = this.pendingGraphReviews.get(token);
+    this.pendingGraphReviews.delete(token);
+    if (reviewed === undefined)
+      throw new Error("That graph review has expired or was already used. Review the step again.");
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window's authority ended. Review the request again.");
+    if (reviewed.owner !== owner)
+      throw new Error("This window changed since that review. Review the step again.");
+
+    const { review } = reviewed;
+    const currentDescriptor = await graph.describeReview({
+      runId: review.runId,
+      nodeId: review.nodeId,
+      attemptId: review.attemptId
+    });
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window changed before the graph step could start.");
+
+    const compose = graph.composeReviewPacket ?? composeGraphHostReviewPacket;
+    const lookupFn = graph.lookupCorrelation ?? lookup;
+    const saveIntentFn = graph.saveIntent ?? saveIntent;
+    const recordDispatchFn = graph.recordDispatch ?? recordDispatch;
+    const recordTerminalFn = graph.recordTerminal ?? recordTerminal;
+    const recordTerminalTxFn =
+      graph.recordTerminalInExistingTransaction ?? recordTerminalInExistingTransaction;
+    const readProvenFn = graph.readProvenTerminal ?? readProvenGraphHostTerminal;
+
+    const key: GraphHostCorrelationKey = {
+      caseId: review.caseId,
+      graphRunId: review.runId,
+      nodeId: review.nodeId,
+      attemptId: review.attemptId
+    };
+
+    const assertCurrentReviewState = (): void => {
+      const db = this.deps.book();
+      const room = this.deps.readCase(db, review.caseId);
+      if (room === null || room.closedAt !== null)
+        throw new Error("This case is no longer open. Review the step again.");
+      const currentProjectId = this.deps.memory.projectForCase(db, review.caseId);
+      if (currentProjectId !== review.projectId)
+        throw new Error("This case changed projects after review. Review the step again.");
+      const currentEpoch =
+        currentProjectId === null ? 0 : this.deps.memory.epoch(db, currentProjectId);
+      if (currentEpoch !== review.memoryEpoch)
+        throw new Error("Project memory changed after review. Review the step again.");
+      const recomposed = compose(db, currentDescriptor, review.operationId);
+      if (
+        recomposed.descriptorSha256 !== review.descriptorSha256 ||
+        recomposed.sourceBindingSha256 !== review.sourceBindingSha256 ||
+        recomposed.requestSha256 !== review.requestSha256 ||
+        recomposed.preview !== review.preview
+      ) {
+        throw new Error("The reviewed graph inputs or case sources changed since you looked at them. Review again.");
+      }
+    };
+
+    assertCurrentReviewState();
+    if (lookupFn(this.deps.book(), key) !== null)
+      throw new Error("This graph attempt was already reserved or dispatched.");
+    this.assertAdmissible({
+      caseId: review.caseId,
+      providerId: "bundled-local",
+      workspacePath: review.workspace.path,
+      owner
+    });
+
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("workstation-agent");
+    try {
+      saveIntentFn(this.deps.book(), {
+        ...key,
+        descriptorSha256: review.descriptorSha256,
+        workflowSha256: review.workflowSha256,
+        agentSha256: review.agentSha256,
+        sourceTurnIds: review.sourceTurnIds,
+        runtimeId: review.runtimeId,
+        modelId: review.modelId,
+        createdAt: this.deps.now()
+      });
+
+      const reserved = await graph.reserveAttempt({
+        runId: review.runId,
+        nodeId: review.nodeId,
+        attemptId: review.attemptId,
+        descriptorSha256: review.descriptorSha256
+      });
+
+      await graph.bindOperation({
+        runId: review.runId,
+        nodeId: review.nodeId,
+        attemptId: review.attemptId,
+        operationId: review.operationId,
+        correlation: reserved.correlation
+      });
+
+      recordDispatchFn(this.deps.book(), {
+        ...key,
+        operationId: review.operationId,
+        dispatchedAt: this.deps.now()
+      });
+
+      try {
+        if (this.invalidatedOwners.has(owner))
+          throw new Error("This window changed before the graph step could start.");
+        assertCurrentReviewState();
+        this.assertAdmissible({
+          caseId: review.caseId,
+          providerId: "bundled-local",
+          workspacePath: review.workspace.path,
+          owner
+        });
+
+        await scope.run({
+          kind: "graph-node",
+          db: this.deps.book(),
+          caseId: review.caseId,
+          operationId: review.operationId,
+          modelId: review.modelId,
+          sourceTurnIds: review.sourceTurnIds,
+          workspacePath: review.workspace.path,
+          owner,
+          stop: async () => {
+            this.stoppedGraphOperations.add(review.operationId);
+            if (graph.stopNode) {
+              return graph.stopNode(review.caseId, review.operationId);
+            }
+            return { stopped: true };
+          },
+          graph: {
+            binding: {
+              ...key,
+              descriptorSha256: review.descriptorSha256
+            },
+            requestSha256: review.requestSha256,
+            validate: () => {
+              assertCurrentReviewState();
+            },
+            onFinish: (answerTurnId: string) => {
+              const dbCurrent = this.deps.book();
+              const turn = this.deps
+                .turnsFor(dbCurrent, review.caseId)
+                .find((candidate) => candidate.id === answerTurnId);
+              if (!turn)
+                throw new Error("Graph node answer turn is missing during completion.");
+              const resultSha256 = createHash("sha256")
+                .update(turn.body, "utf8")
+                .digest("hex");
+              recordTerminalTxFn(dbCurrent, {
+                ...key,
+                operationId: review.operationId,
+                outcome: "completed",
+                answerTurnId,
+                resultSha256,
+                terminalAt: this.deps.now()
+              });
+            },
+            onFailure: (interrupted: boolean) => {
+              const dbCurrent = this.deps.book();
+              const outcome: GraphHostTerminalOutcome = this.stoppedGraphOperations.has(
+                review.operationId
+              )
+                ? "stopped"
+                : interrupted
+                  ? "interrupted"
+                  : "failed";
+              recordTerminalTxFn(dbCurrent, {
+                ...key,
+                operationId: review.operationId,
+                outcome,
+                answerTurnId: null,
+                resultSha256: null,
+                terminalAt: this.deps.now()
+              });
+            }
+          },
+          work: async (hooks) => {
+            await graph.runNode({
+              db: this.deps.book(),
+              caseId: review.caseId,
+              nodeTitle: review.nodeTitle,
+              instruction: review.instruction,
+              sourceTurnIds: review.sourceTurnIds,
+              request: reviewed.request,
+              hooks
+            });
+          }
+        });
+      } catch (error) {
+        const dbAfter = this.deps.book();
+        const current = lookupFn(dbAfter, key);
+        if (current !== null && current.status !== "terminal") {
+          const outcome: GraphHostTerminalOutcome = this.stoppedGraphOperations.has(
+            review.operationId
+          )
+            ? "stopped"
+            : this.invalidatedOwners.has(owner)
+              ? "interrupted"
+              : "failed";
+          recordTerminalFn(dbAfter, {
+            ...key,
+            operationId: review.operationId,
+            outcome,
+            answerTurnId: null,
+            resultSha256: null,
+            terminalAt: this.deps.now()
+          });
+        }
+        this.stoppedGraphOperations.delete(review.operationId);
+        const evidence = readProvenFn(dbAfter, key, review.operationId);
+        if (evidence !== null) {
+          await graph.reconcileTerminal({
+            runId: review.runId,
+            nodeId: review.nodeId,
+            attemptId: review.attemptId,
+            correlation: reserved.correlation,
+            operationId: review.operationId,
+            terminalEvidence: evidence
+          });
+        }
+        throw error;
+      }
+
+      this.stoppedGraphOperations.delete(review.operationId);
+      const evidence = readProvenFn(this.deps.book(), key, review.operationId);
+      if (evidence === null)
+        throw new Error("Graph node finished without proven terminal evidence.");
+
+      return await graph.reconcileTerminal({
+        runId: review.runId,
+        nodeId: review.nodeId,
+        attemptId: review.attemptId,
+        correlation: reserved.correlation,
+        operationId: review.operationId,
+        terminalEvidence: evidence
+      });
+    } finally {
+      permit.release();
+    }
+  }
+
+  async stopGraphNode(
+    caseId: string,
+    operationId: string,
+    owner: object
+  ): Promise<{ stopped: boolean }> {
+    const scope = this.localCaseScope;
+    if (!scope) return { stopped: false };
+    const current = scope.current(caseId, owner);
+    if (!current || current.operationId !== operationId) {
+      return { stopped: false };
+    }
+    this.stoppedGraphOperations.add(operationId);
+    return scope.stop(caseId, operationId, owner);
+  }
+
+  async reconcileGraphHostRuns(): Promise<number> {
+    this.recover();
+    const db = this.deps.book();
+    this.localCaseScope?.recover(db);
+    this.localBriefScope?.recover(db);
+
+    const graph = this.deps.graph;
+    if (!graph?.snapshot) return 0;
+
+    const lookupFn = graph.lookupCorrelation ?? lookup;
+    const saveIntentFn = graph.saveIntent ?? saveIntent;
+    const recordDispatchFn = graph.recordDispatch ?? recordDispatch;
+    const recordTerminalFn = graph.recordTerminal ?? recordTerminal;
+    const readProvenFn = graph.readProvenTerminal ?? readProvenGraphHostTerminal;
+
+    const workspace = await graph.snapshot();
+    const activeLocalOps = new Set(
+      (this.localCaseScope?.sessions() ?? []).map((session) => session.operationId)
+    );
+    let reconciled = 0;
+
+    for (const run of workspace.runs) {
+      if (run.schemaVersion !== 2) continue;
+      for (const step of run.steps) {
+        if (step.attemptId === null) continue;
+        if (step.operationId !== null && activeLocalOps.has(step.operationId)) {
+          continue;
+        }
+
+        const key: GraphHostCorrelationKey = {
+          caseId: run.reviewBinding.caseId,
+          graphRunId: run.id,
+          nodeId: step.nodeId,
+          attemptId: step.attemptId
+        };
+
+        if (step.state === "awaiting-review" && step.intent === null) {
+          const preReserved = lookupFn(db, key);
+          if (preReserved === null) continue;
+          const reserved = await graph.reserveAttempt({
+            runId: run.id,
+            nodeId: step.nodeId,
+            attemptId: step.attemptId,
+            descriptorSha256: preReserved.intent.descriptorSha256
+          });
+          const opId =
+            preReserved.dispatch?.operationId ??
+            preReserved.terminal?.operationId ??
+            this.deps.newId();
+          if (preReserved.status === "reserved") {
+            recordDispatchFn(db, {
+              ...key,
+              operationId: opId,
+              dispatchedAt: this.deps.now()
+            });
+          }
+          const afterDispatch = lookupFn(db, key);
+          if (afterDispatch !== null && afterDispatch.status !== "terminal") {
+            recordTerminalFn(db, {
+              ...key,
+              operationId: opId,
+              outcome: "interrupted",
+              answerTurnId: null,
+              resultSha256: null,
+              terminalAt: this.deps.now()
+            });
+          }
+          const evidence = readProvenFn(db, key, opId);
+          if (evidence !== null) {
+            if (evidence.status !== "interrupted") {
+              await graph.bindOperation({
+                runId: run.id,
+                nodeId: step.nodeId,
+                attemptId: step.attemptId,
+                operationId: opId,
+                correlation: reserved.correlation
+              });
+            }
+            await graph.reconcileTerminal({
+              runId: run.id,
+              nodeId: step.nodeId,
+              attemptId: step.attemptId,
+              correlation: reserved.correlation,
+              operationId: opId,
+              terminalEvidence: evidence
+            });
+            reconciled += 1;
+          }
+          continue;
+        }
+
+        const isUnprovenInterrupted =
+          step.state === "interrupted" &&
+          step.error === "Unproven Host dispatch was interrupted by restart.";
+        const isCancelledWhileReserved =
+          step.state === "cancelled" &&
+          step.error === "Cancelled while reserved for Host.";
+        if (
+          step.intent === null ||
+          (step.state !== "host-reserved" &&
+            !isUnprovenInterrupted &&
+            !isCancelledWhileReserved)
+        ) {
+          continue;
+        }
+
+        let record = lookupFn(db, key);
+        if (record === null && this.deps.readCase(db, key.caseId) !== null) {
+          const workflowSha256 = createHash("sha256")
+            .update(JSON.stringify(run.workflowSnapshot ?? {}), "utf8")
+            .digest("hex");
+          const agentSha256 = createHash("sha256")
+            .update(JSON.stringify(step.agent), "utf8")
+            .digest("hex");
+          saveIntentFn(db, {
+            ...key,
+            descriptorSha256: step.intent.descriptorSha256,
+            workflowSha256,
+            agentSha256,
+            sourceTurnIds: run.reviewBinding.sourceTurnIds,
+            runtimeId: step.agent.runtimeId,
+            modelId: step.agent.modelId,
+            createdAt: this.deps.now()
+          });
+          record = lookupFn(db, key);
+        }
+
+        const opId =
+          step.operationId ??
+          record?.dispatch?.operationId ??
+          record?.terminal?.operationId ??
+          this.deps.newId();
+
+        if (record !== null && record.status === "reserved") {
+          recordDispatchFn(db, {
+            ...key,
+            operationId: opId,
+            dispatchedAt: this.deps.now()
+          });
+          record = lookupFn(db, key);
+        }
+
+        if (record !== null && record.status === "dispatched") {
+          recordTerminalFn(db, {
+            ...key,
+            operationId: opId,
+            outcome: "interrupted",
+            answerTurnId: null,
+            resultSha256: null,
+            terminalAt: this.deps.now()
+          });
+        }
+
+        const evidence =
+          record !== null
+            ? readProvenFn(db, key, opId)
+            : {
+                status: "interrupted" as const,
+                answerTurnId: null,
+                output: null,
+                outputSha256: null
+              };
+        if (evidence === null) continue;
+
+        if (
+          step.operationId === null &&
+          step.state === "host-reserved" &&
+          evidence.status !== "interrupted"
+        ) {
+          await graph.bindOperation({
+            runId: run.id,
+            nodeId: step.nodeId,
+            attemptId: step.attemptId,
+            operationId: opId,
+            correlation: step.intent.correlation
+          });
+        }
+
+        await graph.reconcileTerminal({
+          runId: run.id,
+          nodeId: step.nodeId,
+          attemptId: step.attemptId,
+          correlation: step.intent.correlation,
+          operationId: opId,
+          terminalEvidence: evidence
+        });
+        reconciled += 1;
+      }
+    }
+
+    return reconciled;
+  }
+
 
   /**
    * What a crash left behind, settled once per launch.
@@ -372,15 +1193,22 @@ export class WorkstationHost {
     input: {
       readonly caseId: string;
       readonly providerId: WorkstationProviderId;
-      readonly modelId?: string | undefined;
+      readonly modelId: string;
       readonly prompt: string;
       readonly sourceTurnIds: readonly string[];
+      /** Explicit owner-selected Crew audience, never inferred from prompt text. */
+      readonly contextRoleId?: string;
       readonly workspaceId?: string | undefined;
       readonly enableTools?: boolean | undefined;
     },
-    owner: object
+    owner: object,
+    policy: { readonly freshSession: true } | undefined = undefined
   ): Promise<WorkstationReview> {
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window's authority ended. Open a new review.");
     this.expireReviews();
+    if (input.contextRoleId !== undefined)
+      ProjectMemoryRoleIdSchema.parse(input.contextRoleId);
     const prompt = input.prompt.trim();
     if (prompt === "") throw new Error("Write what you want done before reviewing it.");
 
@@ -388,6 +1216,15 @@ export class WorkstationHost {
     const room = this.deps.readCase(db, input.caseId);
     if (room === null || room.closedAt !== null)
       throw new Error("Open this case before starting a workstation session.");
+
+    const projectId = this.deps.memory.projectForCase(db, input.caseId);
+    const memoryEpoch = projectId === null ? 0 : this.deps.memory.epoch(db, projectId);
+    const acceptedConstraints = projectId === null ? [] : this.deps.memory.constraints(db, projectId);
+    if (projectId !== null && !this.deps.memory.findings)
+      throw new Error("Project finding context is unavailable. Nothing was sent.");
+    const approvedFindings = projectId === null ? [] : this.deps.memory.findings!(db, projectId);
+    if (projectId !== null && this.deps.memory.epoch(db, projectId) !== memoryEpoch)
+      throw new Error("Project memory changed while preparing context. Review again.");
 
     const sources = this.selectSources(db, input.caseId, input.sourceTurnIds);
     const enableTools = input.enableTools === true;
@@ -418,7 +1255,11 @@ export class WorkstationHost {
     }
     const launch = await this.launchFor(input.providerId);
     const modelId = chosenModel(launch.provider, input.modelId);
-    const workspace = await this.resolveWorkspace(input.caseId, input.workspaceId, owner);
+    const selectedWorkspace = await this.resolveWorkspace(input.caseId, input.workspaceId, owner);
+    const canonicalPath = await this.deps.canonicalWorkspacePath(selectedWorkspace.path);
+    const workspace: WorkstationWorkspace = Object.freeze({ ...selectedWorkspace, path: canonicalPath });
+    const workspaceProblem = whyWorkspaceUnsuitable(canonicalPath);
+    if (workspaceProblem !== null) throw new Error(workspaceProblem);
     // Refused at review, not at send: showing somebody a packet for a session
     // that cannot start is worse than saying so before they read it.
     this.assertAdmissible({
@@ -431,8 +1272,39 @@ export class WorkstationHost {
     const context = this.deps.buildContext({
       prompt,
       sources,
-      maxChars: MAX_PACKET_CHARS
+      maxChars: MAX_PACKET_CHARS,
+      acceptedConstraints,
+      approvedFindings,
+      ...(input.contextRoleId === undefined ? {} : { taskRole: input.contextRoleId })
     });
+    if (input.contextRoleId !== undefined) {
+      let scope: unknown;
+      try {
+        const parsed: unknown = JSON.parse(context.packet);
+        const policy = typeof parsed === "object" && parsed !== null
+          ? (parsed as Record<string, unknown>)["policy"] : undefined;
+        scope = typeof policy === "object" && policy !== null
+          ? (policy as Record<string, unknown>)["contextRoleId"] : undefined;
+      } catch {
+        throw new Error("The context did not bind the selected role. Nothing was sent.");
+      }
+      if (scope !== input.contextRoleId)
+        throw new Error("The context did not bind the selected role. Nothing was sent.");
+    }
+    if (acceptedConstraints.length > 0 &&
+        JSON.stringify(context.constraintIds ?? []) !== JSON.stringify(acceptedConstraints.map((item) => item.id)))
+      throw new Error("The context did not include every approved project constraint. Nothing was sent.");
+    const findingDecisions = context.findingDecisions ?? [];
+    if (approvedFindings.length > 0) {
+      const expected = new Map(approvedFindings.map((item) => [item.id, item]));
+      if (findingDecisions.length !== expected.size ||
+          findingDecisions.some((decision) => {
+            const finding = expected.get(decision.id);
+            return !finding || finding.revision !== decision.revision ||
+              (decision.included && finding.provenance !== "verified");
+          }) || new Set(findingDecisions.map((decision) => decision.id)).size !== expected.size)
+        throw new Error("The context did not account for every approved project finding. Nothing was sent.");
+    }
     const packet = context.packet;
     if (packet.trim() === "")
       throw new Error("There is nothing to send. Select a source or write more of the request.");
@@ -461,9 +1333,9 @@ export class WorkstationHost {
     // continuing a saved one would attach this reviewed source scope to
     // definitions nobody reviewed for it. Tools therefore start fresh, and the
     // review says so rather than letting the owner discover it afterwards.
-    const resumeSessionId = enableTools
+    const resumeSessionId = enableTools || policy?.freshSession === true
       ? null
-      : this.resumableSession(db, input.caseId, input.providerId, workspace);
+      : this.resumableSession(db, input.caseId, input.providerId, modelId, workspace, projectId, memoryEpoch);
     const reviewTools: WorkstationReviewTools | null =
       enableTools && tools !== undefined
         ? {
@@ -483,6 +1355,24 @@ export class WorkstationHost {
         : null;
     const now = this.deps.now();
     const token = this.deps.token();
+    const contextSnapshotId = this.deps.newId();
+    const savedContext = this.deps.memory.saveSnapshot(db, {
+      id: contextSnapshotId,
+      caseId: input.caseId,
+      projectId,
+      memoryEpoch,
+      providerId: input.providerId,
+      modelId,
+      packet,
+      manifest: {
+        preview: context.preview,
+        sourceIds: [...context.sourceIds],
+        omitted: [...context.omitted],
+        constraints: acceptedConstraints.map(({ id, revision }) => ({ id, revision }))
+      }
+    }, now);
+    if (savedContext.packet !== packet || savedContext.packetHash !== sha256(packet))
+      throw new Error("The saved review does not match the context packet. Nothing was sent.");
     const review: WorkstationReview = Object.freeze({
       token,
       caseId: input.caseId,
@@ -497,6 +1387,9 @@ export class WorkstationHost {
       contextPreview: packet,
       sourceIds: Object.freeze([...input.sourceTurnIds]),
       sourceHash: sha256(packet),
+      projectId,
+      memoryEpoch,
+      contextSnapshotId,
       workspace,
       expiresAt: now + REVIEW_TTL_MS,
       resumeSessionId,
@@ -519,13 +1412,18 @@ export class WorkstationHost {
       // carries what the packet actually contains, and the two agree because a
       // packet that omitted anything was refused above.
       sourceIds: Object.freeze([...input.sourceTurnIds]),
-      enableTools
+      enableTools,
+      projectId,
+      memoryEpoch,
+      contextSnapshotId,
+      includedFindingRefs: findingDecisions.filter((decision) => decision.included)
+        .map(({ id, revision }) => ({ id, revision }))
     });
     return review;
   }
 
   /**
-   * Spends the token and starts. Returns as soon as the record is durable.
+   * Spends the token and starts after the record and preimage are durable.
    *
    * The token is removed from the map on the first line, before anything else is
    * checked, so a replay races against nothing — the second caller finds an
@@ -534,15 +1432,19 @@ export class WorkstationHost {
    * and only then is a process created. What comes back is a snapshot; the
    * answer arrives through `state`.
    */
-  async start(input: { readonly token: string }, owner: object): Promise<WorkstationSnapshot> {
+  async start(input: { readonly token: string }, owner: object, signal?: AbortSignal): Promise<WorkstationSnapshot> {
     const reviewed = this.pending.get(input.token);
     this.pending.delete(input.token);
     if (reviewed === undefined)
       throw new Error("That review has already been used or is no longer valid. Review the request again.");
+    if (this.invalidatedOwners.has(owner))
+      throw new Error("This window's authority ended. Review the request again.");
     if (reviewed.owner !== owner)
       throw new Error("This window changed since that review. Review the request again.");
     if (this.deps.now() > reviewed.review.expiresAt)
       throw new Error("That review expired. Review the request again.");
+    if (signal?.aborted)
+      throw new Error("Stopped before the provider was asked.");
 
     const db = this.deps.book();
     const room = this.deps.readCase(db, reviewed.review.caseId);
@@ -551,6 +1453,7 @@ export class WorkstationHost {
     const sources = this.selectSources(db, reviewed.review.caseId, reviewed.sourceIds);
     if (fingerprintOf(room, sources) !== reviewed.fingerprint)
       throw new Error("This case changed after that review. Review the request again before sending it.");
+    this.assertMemoryCurrent(db, reviewed);
     // Re-checked here as well: another session may have taken this folder or
     // this subscription in the time the review was on screen.
     this.assertAdmissible({
@@ -565,10 +1468,14 @@ export class WorkstationHost {
     if (executable === null)
       throw new Error(`${review.providerLabel} is not installed on this Mac.`);
 
+    const quiescencePermit = this.quiescenceCoordinator.acquireWriterPermit("session-pool");
     const startedAt = this.deps.now();
     const run: RunState = {
       operationId: this.deps.newId(),
       caseId: review.caseId,
+      projectId: reviewed.projectId,
+      memoryEpoch: reviewed.memoryEpoch,
+      contextSnapshotId: reviewed.contextSnapshotId,
       providerId: review.providerId,
       providerLabel: review.providerLabel,
       modelId: review.modelId,
@@ -579,6 +1486,7 @@ export class WorkstationHost {
       status: "starting",
       updatedAt: startedAt,
       text: "",
+      answerTurnId: null,
       truncated: false,
       activity: [],
       reportedModelId: null,
@@ -591,7 +1499,8 @@ export class WorkstationHost {
       stopping: false,
       finished: false,
       lastEventAt: startedAt,
-      lastCheckpointAt: startedAt
+      lastCheckpointAt: startedAt,
+      quiescencePermit
     };
 
     // Built from `sources` — the array just re-read and just fingerprint-checked
@@ -616,53 +1525,74 @@ export class WorkstationHost {
       });
     }
 
-    // Durable before dispatch, and all three in one transaction: a prompt
-    // recorded without its start receipt would read as something the owner said
-    // to nobody, a start receipt without the prompt is a session about nothing,
-    // and a durable session record committed separately from either can outlive
-    // a failure that rolled the other two back.
-    this.deps.transaction(db, () => {
-      this.deps.appendTurn(db, run.caseId, {
-        seat: "owner",
-        kind: "verbatim",
-        body: review.prompt
-      });
-      this.deps.appendTurn(db, run.caseId, {
-        seat: "workstation",
-        kind: "receipt",
-        body: startReceiptBody(run, review)
-      });
-      this.deps.saveReceipt(db, run.caseId, this.receipt(run, "start"));
-    });
-
+    // Reserve the reviewed case, provider and canonical path before awaiting
+    // the preimage. Another start must see this pending run in the same pool.
     this.active.set(run.operationId, run);
-    if (this.deps.onRunStart !== undefined) {
-      try {
-        this.deps.onRunStart({
-          caseId: run.caseId,
-          operationId: run.operationId,
-          workspacePath: review.workspace.path
+    try {
+      // Durable before dispatch, and all three in one transaction: a prompt
+      // recorded without its start receipt would read as something the owner
+      // said to nobody, and a start receipt without the prompt is incomplete.
+      this.deps.transaction(db, () => {
+        this.deps.appendTurn(db, run.caseId, {
+          seat: "owner",
+          kind: "verbatim",
+          body: review.prompt
         });
-      } catch {
-        // Recording what a folder looked like is not a reason to refuse to work in it.
+        this.deps.appendTurn(db, run.caseId, {
+          seat: "workstation",
+          kind: "receipt",
+          body: startReceiptBody(run, review)
+        });
+        this.deps.saveReceipt(db, run.caseId, this.receipt(run, "start"));
+      });
+
+      const preimageSaved = await this.deps.onRunStart({
+        caseId: run.caseId,
+        operationId: run.operationId,
+        workspacePath: review.workspace.path
+      });
+      if (signal?.aborted || run.stopping || run.finished)
+        throw new Error("Stopped before the provider was asked.");
+      if (!preimageSaved)
+        throw new Error("Could not cover this workspace with a saved preimage. Choose a narrower folder or check file access. Nothing was sent.");
+
+      // The owner could close the case or edit a selected source while the
+      // snapshot was pending. Never dispatch a packet whose review has drifted.
+      const currentDb = this.deps.book();
+      const currentRoom = this.deps.readCase(currentDb, run.caseId);
+      if (currentRoom === null || currentRoom.closedAt !== null)
+        throw new Error("This case closed while its folder was being saved. Nothing was sent.");
+      const currentSources = this.selectSources(currentDb, run.caseId, reviewed.sourceIds);
+      if (fingerprintOf(currentRoom, currentSources) !== reviewed.fingerprint)
+        throw new Error("This case changed while its folder was being saved. Review the request again.");
+      this.assertMemoryCurrent(currentDb, reviewed);
+      if (signal?.aborted)
+        throw new Error("Stopped before the provider was asked.");
+
+      // Absent model, profile and resume ids remain absent in adapter options.
+      const options: MutableWorkerOptions = {
+        executable,
+        cwd: review.workspace.path,
+        onEvent: (event: NativeEvent) => {
+          this.onEvent(run, event);
+        }
+      };
+      if (review.modelId !== null) options.modelId = review.modelId;
+      if (launch.profileHome !== undefined) options.profileHome = launch.profileHome;
+      if (review.resumeSessionId !== null) options.resumeId = review.resumeSessionId;
+      if (run.toolSession !== null) options.tools = run.toolSession;
+      this.deps.memory.markDispatchAttempt(currentDb, run.contextSnapshotId, run.caseId, run.projectId, this.deps.now());
+      this.running.set(run.operationId, this.execute(run, reviewed.packet, options));
+      return this.snapshot(run);
+    } catch (error) {
+      try {
+        this.fail(run, error, run.stopping ? "stopped" : "failed");
+      } finally {
+        this.disposeTools(run);
+        this.retire(run);
       }
+      throw error;
     }
-    // Built by assignment rather than by spreading conditionals: an absent
-    // model, profile or resume id must be *absent*, not present and undefined,
-    // or an adapter cannot tell "use the default" from "use nothing".
-    const options: MutableWorkerOptions = {
-      executable,
-      cwd: review.workspace.path,
-      onEvent: (event: NativeEvent) => {
-        this.onEvent(run, event);
-      }
-    };
-    if (review.modelId !== null) options.modelId = review.modelId;
-    if (launch.profileHome !== undefined) options.profileHome = launch.profileHome;
-    if (review.resumeSessionId !== null) options.resumeId = review.resumeSessionId;
-    if (run.toolSession !== null) options.tools = run.toolSession;
-    this.running.set(run.operationId, this.execute(run, reviewed.packet, options));
-    return this.snapshot(run);
   }
 
   /**
@@ -684,6 +1614,43 @@ export class WorkstationHost {
     } catch {
       // No book open yet. A missing snapshot is the honest answer.
       return null;
+    }
+  }
+
+  /** Waits for one host-owned operation, including a Stop that is still settling. */
+  async awaitTerminal(caseId: string, operationId: string, owner: object,
+    signal?: AbortSignal, onActivity?: (line: string) => void): Promise<WorkstationSnapshot> {
+    const live = this.active.get(operationId);
+    if (live !== undefined && (live.caseId !== caseId || live.owner !== owner))
+      throw new Error("That reviewed session belongs to another work or window.");
+    const finished = this.finished.get(caseId);
+    if (live === undefined && finished?.operationId !== operationId)
+      throw new Error("That reviewed session is no longer available.");
+    if (live === undefined && this.finishedOwners.get(operationId) !== owner)
+      throw new Error("That reviewed session belongs to another window.");
+    const task = this.running.get(operationId);
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const stop = () => { void this.stop(caseId, operationId, owner).catch(() => undefined); };
+    if (signal?.aborted) stop();
+    else signal?.addEventListener("abort", stop, { once: true });
+    if (onActivity !== undefined && task !== undefined) {
+      let last = "";
+      timer = setInterval(() => {
+        const line = this.state(caseId)?.activity.at(-1) ?? "";
+        if (line !== "" && line !== last) { last = line; onActivity(line); }
+      }, 300);
+      if (typeof timer.unref === "function") timer.unref();
+    }
+    try {
+      if (task !== undefined) await task;
+      const result = this.finished.get(caseId);
+      if (result?.operationId !== operationId || this.finishedOwners.get(operationId) !== owner ||
+          !TERMINAL_STATUSES.has(result.status))
+        throw new Error("That session did not reach a recorded terminal state.");
+      return result;
+    } finally {
+      signal?.removeEventListener("abort", stop);
+      if (timer !== null) clearInterval(timer);
     }
   }
 
@@ -712,6 +1679,44 @@ export class WorkstationHost {
         : `Stop requested but not acknowledged: ${acknowledgement.detail}`
     );
     return this.snapshot(run);
+  }
+
+  /** Narrow primitive for a future atomic, Mac-approved remote principal transition.
+   * This does not revoke a bearer or authorize a handover by itself. The caller
+   * must perform both in one synchronous server transaction before exposing
+   * the new principal. No pending permission or tool authority is transferred.
+   */
+  handoverActiveRun(caseId: string, operationId: string, oldOwner: object, newOwner: object): WorkstationSnapshot {
+    if (oldOwner === newOwner || this.invalidatedOwners.has(oldOwner) || this.invalidatedOwners.has(newOwner))
+      throw new Error("The handover owners are not distinct and current.");
+    const run = this.activeFor(caseId, operationId, oldOwner);
+    if (run.status !== "running" || run.stopping || run.worker === null ||
+        run.waiting.length > 0 || run.decidingPermissionId !== null || run.toolSession !== null ||
+        !this.running.has(operationId))
+      throw new Error("This run cannot be handed over while starting, stopping, or awaiting authority.");
+    if (this.liveRuns().some((item) => item !== run && item.owner === newOwner) ||
+        [...this.pending.values()].some((review) => review.owner === newOwner) ||
+        [...this.pendingGraphReviews.values()].some((review) => review.owner === newOwner))
+      throw new Error("The new owner already has workstation authority.");
+    if (this.liveRuns().some((item) => item !== run && item.owner === oldOwner && item.status === "starting"))
+      throw new Error("Another run is still starting for the old owner.");
+    // No await: old exact Stop fails as soon as this assignment happens. The
+    // server transaction must revoke the old bearer in the same event-loop turn.
+    run.owner = newOwner;
+    for (const [token, review] of this.pending)
+      if (review.owner === oldOwner) this.pending.delete(token);
+    for (const [token, review] of this.pendingGraphReviews)
+      if (review.owner === oldOwner) this.pendingGraphReviews.delete(token);
+    this.invalidatedOwners.add(oldOwner);
+    return this.snapshot(run);
+  }
+
+  /** Called only after the paired phone has passed its owner-chat check. */
+  async stopFromPhone(caseId: string, operationId: string): Promise<WorkstationSnapshot> {
+    const run = this.active.get(operationId);
+    if (run === undefined || run.finished || run.caseId !== caseId)
+      throw new Error("That session is no longer running.");
+    return this.stop(caseId, operationId, run.owner);
   }
 
   /**
@@ -760,6 +1765,14 @@ export class WorkstationHost {
     return this.snapshot(run);
   }
 
+  /** The paired phone names the exact announced call, never an oldest slot. */
+  async decideFromPhone(operationId: string, permissionId: string, allow: boolean): Promise<WorkstationSnapshot> {
+    const run = this.active.get(operationId);
+    if (run === undefined || run.finished)
+      throw new Error("That session is no longer running.");
+    return this.decide(operationId, permissionId, allow, run.owner);
+  }
+
   /**
    * Every session alive right now.
    *
@@ -771,19 +1784,52 @@ export class WorkstationHost {
     return this.liveRuns().map((run) => this.snapshot(run));
   }
 
+  /** Remote state and decisions may see only sessions owned by their paired principal. */
+  snapshotsForOwner(owner: object): readonly WorkstationSnapshot[] {
+    const live = this.liveRuns().filter((run) => run.owner === owner).map((run) => this.snapshot(run));
+    const recent = [...this.finished].filter(([, snapshot]) => this.finishedOwners.get(snapshot.operationId) === owner)
+      .map(([, snapshot]) => snapshot);
+    return [...live, ...recent].sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  /** Coordinators register their queued work so a global Stop reaches it too. */
+  registerParentStop(hook: () => Promise<boolean>): () => void {
+    this.parentStopHooks.add(hook);
+    return () => { this.parentStopHooks.delete(hook); };
+  }
+
+  /** Called only after a paired-phone or equally trusted global Stop check. */
+  async stopAllFromPhone(): Promise<{ readonly parents: number; readonly sessions: number; readonly failures: number }> {
+    const hooks = [...this.parentStopHooks];
+    const parentResults = await Promise.allSettled(hooks.map((hook) => hook()));
+    let failures = parentResults.filter((result) => result.status === "rejected").length;
+    const live = this.liveSnapshots().filter((snapshot) => snapshot.status !== "stopping");
+    for (const snapshot of live) {
+      try { await this.stopFromPhone(snapshot.caseId, snapshot.operationId); }
+      catch { failures += 1; }
+    }
+    const local = this.localCaseScope?.sessions() ?? [];
+    for (const run of local) {
+      try { await this.localCaseScope?.stopSession(run.operationId, run.owner); }
+      catch { failures += 1; }
+    }
+    const briefs = this.localBriefScope?.sessions() ?? [];
+    for (const run of briefs) {
+      try { this.localBriefScope?.stop(run.operationId, run.owner); }
+      catch { failures += 1; }
+    }
+    return { parents: parentResults.filter((result) => result.status === "fulfilled" && result.value).length,
+      sessions: live.length + local.length + briefs.length, failures };
+  }
+
   /**
-   * One provider, one question, no workspace, no tools, no session.
+   * One provider and one prompt outside the host-owned reviewed run.
    *
-   * Deliberately not a run: `admit` refuses a second session in a case because
-   * two of them writing files and interleaving answers corrupts both, and that
-   * is right for sessions. This writes nothing and holds nothing — it asks, and
-   * the caller decides what to do with the text — so several may go at once in
-   * one case, which is the whole point of asking three subscriptions the same
-   * question. It is also why there is no tool scope here and no way to pass one:
-   * the capability is absent rather than forbidden.
-   *
-   * The caller is responsible for having had the question reviewed. This is a
-   * seam, not a door around the review.
+   * This bypasses `admit` and its case/workspace concurrency rules. The worker
+   * receives the caller's cwd, and provider adapters may have their own file,
+   * tool or network capabilities. There is no host-enforced read-only scope,
+   * preimage barrier or durable run ownership here. Callers must supply their
+   * own review and treat the returned outcome as evidence, not an approval.
    */
   async askOnce(input: {
     readonly providerId: WorkstationProviderId;
@@ -792,15 +1838,19 @@ export class WorkstationHost {
     readonly modelId?: string;
     readonly signal: AbortSignal;
     readonly onActivity?: (text: string) => void;
-  }): Promise<{ readonly text: string; readonly sessionId: string | null }> {
+  }): Promise<NativeAskOutcome> {
     const launch = await this.launchFor(input.providerId);
     if (launch.executable === null) throw new Error("That provider is not installed on this Mac.");
     if (input.signal.aborted) throw new Error("Stopped before the provider was asked.");
 
+    let streamedText = "";
+    let observedSessionId: string | null = null;
     const options: MutableWorkerOptions = {
       executable: launch.executable,
       cwd: input.cwd,
       onEvent: (event) => {
+        if (event.type === "text") streamedText += event.text;
+        if (event.type === "session") observedSessionId = event.sessionId;
         if (event.type === "activity" && input.onActivity !== undefined) input.onActivity(event.text);
       }
     };
@@ -814,8 +1864,22 @@ export class WorkstationHost {
     input.signal.addEventListener("abort", stop, { once: true });
     try {
       const result = await worker.run(input.prompt);
-      if (input.signal.aborted) throw new Error("Stopped.");
-      return { text: result.text, sessionId: result.sessionId };
+      return {
+        ...result,
+        requestedModelId: input.modelId ?? null,
+        cancellationRequested: input.signal.aborted,
+        resultSource: "worker"
+      };
+    } catch (problem) {
+      return {
+        text: streamedText,
+        sessionId: observedSessionId,
+        finishReason: "failed",
+        requestedModelId: input.modelId ?? null,
+        cancellationRequested: input.signal.aborted,
+        resultSource: "transport",
+        detail: problem instanceof Error ? problem.message : "The provider could not finish this request."
+      };
     } finally {
       input.signal.removeEventListener("abort", stop);
       await worker.dispose().catch(() => undefined);
@@ -824,8 +1888,53 @@ export class WorkstationHost {
 
   /** Closing or erasing a case while it is working would strand the session. */
   assertIdle(caseId: string): void {
-    if (this.liveRuns().some((run) => run.caseId === caseId))
+    this.localCaseScope?.assertIdle(caseId);
+    if (this.liveRuns().some((run) => run.caseId === caseId) ||
+        [...this.restoreLeases.values()].some((lease) => lease.caseId === caseId))
       throw new Error("Stop the workstation session before closing or erasing this case.");
+  }
+
+  /** Reserve a canonical workspace for restore before awaiting a durable preimage. */
+  async withFileRestoreLease<T>(
+    caseId: string,
+    workspacePath: string,
+    owner: object,
+    action: () => Promise<T>
+  ): Promise<T> {
+    const canonicalPath = await this.deps.canonicalWorkspacePath(workspacePath);
+    const room = this.deps.readCase(this.deps.book(), caseId);
+    if (room === null || room.closedAt !== null) {
+      throw new Error("This case is no longer open. Nothing was restored.");
+    }
+    // No await between admission and reservation: starts and restores see the
+    // same lane, including the time spent saving the preimage.
+    this.assertAdmissible({ caseId, providerId: "file restore", workspacePath: canonicalPath, owner });
+    const permit = this.quiescenceCoordinator.acquireWriterPermit("restore-lease");
+    const operationId = this.deps.newId();
+    this.restoreLeases.set(operationId, {
+      operationId, caseId, workspacePath: canonicalPath, owner,
+      startedAt: this.deps.now()
+    });
+    try {
+      return await action();
+    } finally {
+      this.restoreLeases.delete(operationId);
+      permit.release();
+    }
+  }
+
+  /** Mutation cannot revoke context while a provider still has it in flight. */
+  assertProjectIdle(projectId: string): void {
+    this.localCaseScope?.assertProjectIdle(projectId);
+    if (this.liveRuns().some((run) => run.projectId === projectId))
+      throw new Error("Stop this project's workstation session, then retry changing memory.");
+  }
+
+  invalidateProjectReviews(projectId: string): void {
+    for (const [token, review] of this.pending)
+      if (review.projectId === projectId) this.pending.delete(token);
+    for (const [token, review] of this.pendingGraphReviews)
+      if (review.review.projectId === projectId) this.pendingGraphReviews.delete(token);
   }
 
   /**
@@ -836,8 +1945,13 @@ export class WorkstationHost {
    * because there is no longer anywhere to show what it is doing.
    */
   invalidate(owner: object): void {
+    this.invalidatedOwners.add(owner);
+    this.localCaseScope?.invalidate(owner);
+    this.localBriefScope?.invalidate(owner);
     for (const [token, review] of this.pending)
       if (review.owner === owner) this.pending.delete(token);
+    for (const [token, review] of this.pendingGraphReviews)
+      if (review.owner === owner) this.pendingGraphReviews.delete(token);
     for (const [id, chosen] of this.workspaces)
       if (chosen.owner === owner) this.workspaces.delete(id);
     // Every session that window started, not just the newest one.
@@ -854,6 +1968,8 @@ export class WorkstationHost {
    * holding the quit open on a process that is not listening.
    */
   async shutdown(): Promise<void> {
+    await this.localCaseScope?.shutdown();
+    await this.localBriefScope?.shutdown();
     const live = this.liveRuns();
     await Promise.all(live.map((run) => this.interruptQuietly(run, "Cadrane is quitting.")));
     const running = [...this.running.values()];
@@ -890,11 +2006,34 @@ export class WorkstationHost {
       const db = this.deps.book();
       const room = this.deps.readCase(db, run.caseId);
       if (room === null || room.closedAt !== null) return false;
+      this.assertMemoryCurrent(db, reviewed);
       const current = this.selectSources(db, run.caseId, reviewed.sourceIds);
       return fingerprintOf(room, current) === reviewed.fingerprint;
     } catch {
       return false;
     }
+  }
+
+  private assertMemoryCurrent(db: DatabaseSync, reviewed: PendingReview): void {
+    if (this.deps.memory.projectForCase(db, reviewed.review.caseId) !== reviewed.projectId)
+      throw new Error("This case changed projects after review. Review again.");
+    if (reviewed.projectId !== null && this.deps.memory.epoch(db, reviewed.projectId) !== reviewed.memoryEpoch)
+      throw new Error("Project memory changed after review. Review again.");
+    if (reviewed.projectId !== null && reviewed.includedFindingRefs.length > 0) {
+      if (!this.deps.memory.findings)
+        throw new Error("Project finding context is unavailable. Review again.");
+      const currentFindings = new Map(this.deps.memory.findings(db, reviewed.projectId)
+        .map((finding) => [finding.id, finding]));
+      for (const ref of reviewed.includedFindingRefs) {
+        const current = currentFindings.get(ref.id);
+        if (!current || current.revision !== ref.revision || current.provenance !== "verified")
+          throw new Error("An approved finding's source changed after review. Review again.");
+      }
+    }
+    const saved = this.deps.memory.readSnapshot(db, reviewed.contextSnapshotId, reviewed.review.caseId, reviewed.projectId);
+    if (!saved || saved.packet !== reviewed.packet || saved.packetHash !== reviewed.review.sourceHash ||
+        saved.memoryEpoch !== reviewed.memoryEpoch)
+      throw new Error("The reviewed context is unavailable or changed. Review again.");
   }
 
   /**
@@ -936,14 +2075,18 @@ export class WorkstationHost {
     readonly owner: object;
   }): void {
     const decision = admit(
-      this.liveRuns().map((run) => ({
+      [...this.liveRuns().map((run) => ({
         operationId: run.operationId,
         caseId: run.caseId,
         providerId: run.providerId,
         workspacePath: run.workspace.path,
         owner: run.owner,
         startedAt: run.startedAt
-      })),
+      })), ...(this.localCaseScope?.sessions() ?? []), ...(this.localBriefScope?.sessions() ?? []),
+      ...[...this.restoreLeases.values()].map((lease) => ({
+        ...lease,
+        providerId: ""
+      }))],
       request,
       this.deps.now()
     );
@@ -1019,12 +2162,22 @@ export class WorkstationHost {
     db: DatabaseSync,
     caseId: string,
     providerId: WorkstationProviderId,
-    workspace: WorkstationWorkspace
+    modelId: string | null,
+    workspace: WorkstationWorkspace,
+    projectId: string | null,
+    memoryEpoch: number
   ): string | null {
     const receipt = this.deps.latestReceipt(db, caseId, providerId);
     if (receipt === null) return null;
     if (receipt.workspacePath !== workspace.path) return null;
     if (receipt.snapshot.providerId !== providerId) return null;
+    if (receipt.snapshot.modelId !== modelId) return null;
+    if (receipt.projectId === undefined || receipt.projectId !== projectId) return null;
+    if (!receipt.contextSnapshotId) return null;
+    const context = this.deps.memory.readSnapshot(db, receipt.contextSnapshotId, caseId, projectId);
+    if (!context || context.packet === null || context.manifest === null ||
+        context.memoryEpoch !== memoryEpoch || context.providerId !== providerId ||
+        context.modelId !== modelId || context.dispatchAttemptedAt === null) return null;
     const sessionId = receipt.snapshot.sessionId;
     return sessionId === null || sessionId === "" ? null : sessionId;
   }
@@ -1033,6 +2186,8 @@ export class WorkstationHost {
     const now = this.deps.now();
     for (const [token, review] of this.pending)
       if (now > review.review.expiresAt) this.pending.delete(token);
+    for (const [token, review] of this.pendingGraphReviews)
+      if (now > review.review.expiresAt) this.pendingGraphReviews.delete(token);
   }
 
   private async execute(
@@ -1288,6 +2443,7 @@ export class WorkstationHost {
             kind: "verbatim",
             body: status === "completed" ? answer : partialBody(answer, detail)
           });
+          run.answerTurnId = turnId;
           this.deps.appendTurn(db, run.caseId, {
             seat: "workstation",
             kind: "receipt",
@@ -1311,9 +2467,8 @@ export class WorkstationHost {
       );
   }
 
-  private fail(run: RunState, error: unknown): void {
+  private fail(run: RunState, error: unknown, status: WorkstationStatus = run.stopping ? "interrupted" : "failed"): void {
     const reason = error instanceof Error ? error.message : "The session failed.";
-    const status: WorkstationStatus = run.stopping ? "interrupted" : "failed";
     const answer = run.text.trim();
     const detail = answer === "" ? reason : `${reason} The partial answer above was kept.`;
     this.remember(run.providerId, status, reason);
@@ -1328,6 +2483,7 @@ export class WorkstationHost {
             kind: "verbatim",
             body: partialBody(answer, detail)
           });
+          run.answerTurnId = turnId;
           this.deps.appendTurn(db, run.caseId, {
             seat: "workstation",
             kind: "receipt",
@@ -1370,14 +2526,21 @@ export class WorkstationHost {
     run.finished = true;
     run.waiting = [];
     run.updatedAt = this.deps.now();
+    const previous = this.finished.get(run.caseId);
+    if (previous !== undefined) this.finishedOwners.delete(previous.operationId);
     this.finished.set(run.caseId, this.snapshot(run));
+    this.finishedOwners.set(run.operationId, run.owner);
     while (this.finished.size > MAX_REMEMBERED_CASES) {
       const oldest = this.finished.keys().next();
       if (oldest.done) break;
+      const forgotten = this.finished.get(oldest.value);
+      if (forgotten !== undefined) this.finishedOwners.delete(forgotten.operationId);
       this.finished.delete(oldest.value);
     }
     this.active.delete(run.operationId);
     this.running.delete(run.operationId);
+    run.quiescencePermit?.release();
+    delete run.quiescencePermit;
   }
 
   private receipt(run: RunState, event: WorkstationSessionReceipt["event"]): WorkstationSessionReceipt {
@@ -1385,7 +2548,9 @@ export class WorkstationHost {
       version: 1,
       event,
       snapshot: this.snapshot(run),
-      workspacePath: run.workspace.path
+      workspacePath: run.workspace.path,
+      contextSnapshotId: run.contextSnapshotId,
+      projectId: run.projectId
     };
     return Object.freeze(receipt);
   }
@@ -1402,6 +2567,7 @@ export class WorkstationHost {
       startedAt: run.startedAt,
       updatedAt: run.updatedAt,
       text: run.text,
+      answerTurnId: run.answerTurnId,
       activity: Object.freeze([...run.activity]),
       permission: run.waiting[0] ?? null,
       detail: run.detail
@@ -1453,6 +2619,7 @@ function startReceiptBody(run: RunState, review: WorkstationReview): string {
     `Workstation ${run.operationId} started with ${review.providerLabel}${review.modelId === null ? "" : ` · ${review.modelId}`}.`,
     `Workspace: ${review.workspace.label} (${review.workspace.path}).`,
     `Reviewed packet SHA-256: ${review.sourceHash}.`,
+    `Reviewed context snapshot: ${run.contextSnapshotId}.`,
     `Selected sources: ${review.sourceIds.length === 0 ? "none" : review.sourceIds.join(", ")}.`,
     review.resumeSessionId === null
       ? "New provider session."
@@ -1524,12 +2691,14 @@ export function workspaceFolderName(caseId: string): string {
   return safe;
 }
 
-function chosenModel(provider: WorkstationProvider, requested: string | undefined): string | null {
-  if (requested === undefined || requested.trim() === "") return null;
+function chosenModel(provider: WorkstationProvider, requested: string): string {
+  if (requested.trim() === "")
+    throw new Error("Choose a model before reviewing this request.");
   const wanted = requested.trim();
-  // Only a model the provider itself advertised. A name this host has never
-  // heard of is a string on its way to a command line.
-  if (!provider.models.some((model) => model.id === wanted))
+  // Codex has no verified catalogue; the owner can enter an identifier, which
+  // is sent exactly as typed and verified only by the real native attempt.
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$/u.test(wanted) ||
+      (provider.id !== "codex" && !provider.models.some((model) => model.id === wanted)))
     throw new Error(`${provider.label} does not offer the model "${wanted}".`);
   return wanted;
 }
