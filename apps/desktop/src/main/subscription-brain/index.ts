@@ -33,6 +33,80 @@ import type {
   CapabilityStatus
 } from "./types.js";
 
+import {
+  accountsFrom,
+  checkAccount,
+  familyOf,
+  poolOf,
+  type SeatAccount,
+  type ModelFamily,
+  type Seat,
+  type AccountProblem,
+} from "./accounts.js";
+
+export {
+  accountsFrom,
+  checkAccount,
+  familyOf,
+  poolOf,
+  type SeatAccount,
+  type ModelFamily,
+  type Seat,
+  type AccountProblem,
+};
+
+import {
+  Governor,
+  DEFAULT_LIMITS,
+  type GovernorLimits,
+  type Admission,
+  type Refusal,
+  type Verdict,
+} from "./governor.js";
+
+export {
+  Governor,
+  DEFAULT_LIMITS,
+  type GovernorLimits,
+  type Admission,
+  type Refusal,
+  type Verdict,
+};
+
+import {
+  ledger,
+  ledgerSentence,
+  type PoolLine,
+  type Ledger,
+} from "./ledger.js";
+
+export {
+  ledger,
+  ledgerSentence,
+  type PoolLine,
+  type Ledger,
+};
+
+import {
+  roster,
+  firstSeat,
+  roomSeats,
+  seatNamed,
+  shortModel,
+  PREFERRED,
+  type SeatRoster,
+} from "./seats.js";
+
+export {
+  roster,
+  firstSeat,
+  roomSeats,
+  seatNamed,
+  shortModel,
+  PREFERRED,
+  type SeatRoster,
+};
+
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_PROMPT_CHARS = 100_000;
 const MAX_QUEUE_DEPTH = 4;

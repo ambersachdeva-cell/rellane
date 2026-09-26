@@ -10,6 +10,45 @@ import {
   type SearchOutcome,
   type SearchableTurn
 } from "./book-search.js";
+import {
+  embedTexts,
+  DEFAULT_LOOPBACK_PORT,
+  MAX_BATCH,
+  MAX_INPUT_CHARS,
+  type EmbeddingRuntimeOptions,
+  type EmbeddingResult,
+} from "./embedding-client.js";
+
+export {
+  embedTexts,
+  DEFAULT_LOOPBACK_PORT,
+  MAX_BATCH,
+  MAX_INPUT_CHARS,
+  type EmbeddingRuntimeOptions,
+  type EmbeddingResult,
+};
+
+import {
+  chunkText,
+  cosineSimilarity,
+  rankBySimilarity,
+  CHUNK_TARGET_CHARS,
+  CHUNK_OVERLAP_CHARS,
+  MAX_CHUNKS_PER_SOURCE,
+  type TextChunk,
+  type ScoredChunk,
+} from "./embedding-index.js";
+
+export {
+  chunkText,
+  cosineSimilarity,
+  rankBySimilarity,
+  CHUNK_TARGET_CHARS,
+  CHUNK_OVERLAP_CHARS,
+  MAX_CHUNKS_PER_SOURCE,
+  type TextChunk,
+  type ScoredChunk,
+};
 
 export const WORKSTATION_BOOK_SEARCH_QUERY_LIMIT = 4000;
 
@@ -47,6 +86,51 @@ const UNAVAILABLE_OUTCOME: SearchOutcome = {
   matched: 0,
   summary: "The book is not open yet."
 };
+
+export async function rankSearchableTurnsByEmbedding(
+  query: string,
+  turns: readonly SearchableTurn[],
+  options?: EmbeddingRuntimeOptions,
+  limit = 10
+): Promise<
+  | {
+      readonly status: "ranked";
+      readonly chunks: readonly ScoredChunk[];
+      readonly model: string;
+    }
+  | {
+      readonly status: "unavailable";
+      readonly reason: string;
+    }
+> {
+  const chunks = turns.flatMap((turn) => chunkText(turn.id, turn.body));
+  const candidateChunks = chunks.slice(0, MAX_BATCH - 1);
+  const embedResult = await embedTexts(
+    [query, ...candidateChunks.map((c) => c.text)],
+    options
+  );
+
+  if (embedResult.status !== "embedded") {
+    return {
+      status: "unavailable",
+      reason: embedResult.reason,
+    };
+  }
+
+  const candidates = candidateChunks.map((chunk, index) => ({
+    ...chunk,
+    chunk,
+    vector: embedResult.vectors[index + 1]!,
+  }));
+
+  const ranked = rankBySimilarity(embedResult.vectors[0]!, candidates, limit);
+
+  return {
+    status: "ranked",
+    chunks: ranked,
+    model: embedResult.model,
+  };
+}
 
 export function installWorkstationBookSearch(
   options: InstallWorkstationBookSearchOptions

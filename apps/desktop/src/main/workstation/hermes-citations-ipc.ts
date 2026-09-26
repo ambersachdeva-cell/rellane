@@ -13,6 +13,37 @@ import { readCase, turnsFor } from "../book/cases.js";
 import { CASE_SOURCE_SEAT_PREFIX } from "../../shared/case-sources.js";
 import { checkHermesCitations, type HermesCitationsRuntimeOptions } from "./hermes-citations.js";
 
+export {
+  planDispatch,
+  MAX_STEPS,
+  type AvailableProvider,
+  type PlanStep,
+  type DispatchPlan
+} from "./dispatch-plan.js";
+
+export {
+  formatHermesSystemPrompt,
+  parseHermesOutput,
+  formatToolResponse,
+  runHermesLoop,
+  type HermesToolDefinition,
+  type HermesToolCall,
+  type HermesToolResponse,
+  type HermesStep,
+  type HermesLoopOptions,
+  type HermesLoopResult
+} from "./hermes-agent-loop.js";
+
+export {
+  AgentEngine,
+  type AgentDefinition
+} from "../agent-engine.js";
+
+export {
+  fakeIpcEvent,
+  type FakeIpcEvent
+} from "./fake-ipc-event.js";
+
 /**
  * Where the pinned checker actually lives, dev and packaged.
  *

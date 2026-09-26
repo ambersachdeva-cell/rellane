@@ -18,6 +18,61 @@ export {
   type AcquireWriterPermitResult,
 };
 
+import {
+  auditCopiedRoot,
+  auditDatabaseSync,
+  auditPreimages,
+  type AuditStatus,
+  type DatabaseAuditResult,
+  type PreimageSummary,
+  type PreimageItemAudit,
+  type CopiedRootAuditReport,
+  type CopiedRootAuditOptions,
+} from "./copied-root-audit.js";
+
+export {
+  auditCopiedRoot,
+  auditDatabaseSync,
+  auditPreimages,
+  type AuditStatus,
+  type DatabaseAuditResult,
+  type PreimageSummary,
+  type PreimageItemAudit,
+  type CopiedRootAuditReport,
+  type CopiedRootAuditOptions,
+};
+
+import {
+  preflightCopiedRootRecovery,
+  COPIED_ROOT_STORES,
+  type CopiedRootStore,
+  type RecoveryInventoryEntry,
+  type RecoveryInventoryStore,
+  type RecoveryInventory,
+  type CopiedRootRecoveryPreflightOptions,
+  type CopiedRootRecoveryPreflight,
+} from "./copied-root-recovery.js";
+
+export {
+  preflightCopiedRootRecovery,
+  COPIED_ROOT_STORES,
+  type CopiedRootStore,
+  type RecoveryInventoryEntry,
+  type RecoveryInventoryStore,
+  type RecoveryInventory,
+  type CopiedRootRecoveryPreflightOptions,
+  type CopiedRootRecoveryPreflight,
+};
+
+export async function auditAndPreflightCopiedRoot(
+  auditOptions: CopiedRootAuditOptions,
+  preflightOptions: CopiedRootRecoveryPreflightOptions
+): Promise<{ readonly audit: CopiedRootAuditReport; readonly preflight: CopiedRootRecoveryPreflight }> {
+  const audit = await auditCopiedRoot(auditOptions);
+  const preflight = await preflightCopiedRootRecovery(preflightOptions);
+  return { audit, preflight };
+}
+
 /**
  * Creates a RecoveryQuiescenceCoordinator pre-configured with all 14 REQUIRED_HOST_WRITERS
  * and an explicit "trusted" coverage declaration.

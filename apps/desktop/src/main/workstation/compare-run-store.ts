@@ -4,6 +4,48 @@ import { z } from "zod";
 import { appendTurn } from "../book/cases.js";
 import type { DispatchBoard, DispatchLane, LaneState } from "./dispatch-run-ipc.js";
 
+export {
+  askInCase,
+  systemFor,
+  promptFor as askInCasePromptFor,
+  MAX_SEATS,
+  type CaseSeat,
+  type AskInCaseDeps,
+  type SeatOutcome,
+  type AskInCaseResult
+} from "../crew/ask-in-case.js";
+
+export {
+  Board,
+  LEASE_MS,
+  MAX_ATTEMPTS,
+  type JobState,
+  type Job
+} from "../crew/claims.js";
+
+export {
+  round,
+  work,
+  promptFor as fanoutPromptFor,
+  ESTIMATE,
+  type CrewSeat,
+  type FanOutDeps,
+  type RoundResult
+} from "../crew/fanout.js";
+
+export {
+  renderRoom,
+  boundary,
+  safeLabel,
+  decide,
+  withinReach,
+  narrowReach,
+  type Turn,
+  type Caller,
+  type ToolRequest,
+  type Decision
+} from "../crew/untrusted.js";
+
 const PREFIX = "RellaneCompareV1:";
 const Parent = z.strictObject({ event: z.literal("parent"), runId: z.uuid(), caseId: z.string().min(1),
   brief: z.string().min(1), at: z.number().int(),

@@ -21,6 +21,17 @@ import { describeIntegrity, type Ledger } from "../security/ledger.js";
 import type { SkillPolicy } from "../tools/types.js";
 import { describeSurvey, planFrom, survey, type FileEntry } from "./librarian.js";
 
+export {
+  escapeXml,
+  buildShortcutPlist,
+  readShortcutIntent,
+  shortcutName,
+  validate as validateShortcutSpec,
+  describeShortcut,
+  type ActionKind,
+  type ShortcutSpec
+} from "./shortcuts.js";
+
 /** Plans expire so a stale approval cannot run against a folder that moved on. */
 const PLAN_TTL_MS = 5 * 60_000;
 

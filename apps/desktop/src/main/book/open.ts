@@ -39,6 +39,22 @@ import { openBook } from "./database.js";
 import { RECOVERY_BYTES } from "./recovery.js";
 import { diagnostics } from "../foundations/diagnostics.js";
 
+export {
+  GSTIN_SHAPE,
+  checkCharacter,
+  checkGstin,
+  taxKind,
+  type GstinCheck
+} from "./gstin.js";
+
+export {
+  tallyDate,
+  xml,
+  voucherXml,
+  tallyXml,
+  type TallyVoucher
+} from "./tally.js";
+
 /** What `safeStorage` gives us, narrowed so this is testable without Electron. */
 export interface KeyVault {
   isEncryptionAvailable(): boolean;
